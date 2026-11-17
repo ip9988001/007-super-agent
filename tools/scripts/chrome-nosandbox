@@ -1,5 +1,13 @@
 #!/bin/sh
 # 007 部署版：chromium 在 playwright 默认缓存 ~/.cache/ms-playwright 下；无头模式。
+# --help/-h 时直接打印用法（Chrome 自身的 --help 在无头模式下会去找 man 页，报 No manual entry）。
+if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
+  echo "用法: chrome-nosandbox [--dump-dom] <url> [chrome 参数...]"
+  echo "  渲染指定 URL 并把 DOM 打到 stdout（无头模式已内置：--headless=new --timeout=60000 --no-sandbox）。"
+  echo "  例子: chrome-nosandbox --dump-dom https://example.com"
+  echo "  注意: 不要在参数里再写一遍 chrome-nosandbox；--dump-dom 的输出去 stdout，不写文件。"
+  exit 0
+fi
 CHROME=$(find "$HOME/.cache/ms-playwright" -name chrome -path "*chrome-linux*/chrome" 2>/dev/null | head -1)
 [ -z "$CHROME" ] && { echo "chrome-nosandbox: no chromium found under ~/.cache/ms-playwright" >&2; exit 127; }
 exec "$CHROME" --headless=new --timeout=60000 --no-sandbox --disable-dev-shm-usage --disable-gpu "$@"
