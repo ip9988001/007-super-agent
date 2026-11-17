@@ -40,6 +40,26 @@
 
 为什么是 Linux 优先：007 是按“常年在线的服务器”设计的——systemd 托管、每天凌晨定时精炼备份、工具链按 Debian 打包。Go 核心本身不依赖 Linux 特性，但部署和工具安装目前只做了 Linux。
 
+## 007 自带什么
+
+装完就有 **39 个命令行工具 + 9 个助手脚本 + 14 个 skill**，2026-11-18 在 Debian 12 测试机上逐个实测通过。一键安装脚本在 `scripts/install-toolchain.sh`，版本钉死，全部走公开源。
+
+**抓取与浏览器（10）**：agent-reach 1.6.0、playwright 1.64.1、lightpanda 1.1.0-nightly、scrapling 0.5、httpx 0.28.1、yt-dlp 2026.10.21、curl 7.88.1、gh 2.103.2、camoufox 0.5.9、chrome-nosandbox（playwright chromium 封装）
+
+**代码与审计（11）**：rea 6.8.0、codegraph 1.6.2、semgrep 1.182.1、ast-grep 0.51.0、trivy 0.76.1、gitleaks 8.30.1、bandit 1.9.4、pip-audit 2.10.1、ghidra 12.2、rg 13.0.0、git 2.39.5
+
+**SEO 脚本（3）**：claude-seo、geo-seo-aeo、content-scorers（随 seo-toolkit 种子走，无独立版本号）
+
+**设计（2）**：hyperframes 0.9.63、impeccable 4.7.0
+
+**基础运行环境（13）**：python3 3.11.2、node v22.23.4、npm 10.9.9、uv 0.13.5、yarn 1.22.22、java Temurin 25.0.5、pandoc 2.17.1.1、ffmpeg 5.1.9、edge-tts 7.3.1、jq 1.6、tesseract 5.3.0、magick 6.9.11-60、mpv 0.35.1
+
+**助手脚本（9）**：run-audit.sh（接 `/audit` 前缀）、cap-drift.sh、cap-scan.sh、chrome-cdp.sh、chrome-nosandbox、inventory.sh、inventory2.sh、link-selftest.cjs、totp.js
+
+**Skill（14）**：长期能力 5 个——long-term（长期记忆）、adjudicator（裁决）、retrieval（检索）、migration（迁移）、forge（锻造）；工具型 9 个——agent-reach、browser-tools、edge-tts、github-get、hyperframes、impeccable、lightpanda、reverse-engineer-anything（逆向）、scrapling
+
+另外：注册表里还有 31 条知识条目（67 篇能力文档、84 个品牌的设计资料、SEO 工具包），只读、不占执行位；另有 26 个 skill 只存档、不加载。lightpanda 是滚动 nightly，构建号钉不死。
+
 ## 快在哪里：分诊 + 三级索引
 
 多数 Agent 一上来就把全部工具说明塞进上下文，token 还没干活就先烧掉一半。007 反过来：
