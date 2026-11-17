@@ -1,0 +1,9 @@
+package main
+
+import "fmt"
+
+const Version = "v0.1.0"
+
+func main() {
+	fmt.Printf("super-agent-007 %s starting... (native direct mode, no sandbox)\n", Version)
+}

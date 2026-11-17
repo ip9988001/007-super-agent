@@ -1,0 +1,14 @@
+# Binaries and build artifacts
+/super-agent
+/super-agent-007
+*.exe
+*.out
+*.test
+
+# Local runtime data, ledgers, and secrets (never commit)
+/data/*.db
+/data/*.db-shm
+/data/*.db-wal
+.env
+*.key
+*.pem
