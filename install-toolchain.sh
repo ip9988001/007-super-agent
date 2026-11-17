@@ -10,8 +10,8 @@
 # 不装的（第 19 步 v2 过滤版已排除）：lean-ctx、llmtrim（已死）、tvly（需
 # Tavily key）、bili（未验证出数据）、tavily-search、pi-web-restart、
 # 30 个停放扩展（只存档）、refine_daily.py / l1_watcher.py（框架内已有）。
-# impeccable 4.7.0 不在公开源：它是私有种子里的技能文件；若部署目录下
-# 已有 tools/skills/impeccable（私有构建解开种子后），本脚本会顺手建软链，
+# impeccable：公开库自带 tools/skills/impeccable（引擎首次运行自动下载）；
+# 私有构建也可由 DEPLOY_DIR 指种子里的副本；本脚本会顺手建软链，
 # 否则跳过（注册表里该条保持 available:false，直到你提供它）。
 #
 # 目标版本（第 19 步实测）：
@@ -184,11 +184,18 @@ echo "--- hyperframes 0.9.63 (npm pin) ---"
 npm install -g hyperframes@0.9.63
 
 echo "--- impeccable 4.7.0（仅当 DEPLOY_DIR 下已有种子文件时建软链；公开源无此物）---"
-if [ -n "$DEPLOY_DIR" ] && [ -x "$DEPLOY_DIR/tools/skills/impeccable/scripts/impeccable" ]; then
-  ln -sfn "$DEPLOY_DIR/tools/skills/impeccable/scripts/impeccable" /usr/local/bin/impeccable
-  echo "impeccable linked from seed"
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+IMPECCABLE_SRC=""
+if [ -x "$SCRIPT_DIR/tools/skills/impeccable/scripts/impeccable" ]; then
+  IMPECCABLE_SRC="$SCRIPT_DIR/tools/skills/impeccable/scripts/impeccable"
+elif [ -n "$DEPLOY_DIR" ] && [ -x "$DEPLOY_DIR/tools/skills/impeccable/scripts/impeccable" ]; then
+  IMPECCABLE_SRC="$DEPLOY_DIR/tools/skills/impeccable/scripts/impeccable"
+fi
+if [ -n "$IMPECCABLE_SRC" ]; then
+  ln -sfn "$IMPECCABLE_SRC" /usr/local/bin/impeccable
+  echo "impeccable linked from $IMPECCABLE_SRC"
 else
-  echo "impeccable SKIPPED: no seed file (set DEPLOY_DIR to a deploy dir with tools/skills/impeccable, or leave it unavailable)"
+  echo "impeccable SKIPPED: no skill file (clone the repo with tools/ or set DEPLOY_DIR)"
 fi
 
 # ---------- 核验 ----------

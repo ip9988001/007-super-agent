@@ -1,0 +1,5 @@
+#!/bin/sh
+# 007 部署版：chromium 在 playwright 默认缓存 ~/.cache/ms-playwright 下；无头模式。
+CHROME=$(find "$HOME/.cache/ms-playwright" -name chrome -path "*chrome-linux*/chrome" 2>/dev/null | head -1)
+[ -z "$CHROME" ] && { echo "chrome-nosandbox: no chromium found under ~/.cache/ms-playwright" >&2; exit 127; }
+exec "$CHROME" --headless=new --timeout=60000 --no-sandbox --disable-dev-shm-usage --disable-gpu "$@"
