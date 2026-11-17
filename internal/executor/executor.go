@@ -79,6 +79,10 @@ type Task struct {
 	Irreversible     bool
 	IrreversibleKind string // delete-file / modify-config / send-money
 	Draft            string // 拟交付结论（交活前审用）
+	// StageNo / ArtifactPath 是长任务分片的边界信息（第 14 步 B-06）：
+	// 分片审通过后按此落盘；Stage 语义由调用方（工具）定义。
+	StageNo      int    // 本次分片的 Stage 号（从 1 开始；0 表示非分片）
+	ArtifactPath string // 本 Stage 的落盘产物路径（为空表示无产物）
 }
 
 // Evidence 是监工收到的五件套硬证据（第 7 轮，硬封顶 ≤3000 token，
@@ -100,8 +104,10 @@ type CheckResult struct {
 }
 
 // Advisor 是监工的接口：收证据 + 审查。具体实现在 core/advisor.go。
+// 收证据要带 trigger：pre-action 预审时证据包必须带拟执行的命令与目标
+// （动作尚未执行，无法验证完成度）；delivery 交活前审带拟交付结论。
 type Advisor interface {
-	CollectEvidenceBundle(task Task) (Evidence, error)
+	CollectEvidenceBundle(task Task, trigger Trigger) (Evidence, error)
 	Check(evidence Evidence, trigger Trigger) (CheckResult, error)
 }
 
@@ -273,7 +279,7 @@ func (e *Executor) Check(task Task, trigger Trigger) (CheckResult, error) {
 	if e.Advisor == nil {
 		return CheckResult{Verdict: VerdictNone}, ErrNoAdvisor
 	}
-	ev, err := e.Advisor.CollectEvidenceBundle(task)
+	ev, err := e.Advisor.CollectEvidenceBundle(task, trigger)
 	if err != nil {
 		return CheckResult{}, fmt.Errorf("executor: 收证据失败: %w", err)
 	}
@@ -314,9 +320,46 @@ func (e *Executor) ReviewDelivery(task Task) (CheckResult, error) {
 	return res, err
 }
 
-// ReviewShard 是触发点 ③：长任务分片后审。
+// ReviewShard 是触发点 ③：长任务分片后审。审通过且 Task 带了 Stage 号时，
+// 把该 Stage 的完成进度落盘（stage_no + 产物路径进 execution_ledger），
+// 重跑时用 LastStage 查最后一个已完成 Stage，从下一 Stage 接续。
+// 不做通用 shell 断点续跑（第三方 CLI 的内存状态外部救不回来），
+// 只做 Stage 边界落盘。Ledger 为 nil 时只审不落盘。
 func (e *Executor) ReviewShard(task Task) (CheckResult, error) {
-	return e.Check(task, TriggerShard)
+	res, err := e.Check(task, TriggerShard)
+	if err != nil {
+		return res, err
+	}
+	if task.StageNo > 0 {
+		if cerr := e.CheckpointStage(task.TaskID, task.SessionID, task.ToolID, task.StageNo, task.ArtifactPath); cerr != nil {
+			return res, fmt.Errorf("executor: Stage %d 落盘失败: %w", task.StageNo, cerr)
+		}
+	}
+	return res, nil
+}
+
+// CheckpointStage 记录长任务一个 Stage 的完成进度（Stage 边界落盘）。
+// Stage 语义由调用方（工具）定义——执行层不知道任意 shell 命令的
+// Stage 划分，不替工具发明。Ledger 为 nil 时直接返回 nil。
+func (e *Executor) CheckpointStage(taskID, sessionID, toolID string, stageNo int, artifactPath string) error {
+	if e.Ledger == nil {
+		return nil
+	}
+	_, err := e.Ledger.RecordStage(ledger.StageRecord{
+		SessionID: sessionID, TaskID: taskID, ToolID: toolID,
+		StageNo: stageNo, ArtifactPath: artifactPath,
+	})
+	return err
+}
+
+// LastStage 查某任务某工具最后一个已完成 Stage（重跑时从下一 Stage 接续）。
+// 无记录时 stageNo=0。Ledger 为 nil 时返回 0。
+func (e *Executor) LastStage(taskID, toolID string) (stageNo int, artifactPath string, err error) {
+	if e.Ledger == nil {
+		return 0, "", nil
+	}
+	stageNo, artifactPath, _, err = e.Ledger.LastStage(taskID, toolID)
+	return stageNo, artifactPath, err
 }
 
 // Run 执行一次命令：≤30 秒内联等结果，>30 秒立刻返回任务句柄。

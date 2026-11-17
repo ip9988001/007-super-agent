@@ -11,10 +11,13 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 
 	"007-super-agent/internal/executor"
+	"007-super-agent/internal/ledger"
+	"007-super-agent/internal/llm"
 
 	_ "modernc.org/sqlite"
 )
@@ -24,11 +27,13 @@ type Advisor struct {
 	db      *sql.DB
 	cfg     AdvisorConfig
 	workDir string
+	Ledger  *ledger.Ledger // 监工费用记账用（第 13 步）；为 nil 时不记账
 
-	mu         sync.Mutex
-	retry      map[string]int    // taskID -> 该任务已 HALT 次数
-	prevReason map[string]string // taskID -> 上次 HALT 原因
-	lastTask   string            // 最近一次收证据的任务
+	mu          sync.Mutex
+	retry       map[string]int    // taskID -> 该任务已 HALT 次数
+	prevReason  map[string]string // taskID -> 上次 HALT 原因
+	lastTask    string            // 最近一次收证据的任务
+	lastSession string            // 最近一次收证据的任务所属会话
 }
 
 // New 打开 ledger.db 的只读连接（看护包同款 mode=ro，不写库）。
@@ -50,11 +55,26 @@ func New(dbPath string, cfg AdvisorConfig, workDir string) (*Advisor, error) {
 func (a *Advisor) Close() error { return a.db.Close() }
 
 // CollectEvidenceBundle 从宿主机抓五件套硬证据，映射成 executor.Evidence。
-func (a *Advisor) CollectEvidenceBundle(task executor.Task) (executor.Evidence, error) {
+// trigger 是审查触发点：pre-action 预审时证据包带上拟执行的命令与目标
+// （动作尚未执行，只核目标与参数，不验证完成度）；删文件时把目标文件
+// 也放进产物指纹，让监工看到目标存在与否。其他触发点保持原样。
+func (a *Advisor) CollectEvidenceBundle(task executor.Task, trigger executor.Trigger) (executor.Evidence, error) {
+	prompt := task.Text
+	var artifacts []string
+	if trigger == executor.TriggerPreAction && strings.TrimSpace(task.Command) != "" {
+		prompt = "任务原话：" + task.Text + "\n拟执行命令：" + task.Command +
+			"\n【预审】动作尚未执行：只核对拟执行命令与目标是否与任务原话一致，不验证完成度；不要以“无法证实已完成”为由告警。"
+		if task.IrreversibleKind == executor.KindDeleteFile {
+			if target := deleteTarget(task.Command); target != "" {
+				artifacts = append(artifacts, target)
+			}
+		}
+	}
 	b, err := CollectEvidenceBundle(context.Background(), a.db, EvidenceRequest{
 		TaskID:         task.TaskID,
-		TaskPrompt:     task.Text,
+		TaskPrompt:     prompt,
 		WorkDir:        a.workDir,
+		ArtifactPaths:  artifacts,
 		ProposedOutput: task.Draft,
 	})
 	if err != nil {
@@ -62,6 +82,7 @@ func (a *Advisor) CollectEvidenceBundle(task executor.Task) (executor.Evidence, 
 	}
 	a.mu.Lock()
 	a.lastTask = task.TaskID
+	a.lastSession = task.SessionID
 	a.mu.Unlock()
 	var cmds []string
 	for _, l := range strings.Split(b.LedgerCommands, "\n") {
@@ -98,6 +119,9 @@ func (a *Advisor) Check(evidence executor.Evidence, trigger executor.Trigger) (e
 	if err != nil {
 		return executor.CheckResult{}, err
 	}
+	// 第 13 步：监工调用的费用进 expense_ledger（模型名、hit/miss、
+	// 费用毫分齐全，按任务归属）。记账失败只记日志，不吞 verdict。
+	a.recordAdvisorExpense(taskID, dec.Usage)
 	res := executor.CheckResult{RetryCount: retry}
 	switch dec.Verdict {
 	case "NOTE":
@@ -126,4 +150,38 @@ func (a *Advisor) Check(evidence executor.Evidence, trigger executor.Trigger) (e
 		}
 	}
 	return res, nil
+}
+
+// recordAdvisorExpense 把一次监工调用的费用记进 expense_ledger。
+// Ledger 为 nil 时不记（测试桩或未接账本）。失败只记日志，不吞 verdict。
+func (a *Advisor) recordAdvisorExpense(taskID string, u llm.Usage) {
+	if a.Ledger == nil {
+		return
+	}
+	a.mu.Lock()
+	sessionID := a.lastSession
+	a.mu.Unlock()
+	cost := llm.CostMilliForModel(a.cfg.Model, u.CacheHitTokens, u.CacheMissTokens, u.CompletionTokens, false)
+	_, err := a.Ledger.RecordExpense(ledger.ExpenseRecord{
+		SessionID: sessionID, TaskID: taskID, Model: a.cfg.Model,
+		PromptTokens: u.PromptTokens, CacheHitTokens: u.CacheHitTokens,
+		CacheMissTokens: u.CacheMissTokens, CompletionTokens: u.CompletionTokens,
+		CostCNYMilli: cost,
+	})
+	if err != nil {
+		log.Printf("advisor: record expense failed: %v", err)
+	}
+}
+
+// deleteTarget 从 "rm [-flags] <path>" 这类命令里取目标文件路径：
+// 跳过命令名与 - 开头的选项，第一个剩下的字段就是目标。取不到返回 ""。
+func deleteTarget(command string) string {
+	fields := strings.Fields(command)
+	for _, f := range fields[1:] {
+		if strings.HasPrefix(f, "-") {
+			continue
+		}
+		return f
+	}
+	return ""
 }

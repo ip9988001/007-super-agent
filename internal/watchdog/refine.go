@@ -26,7 +26,8 @@ import (
 
 // RefineFunc 把一天的 L1 日志文本提炼成 Wiki 条目；调用方接模型客户端
 // （llm.Client.RefineL1）。测试里用桩，不真调 API。
-type RefineFunc func(ctx context.Context, l1Text string) ([]memory.WikiEntry, error)
+// taskID 是精炼任务号（refine-YYYY-MM-DD），供模型费用按任务归属记账。
+type RefineFunc func(ctx context.Context, taskID, l1Text string) ([]memory.WikiEntry, error)
 
 // RefineResult 是一次精炼的结果。
 type RefineResult struct {
@@ -64,7 +65,7 @@ func (w *Watchdog) RefineDaily(ctx context.Context, mem *memory.Store, date stri
 		return res, err
 	}
 	res.Lines = strings.Count(text, "\n")
-	entries, err := refine(ctx, text)
+	entries, err := refine(ctx, refineTaskID(date), text)
 	if err != nil {
 		if w.led != nil {
 			_, _ = w.led.RecordExecution(ledger.ExecutionRecord{
@@ -156,5 +157,7 @@ func (w *Watchdog) RefineLoop(ctx context.Context, mem *memory.Store, dataDir st
 		if err := os.WriteFile(refineMarkerFile(dataDir), []byte(now.Format("2006-01-02")+"\n"), 0o600); err != nil {
 			log.Printf("refine loop: 写标记文件失败: %v（下个 60 秒会重跑一次）", err)
 		}
+		// 第 15 步：精炼成功后调记忆备份钩子（失败只记日志，不阻塞循环）。
+		w.afterRefine(ctx, yesterday)
 	}
 }

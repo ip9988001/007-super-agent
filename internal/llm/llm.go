@@ -51,15 +51,44 @@ const (
 	tokensPerMillion   = 1000000
 )
 
-// CostMilli 算一次调用的费用（毫分，整数运算，四舍五入到毫分；
-// Peak 为真时高峰价 2 倍）。命中价是未命中价的 1/50。
-func CostMilli(hit, miss, out int64, peak bool) int64 {
-	total := hit*priceHitMilliPerM + miss*priceMissMilliPerM + out*priceOutMilliPerM
+// V4 Pro 定价（毫分/百万 token，非高峰；官方价 $0.022/$0.66/$1.98 × 6.67）。
+const (
+	priceProHitMilliPerM  = 147   // 输入缓存命中 ¥0.147/百万
+	priceProMissMilliPerM = 4402  // 输入缓存未命中 ¥4.402/百万
+	priceProOutMilliPerM  = 13207 // 输出 ¥13.207/百万
+)
+
+// modelPrices 是各模型的非高峰价表（毫分/百万 token）。
+// deepseek-reasoner / deepseek-chat 是已退役旧别名：按 DeepSeek 官方
+// 定价页（2026-11-17），两者已重定向到 V4.1 Flash（思考/非思考模式），
+// 按 Flash 价计费；未知模型名默认按 Flash 价（并在注释里说明，
+// 不要静默按旧 R1 价 $0.55/$2.19 算，那是已下架的历史价）。
+func modelPrices(model string) (hit, miss, out int64) {
+	switch model {
+	case "deepseek-v4-pro":
+		return priceProHitMilliPerM, priceProMissMilliPerM, priceProOutMilliPerM
+	default: // deepseek-flash、deepseek-reasoner、deepseek-chat 及其他
+		return priceHitMilliPerM, priceMissMilliPerM, priceOutMilliPerM
+	}
+}
+
+// CostMilliForModel 按模型名算一次调用的费用（毫分，整数运算，
+// 四舍五入到毫分；Peak 为真时高峰价 2 倍）。
+func CostMilliForModel(model string, hit, miss, out int64, peak bool) int64 {
+	ph, pm, po := modelPrices(model)
+	total := hit*ph + miss*pm + out*po
 	milli := (total + tokensPerMillion/2) / tokensPerMillion
 	if peak {
 		milli *= 2
 	}
 	return milli
+}
+
+// CostMilli 算一次调用的费用（毫分，整数运算，四舍五入到毫分；
+// Peak 为真时高峰价 2 倍）。命中价是未命中价的 1/50。
+// 保留给旧调用方：默认按 deepseek-flash 价。
+func CostMilli(hit, miss, out int64, peak bool) int64 {
+	return CostMilliForModel("deepseek-flash", hit, miss, out, peak)
 }
 
 // Message 是一条聊天消息（OpenAI 兼容格式）。
@@ -205,8 +234,21 @@ type chatResponse struct {
 
 // Chat 调一次 /v1/chat/completions，返回模型原文与用量。
 // APIKey 为空、非 200、choices 为空都返回错误，不伪造回复。
-// 成功后把费用如实记进 expense_ledger；记账失败只记日志，不吞掉回复。
+// 成功后把费用如实记进 expense_ledger（task_id 取 c.TaskID）；
+// 记账失败只记日志，不吞掉回复。
+// 要按任务归属记账时请用 ChatTask（传本次 taskID），不要共用 c.TaskID。
 func (c *Client) Chat(ctx context.Context, msgs []Message) (string, Usage, error) {
+	return c.chatWithTask(ctx, msgs, c.TaskID)
+}
+
+// ChatTask 与 Chat 相同，但费用行按传入的 taskID 归属。
+// 分诊、精炼、监工等每次调用都要带本次 taskID，费用才能按任务查。
+func (c *Client) ChatTask(ctx context.Context, msgs []Message, taskID string) (string, Usage, error) {
+	return c.chatWithTask(ctx, msgs, taskID)
+}
+
+// chatWithTask 是 Chat 的真实实现。
+func (c *Client) chatWithTask(ctx context.Context, msgs []Message, taskID string) (string, Usage, error) {
 	if strings.TrimSpace(c.APIKey) == "" {
 		return "", Usage{}, errors.New("llm: 未配置 DEEPSEEK_API_KEY")
 	}
@@ -262,19 +304,19 @@ func (c *Client) Chat(ctx context.Context, msgs []Message) (string, Usage, error
 		CacheMissTokens:  cr.Usage.PromptCacheMiss,
 		CompletionTokens: cr.Usage.CompletionTokens,
 	}
-	c.recordExpense(u)
+	c.recordExpense(u, taskID)
 	return cr.Choices[0].Message.Content, u, nil
 }
 
-// recordExpense 把一次调用的费用记进 expense_ledger。
+// recordExpense 把一次调用的费用记进 expense_ledger（按 taskID 归属）。
 // 失败只记日志，不阻塞、不吞回复（账本坏了不该让一次好回答作废）。
-func (c *Client) recordExpense(u Usage) {
+func (c *Client) recordExpense(u Usage, taskID string) {
 	if c.Ledger == nil {
 		return
 	}
-	cost := CostMilli(u.CacheHitTokens, u.CacheMissTokens, u.CompletionTokens, c.Peak)
+	cost := CostMilliForModel(c.Model, u.CacheHitTokens, u.CacheMissTokens, u.CompletionTokens, c.Peak)
 	_, err := c.Ledger.RecordExpense(ledger.ExpenseRecord{
-		SessionID: c.SessionID, TaskID: c.TaskID, Model: c.Model,
+		SessionID: c.SessionID, TaskID: taskID, Model: c.Model,
 		PromptTokens: u.PromptTokens, CacheHitTokens: u.CacheHitTokens,
 		CacheMissTokens: u.CacheMissTokens, CompletionTokens: u.CompletionTokens,
 		CostCNYMilli: cost,
@@ -285,10 +327,12 @@ func (c *Client) recordExpense(u Usage) {
 }
 
 // TriageCall 是给 triage.Triage 注入的 ModelCallFunc：
-// 把 BuildTriagePrompt 的输出当一条 user 消息发给模型，
-// 返回模型原文 + 输入/输出 token 数。非法 JSON 由 triage.ParseTriageReply 校验。
-func (c *Client) TriageCall(prompt string) (string, int64, int64, error) {
-	reply, u, err := c.Chat(context.Background(), []Message{{Role: "user", Content: prompt}})
+// frozen（分诊提示词头 + 可用工具清单）放 system 消息最前（缓存分区 A 区，
+// 跨调用内容固定才能命中缓存），tail（本次用户原话）放最后一条 user
+// 消息（C 区）。费用按 taskID 归属记账。非法 JSON 由 triage.ParseTriageReply 校验。
+func (c *Client) TriageCall(taskID, frozen, tail string) (string, int64, int64, error) {
+	msgs := BuildMessages(Zones{Frozen: frozen, Tail: tail})
+	reply, u, err := c.chatWithTask(context.Background(), msgs, taskID)
 	if err != nil {
 		return "", 0, 0, err
 	}
@@ -297,9 +341,10 @@ func (c *Client) TriageCall(prompt string) (string, int64, int64, error) {
 
 // TriageCallZones 是带缓存分区的分诊调用：A 区放冻结前缀（分诊提示词头
 // 由 BuildTriagePrompt 自带，这里只补宪法摘要 + L1 索引），C 区放用户原话。
+// 费用按 c.TaskID 归属；要按任务归属请用 TriageCall。
 func (c *Client) TriageCallZones(frozen, carryover string, history []Message, tail string) (string, int64, int64, error) {
 	msgs := BuildMessages(Zones{Frozen: frozen, Carryover: carryover, History: history, Tail: tail})
-	reply, u, err := c.Chat(context.Background(), msgs)
+	reply, u, err := c.chatWithTask(context.Background(), msgs, c.TaskID)
 	if err != nil {
 		return "", 0, 0, err
 	}
@@ -389,8 +434,9 @@ const MaxRefineRunes = 12000
 // RefineL1 把一天的 L1 日志文本提炼成 Wiki 条目：调一次 Chat，
 // 提示词放 A 区（冻结）、L1 文本放 C 区。模型回的 JSON 数组解析后返回；
 // kind/title 非法由 WriteWiki 再拦一遍，这里只做解析，不伪造条目。
-// L1 文本为空时直接回空数组，不调模型。
-func (c *Client) RefineL1(ctx context.Context, l1Text string) ([]memory.WikiEntry, error) {
+// L1 文本为空时直接回空数组，不调模型。费用按 taskID 归属记账
+// （调用方传 refine-YYYY-MM-DD）。
+func (c *Client) RefineL1(ctx context.Context, taskID, l1Text string) ([]memory.WikiEntry, error) {
 	if strings.TrimSpace(l1Text) == "" {
 		return nil, nil
 	}
@@ -398,7 +444,7 @@ func (c *Client) RefineL1(ctx context.Context, l1Text string) ([]memory.WikiEntr
 		l1Text = string([]rune(l1Text)[utf8.RuneCountInString(l1Text)-MaxRefineRunes:])
 	}
 	msgs := BuildMessages(Zones{Frozen: refineSystemPrompt, Tail: l1Text})
-	reply, _, err := c.Chat(ctx, msgs)
+	reply, _, err := c.chatWithTask(ctx, msgs, taskID)
 	if err != nil {
 		return nil, err
 	}

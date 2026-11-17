@@ -18,7 +18,7 @@ type stubAdvisor struct {
 	calls   []Trigger
 }
 
-func (s *stubAdvisor) CollectEvidenceBundle(task Task) (Evidence, error) {
+func (s *stubAdvisor) CollectEvidenceBundle(task Task, trigger Trigger) (Evidence, error) {
 	return Evidence{TaskText: task.Text, Draft: task.Draft}, nil
 }
 
@@ -232,5 +232,43 @@ func TestStdoutTailAndErrHead(t *testing.T) {
 	}
 	if len([]rune(r.ErrHead)) != 600 {
 		t.Fatalf("stderr 应截到 600 字，实际 %d 字", len([]rune(r.ErrHead)))
+	}
+}
+
+// TestReviewShardRecordsStage 是 B-06 的 Stage 落盘：分片审通过后，
+// 该 Stage 的进度（stage_no + 产物路径）写进 execution_ledger，
+// LastStage 能查到，重跑从下一 Stage 接续。
+func TestReviewShardRecordsStage(t *testing.T) {
+	l := openTestLedger(t)
+	ex := newTestExecutor(l, &stubAdvisor{verdict: VerdictNote, note: "ok"})
+	res, err := ex.ReviewShard(Task{
+		TaskID: "t-stage", SessionID: "s1", ToolID: "tool-a",
+		Text: "long job", Command: "run stage 2",
+		StageNo: 2, ArtifactPath: "/tmp/stage2.out",
+	})
+	if err != nil || res.Verdict != VerdictNote {
+		t.Fatalf("ReviewShard = %+v, %v", res, err)
+	}
+	n, p, err := ex.LastStage("t-stage", "tool-a")
+	if err != nil || n != 2 || p != "/tmp/stage2.out" {
+		t.Fatalf("LastStage = (%d, %q), err = %v, want (2, /tmp/stage2.out)", n, p, err)
+	}
+}
+
+// TestReviewShardHaltDoesNotRecordStage：分片被 HALT 打回时不落盘。
+func TestReviewShardHaltDoesNotRecordStage(t *testing.T) {
+	l := openTestLedger(t)
+	ex := newTestExecutor(l, &stubAdvisor{verdict: VerdictHalt, note: "no"})
+	_, err := ex.ReviewShard(Task{
+		TaskID: "t-halt", SessionID: "s1", ToolID: "tool-a",
+		Text: "long job", Command: "run stage 1",
+		StageNo: 1, ArtifactPath: "/tmp/stage1.out",
+	})
+	if err == nil {
+		t.Fatal("HALT should return an error")
+	}
+	n, _, err := ex.LastStage("t-halt", "tool-a")
+	if err != nil || n != 0 {
+		t.Fatalf("LastStage = %d, err = %v, want 0 (no stage recorded)", n, err)
 	}
 }

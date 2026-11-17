@@ -97,12 +97,18 @@ func TestCheckRegistryFindsBrokenAndRecords(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rows) != 2 {
-		t.Fatalf("execution_ledger rows = %d, want 2", len(rows))
+	// 第 13 步：体检只写一行汇总回执（checked/ok/broken 数 + 前 5 个坏条目名），
+	// 不再逐条写 failure 淹没账本。
+	if len(rows) != 1 {
+		t.Fatalf("execution_ledger rows = %d, want 1 summary row", len(rows))
 	}
-	for _, r := range rows {
-		if r.Status != "failure" || r.ExitCode != 1 || r.ErrHead == "" {
-			t.Fatalf("bad failure row: %+v", r)
+	r := rows[0]
+	if r.Status != "failure" || r.ExitCode != 1 || r.ToolID != "watchdog-daily-check" {
+		t.Fatalf("bad summary row: %+v", r)
+	}
+	for _, want := range []string{"checked=3", "ok=1", "broken=2", "cap-bad-probe", "cap-bad-sop"} {
+		if !strings.Contains(r.ErrHead, want) {
+			t.Fatalf("summary ErrHead %q missing %q", r.ErrHead, want)
 		}
 	}
 }
@@ -272,7 +278,10 @@ func TestRefineDailyWritesWiki(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "memory", "l1", yesterday+".log"), []byte(l1), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	stub := func(_ context.Context, text string) ([]memory.WikiEntry, error) {
+	stub := func(_ context.Context, taskID, text string) ([]memory.WikiEntry, error) {
+		if taskID != "refine-"+yesterday {
+			t.Errorf("refine taskID = %q, want refine-%s", taskID, yesterday)
+		}
 		if !strings.Contains(text, "task t1") || !strings.Contains(text, "task t3") {
 			t.Errorf("精炼收到的 L1 文本不完整")
 		}
@@ -313,7 +322,7 @@ func TestRefineDailySkips(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	never := func(_ context.Context, _ string) ([]memory.WikiEntry, error) {
+	never := func(_ context.Context, _, _ string) ([]memory.WikiEntry, error) {
 		t.Errorf("跳过时不应调模型")
 		return nil, nil
 	}
@@ -356,5 +365,96 @@ func TestShouldRefine(t *testing.T) {
 		if got := shouldRefine(c.now, c.marker); got != c.want {
 			t.Errorf("shouldRefine(%v, %q) = %v, want %v", c.now.Format("15:04"), c.marker, got, c.want)
 		}
+	}
+}
+
+// TestBackupLedger 是 B-07 的备份：热备文件能生成、能用 sqlite 打开、
+// 旧文件按 7 天轮转被删、结果写进 execution_ledger。
+func TestBackupLedger(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "ledger.db")
+	l, err := ledger.Open(dbPath)
+	if err != nil {
+		t.Fatalf("ledger.Open: %v", err)
+	}
+	defer ledger.Close(l)
+	if _, err := l.RecordExecution(ledger.ExecutionRecord{
+		SessionID: "s1", TaskID: "t1", ToolID: "tool-a",
+		Command: "echo hi", ExitCode: 0, Status: "success",
+	}); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	// 放两个假旧备份：8 天前的该删，3 天前的该留。
+	backups := filepath.Join(dir, "backups")
+	if err := os.MkdirAll(backups, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	today := beijingNow().Format("2006-01-02")
+	oldDate := beijingNow().AddDate(0, 0, -8).Format("2006-01-02")
+	newDate := beijingNow().AddDate(0, 0, -3).Format("2006-01-02")
+	for _, d := range []string{oldDate, newDate} {
+		if err := os.WriteFile(filepath.Join(backups, backupFileName(d)), []byte("fake"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w := New(l, dbPath, nil)
+	path, err := w.BackupLedger(dir)
+	if err != nil {
+		t.Fatalf("BackupLedger: %v", err)
+	}
+	if want := filepath.Join(backups, backupFileName(today)); path != want {
+		t.Fatalf("backup path = %s, want %s", path, want)
+	}
+	// 备份文件能用 sqlite 打开，且有一行 execution_ledger。
+	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro")
+	if err != nil {
+		t.Fatalf("open backup: %v", err)
+	}
+	defer db.Close()
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM execution_ledger`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("backup execution rows = %d, err = %v, want 1", n, err)
+	}
+	// 轮转：8 天前删了，3 天前还在。
+	if _, err := os.Stat(filepath.Join(backups, backupFileName(oldDate))); !os.IsNotExist(err) {
+		t.Fatalf("old backup %s should be pruned", oldDate)
+	}
+	if _, err := os.Stat(filepath.Join(backups, backupFileName(newDate))); err != nil {
+		t.Fatalf("recent backup %s should be kept: %v", newDate, err)
+	}
+	// 记账行：backup-ledger 成功 1 行。
+	rows, err := l.ListExecutions("backup-"+today, 10)
+	if err != nil || len(rows) != 1 || rows[0].ToolID != "backup-ledger" || rows[0].Status != "success" {
+		t.Fatalf("backup ledger rows = %+v, err = %v, want one success", rows, err)
+	}
+	// 同一天重复跑：覆盖旧文件，不报错。
+	if _, err := w.BackupLedger(dir); err != nil {
+		t.Fatalf("second BackupLedger same day: %v", err)
+	}
+}
+
+// TestShouldBackup 是备份窗口：只在北京时间 03:30–03:45 且当天未跑过时跑。
+func TestShouldBackup(t *testing.T) {
+	loc := time.FixedZone("CST", 8*3600)
+	mk := func(h, m int) time.Time {
+		return time.Date(2026, 11, 17, h, m, 0, 0, loc)
+	}
+	if !shouldBackup(mk(3, 30), "") {
+		t.Fatal("03:30 should backup")
+	}
+	if !shouldBackup(mk(3, 44), "2026-11-16") {
+		t.Fatal("03:44 yesterday marker should backup")
+	}
+	if shouldBackup(mk(3, 45), "") {
+		t.Fatal("03:45 should not backup")
+	}
+	if shouldBackup(mk(3, 29), "") {
+		t.Fatal("03:29 should not backup")
+	}
+	if shouldBackup(mk(4, 0), "") {
+		t.Fatal("04:00 should not backup")
+	}
+	if shouldBackup(mk(3, 35), "2026-11-17") {
+		t.Fatal("already backed up today should not backup")
 	}
 }

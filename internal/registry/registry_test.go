@@ -66,19 +66,19 @@ func copyFile(src, dst string) error {
 	return err
 }
 
-// 1. 加载 72 条。
-func TestLoad72Entries(t *testing.T) {
+// 1. 加载 73 条（第 11 步加了 cap-design-hyperframes，design 7→8）。
+func TestLoad73Entries(t *testing.T) {
 	rg, err := Load(fixture(t))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if got := rg.Count(); got != 72 {
-		t.Fatalf("Count = %d, want 72", got)
+	if got := rg.Count(); got != 73 {
+		t.Fatalf("Count = %d, want 73", got)
 	}
 	if got := len(Categories()); got != 6 {
 		t.Fatalf("Categories = %d, want 6", got)
 	}
-	want := map[string]int{"fetch": 13, "code": 7, "seo": 7, "design": 7, "ops": 22, "memory": 16}
+	want := map[string]int{"fetch": 13, "code": 7, "seo": 7, "design": 8, "ops": 22, "memory": 16}
 	for cat, n := range want {
 		if got := len(rg.EntriesByCategory(cat)); got != n {
 			t.Errorf("category %s = %d entries, want %d", cat, got, n)
@@ -263,5 +263,47 @@ func TestLoadValidation(t *testing.T) {
 	}
 	if _, err := Load(dir2); err == nil {
 		t.Error("Load with orphan L3: want error, got nil")
+	}
+}
+
+// TestNeedsProbeAndMarkVerified 是 B-03 的探针门：verified=false 的可用工具
+// 调用前必须探针；探针通过后本进程内不再重复探针；已验证的工具不探针。
+func TestNeedsProbeAndMarkVerified(t *testing.T) {
+	rg, err := Load(fixture(t))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !rg.NeedsProbe("cap-design-hyperframes") {
+		t.Fatal("hyperframes verified=false, want NeedsProbe=true")
+	}
+	if rg.NeedsProbe("cap-code-semgrep") {
+		t.Fatal("semgrep verified, want NeedsProbe=false")
+	}
+	if rg.NeedsProbe("no-such-tool") {
+		t.Fatal("missing tool, want NeedsProbe=false")
+	}
+	if rg.NeedsProbe("cap-memory-playbooks") {
+		t.Fatal("available=false, want NeedsProbe=false")
+	}
+	rg.MarkVerified("cap-design-hyperframes")
+	if rg.NeedsProbe("cap-design-hyperframes") {
+		t.Fatal("after MarkVerified, want NeedsProbe=false")
+	}
+}
+
+// TestProbeEntry 是探针本身的口径：首词在 PATH 或文件存在即通过，
+// 否则失败；空 entry_point 失败。
+func TestProbeEntry(t *testing.T) {
+	if err := ProbeEntry(Entry{EntryPoint: "echo hi"}); err != nil {
+		t.Fatalf("ProbeEntry(echo): %v", err)
+	}
+	if err := ProbeEntry(Entry{EntryPoint: "no-such-cmd-xyz-123"}); err == nil {
+		t.Fatal("ProbeEntry(missing cmd) should fail")
+	}
+	if err := ProbeEntry(Entry{EntryPoint: "/nonexistent/path/tool"}); err == nil {
+		t.Fatal("ProbeEntry(missing file) should fail")
+	}
+	if err := ProbeEntry(Entry{EntryPoint: ""}); err == nil {
+		t.Fatal("ProbeEntry(empty) should fail")
 	}
 }

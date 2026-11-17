@@ -19,6 +19,8 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+
+	"007-super-agent/internal/llm"
 )
 
 const (
@@ -53,11 +55,12 @@ type AdvisorConfig struct {
 }
 
 type AdvisorDecision struct {
-	Verdict        string `json:"verdict"` // NOTE | CONCERN | HALT
-	Reason         string `json:"reason"`
-	FixDirective   string `json:"fix_directive"`
-	ShouldBlock    bool   `json:"should_block"`    // true only when HALT and retryCount < MaxAdvisorRetries
-	ShouldEscalate bool   `json:"should_escalate"` // true when HALT reaches retry cap or repeats same reason
+	Verdict        string    `json:"verdict"` // NOTE | CONCERN | HALT
+	Reason         string    `json:"reason"`
+	FixDirective   string    `json:"fix_directive"`
+	ShouldBlock    bool      `json:"should_block"`    // true only when HALT and retryCount < MaxAdvisorRetries
+	ShouldEscalate bool      `json:"should_escalate"` // true when HALT reaches retry cap or repeats same reason
+	Usage          llm.Usage // 本次调用的 token 用量（供调用方记进 expense_ledger）
 }
 
 func truncateByTokenCap(s string, maxTokens int) string {
@@ -166,6 +169,12 @@ func RunAdvisorCheck(ctx context.Context, cfg AdvisorConfig, bundle EvidenceBund
 				Content string `json:"content"`
 			} `json:"message"`
 		} `json:"choices"`
+		Usage struct {
+			PromptTokens     int64 `json:"prompt_tokens"`
+			PromptCacheHit   int64 `json:"prompt_cache_hit_tokens"`
+			PromptCacheMiss  int64 `json:"prompt_cache_miss_tokens"`
+			CompletionTokens int64 `json:"completion_tokens"`
+		} `json:"usage"`
 	}
 	if err := json.Unmarshal(raw, &apiResp); err != nil || len(apiResp.Choices) == 0 {
 		return AdvisorDecision{}, fmt.Errorf("advisor invalid response: %s", truncateByTokenCap(string(raw), 100))
@@ -174,6 +183,12 @@ func RunAdvisorCheck(ctx context.Context, cfg AdvisorConfig, bundle EvidenceBund
 	var dec AdvisorDecision
 	if err := json.Unmarshal([]byte(apiResp.Choices[0].Message.Content), &dec); err != nil {
 		return AdvisorDecision{}, fmt.Errorf("advisor verdict parse error: %w", err)
+	}
+	dec.Usage = llm.Usage{
+		PromptTokens:     apiResp.Usage.PromptTokens,
+		CacheHitTokens:   apiResp.Usage.PromptCacheHit,
+		CacheMissTokens:  apiResp.Usage.PromptCacheMiss,
+		CompletionTokens: apiResp.Usage.CompletionTokens,
 	}
 	if dec.Verdict == "HALT" {
 		sameCause := prevHaltReason != "" && strings.EqualFold(strings.TrimSpace(prevHaltReason), strings.TrimSpace(dec.Reason))

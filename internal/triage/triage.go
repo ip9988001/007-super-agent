@@ -38,6 +38,7 @@ var (
 	ErrInvalidReply   = errors.New("triage: 模型分诊回复非法")
 	ErrToolNotFound   = errors.New("triage: 工具定位不到")
 	ErrToolNotAllowed = errors.New("triage: 工具不可调用")
+	ErrProbeFailed    = errors.New("triage: 工具预检探针失败")
 )
 
 // Route 是分诊三选一。
@@ -70,7 +71,10 @@ type Decision struct {
 
 // ModelCallFunc 是 Tier-1 的模型调用注入：生产上接 DeepSeek，
 // 返回模型原文 + 输入/输出 token 数。测试时注入桩。
-type ModelCallFunc func(prompt string) (reply string, tokensIn, tokensOut int64, err error)
+// frozen 是冻结前缀（分诊提示词头 + 可用工具清单，放缓存分区 A 区，
+// 跨调用内容固定才能命中缓存）；tail 是本次用户原话（C 区）；
+// taskID 用于费用按任务归属记账。
+type ModelCallFunc func(taskID, frozen, tail string) (reply string, tokensIn, tokensOut int64, err error)
 
 // Tier0Result 是 Tier-0 的结论：Matched 为真表示前缀/定时任务命中。
 // ToolID 只有唯一候选时才有值；多候选时只给 Candidates。
@@ -167,18 +171,69 @@ META：改 Agent 自身配置、定时任务、行为规则，不动外部工具
 TOOL 时 tool_id 必填且必须是总账里真实存在的工具；DIRECT/META 时 tool_id 留空。
 `
 
-// BuildTriagePrompt 生成 Tier-1 分诊提示词（无候选收窄时用）。
-func BuildTriagePrompt(text string) string {
-	return triagePromptHead + "用户原话：" + strings.TrimSpace(text) + "\n"
+// CompactToolList 生成紧凑工具清单：每条一行「tool_id: 一句话」。
+// 只列可用工具（available:false 的不进清单，模型没机会挑它）。
+// candidates 非空时只列候选集（Tier-0 收窄用）；为空时列全量。
+// 顺序固定（总账 6 类顺序 + 类内文件顺序），跨调用内容不变，
+// 冻结前缀才能命中缓存。one_liner 截到 80 字，防清单过长。
+func CompactToolList(reg *registry.Registry, candidates []string) string {
+	if len(candidates) > 0 {
+		var b strings.Builder
+		for _, id := range candidates {
+			e, ok := reg.Entry(id)
+			if !ok || !e.Available {
+				continue
+			}
+			fmt.Fprintf(&b, "- %s: %s\n", e.ToolID, truncateRunes(e.OneLiner, 80))
+		}
+		return b.String()
+	}
+	var b strings.Builder
+	for _, cat := range registry.Categories() {
+		for _, e := range reg.EntriesByCategory(cat) {
+			if !e.Available {
+				continue
+			}
+			fmt.Fprintf(&b, "- %s: %s\n", e.ToolID, truncateRunes(e.OneLiner, 80))
+		}
+	}
+	return b.String()
+}
+
+// truncateRunes 按字符截断到 n 个字（先转 []rune，防中文乱码），超了加 …。
+func truncateRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
+}
+
+// BuildTriageFrozen 生成 Tier-1 分诊的冻结前缀（放缓存分区 A 区）：
+// 提示词头 + 可用工具清单。清单放冻结区，不放每次变的用户区，
+// 跨调用内容固定才能命中缓存。candidates 非空时只列候选集。
+func BuildTriageFrozen(reg *registry.Registry, candidates []string) string {
+	return triagePromptHead +
+		"可用工具清单（只许从中挑 tool_id，清单外的一律非法；没有合适的工具就回 DIRECT 或 META，不要编 tool_id）：\n" +
+		CompactToolList(reg, candidates)
+}
+
+// BuildTriageTail 生成 Tier-1 分诊的尾部（放缓存分区 C 区）：本次用户原话。
+func BuildTriageTail(text string) string {
+	return "用户原话：" + strings.TrimSpace(text) + "\n"
+}
+
+// BuildTriagePrompt 生成 Tier-1 分诊提示词（无候选收窄时用）：
+// 冻结前缀 + 用户原话。调用方要走缓存分区时请拆成
+// BuildTriageFrozen + BuildTriageTail 分别传 system / user。
+func BuildTriagePrompt(reg *registry.Registry, text string) string {
+	return BuildTriageFrozen(reg, nil) + BuildTriageTail(text)
 }
 
 // BuildTriagePromptNarrowed 生成收窄后的 Tier-1 提示词：
 // 模型只许在 Tier-0 给出的候选集里挑工具，不许另编 tool_id。
-func BuildTriagePromptNarrowed(text string, candidates []string) string {
-	return triagePromptHead +
-		"候选工具（只许从中挑一个，不许编别的 tool_id）：" +
-		strings.Join(candidates, ", ") + "\n" +
-		"用户原话：" + strings.TrimSpace(text) + "\n"
+func BuildTriagePromptNarrowed(reg *registry.Registry, text string, candidates []string) string {
+	return BuildTriageFrozen(reg, candidates) + BuildTriageTail(text)
 }
 
 // ParseTriageReply 解析并校验模型的一行 JSON 回复。
@@ -228,6 +283,9 @@ func ParseTriageReply(reply string, reg *registry.Registry) (Decision, error) {
 // ResolveTool 按 L1→L2→L3 的顺序定位并取回一条工具的 L3 说明。
 // 每一步都校验：L1 可读且该类在 6 类之内、L2 含该条、L3 可读且可用；
 // 任一步失败返回错误，绝不换一条凑数。DIRECT 路径不调本函数。
+// 第 14 步 B-03：verified=false 的工具先跑预检探针（存在性检查，
+// 不真跑命令），通过才标记已验证并继续；失败返回 ErrProbeFailed，
+// 调用方负责记账（失败行进 execution_ledger），不禁用、不静默跳过。
 func ResolveTool(reg *registry.Registry, toolID string) (*registry.Entry, string, error) {
 	if strings.TrimSpace(toolID) == "" {
 		return nil, "", fmt.Errorf("%w: empty tool_id", ErrToolNotFound)
@@ -238,6 +296,11 @@ func ResolveTool(reg *registry.Registry, toolID string) (*registry.Entry, string
 	}
 	if !e.Available {
 		return nil, "", fmt.Errorf("%w: %q", ErrToolNotAllowed, toolID)
+	}
+	if reg.NeedsProbe(toolID) {
+		if err := reg.Probe(toolID); err != nil {
+			return nil, "", fmt.Errorf("%w: %q: %v", ErrProbeFailed, toolID, err)
+		}
 	}
 	// L1：读常驻索引（已在 Load 时校验 ≤25 行），确认该类在 6 类之内。
 	// 注：L1 行文用中文类名，slug 级核对走总账的固定 6 类表，不做字符串硬搜。
@@ -298,11 +361,9 @@ func triageTier1(reg *registry.Registry, led *ledger.Ledger, in Input, candidate
 	if modelCall == nil {
 		return Decision{}, ErrNoModel
 	}
-	prompt := BuildTriagePrompt(in.Text)
-	if len(candidates) > 0 {
-		prompt = BuildTriagePromptNarrowed(in.Text, candidates)
-	}
-	reply, tokIn, tokOut, err := modelCall(prompt)
+	prompt := BuildTriageFrozen(reg, candidates)
+	tail := BuildTriageTail(in.Text)
+	reply, tokIn, tokOut, err := modelCall(in.TaskID, prompt, tail)
 	if err != nil {
 		return Decision{}, fmt.Errorf("triage: model call: %w", err)
 	}

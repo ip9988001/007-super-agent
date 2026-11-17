@@ -36,6 +36,9 @@ type Config struct {
 	MergeWindow time.Duration
 	// ForcedWake：首封等超过此时长强制处理，防饿死（旧 waker 180 秒）。
 	ForcedWake time.Duration
+	// Debounce：首封防抖（第 14 步 B-01）：无合并追加的孤信等满此时长
+	// 即处理，不再干等 60 秒合并窗口；同 task_id 有追加信时仍等合并窗口。
+	Debounce time.Duration
 	// MaxPending：待处理队列上限，满了返回 503 并写水位告警。
 	MaxPending int
 	// Shadow：影子模式——收信、分诊照常走，执行只记“影子会跑什么”
@@ -48,6 +51,18 @@ type Config struct {
 	Missing []string
 	// Warnings 是非致命提醒（只有键名/路径，没有值），如 .env 权限过松。
 	Warnings []string
+	// BackupEnabled：记忆自动备份开关（第 15 步），默认关；
+	// 只在私密部署上显式打开（BACKUP_ENABLED=1）。
+	BackupEnabled bool
+	// BackupRepo：期望的私密仓库名 "owner/repo"，默认 DefaultRepo。
+	BackupRepo string
+	// BackupServerID：本机在 memories/ 下的子目录名；为空时取 hostname。
+	BackupServerID string
+	// BackupTokenKey：读 GitHub Token 的环境变量键名（只存键名）；
+	// 默认 "GITHUB_API_TOKEN"，值在 .env（600 权限）里。
+	BackupTokenKey string
+	// BackupRepoDir：git 工作区（部署目录）；为空时取 DataDir 的父目录。
+	BackupRepoDir string
 }
 
 // Defaults 返回带默认值的配置。
@@ -60,8 +75,12 @@ func Defaults() *Config {
 		ListenAddr:   "127.0.0.1:6262",
 		MergeWindow:  60 * time.Second,
 		ForcedWake:   180 * time.Second,
+		Debounce:     3 * time.Second,
 		MaxPending:   100,
 		Shadow:       false,
+		BackupEnabled: false,
+		BackupRepo:    "ip9988001/super-agent-007",
+		BackupTokenKey: "GITHUB_API_TOKEN",
 	}
 }
 
@@ -114,6 +133,11 @@ func Load() (*Config, error) {
 			cfg.ForcedWake = time.Duration(n) * time.Second
 		}
 	}
+	if v, ok := kv["DEBOUNCE_S"]; ok {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.Debounce = time.Duration(n) * time.Second
+		}
+	}
 	if v, ok := kv["MAX_PENDING"]; ok {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			cfg.MaxPending = n
@@ -135,6 +159,30 @@ func Load() (*Config, error) {
 		if b, ok := parseBoolFlag(v); ok {
 			cfg.Shadow = b
 		}
+	}
+	// 记忆自动备份（第 15 步）：只读开关与仓库名、服务器 id、Token 键名、
+	// 工作区路径；Token 值本身只在 backup 包里读环境变量，永不进日志。
+	if v, ok := kv["BACKUP_ENABLED"]; ok {
+		if b, ok := parseBoolFlag(v); ok {
+			cfg.BackupEnabled = b
+		}
+	}
+	if v := os.Getenv("BACKUP_ENABLED"); v != "" {
+		if b, ok := parseBoolFlag(v); ok {
+			cfg.BackupEnabled = b
+		}
+	}
+	if v, ok := kv["BACKUP_REPO"]; ok && strings.TrimSpace(v) != "" {
+		cfg.BackupRepo = strings.TrimSpace(v)
+	}
+	if v, ok := kv["BACKUP_SERVER_ID"]; ok {
+		cfg.BackupServerID = strings.TrimSpace(v)
+	}
+	if v, ok := kv["BACKUP_TOKEN_KEY"]; ok && strings.TrimSpace(v) != "" {
+		cfg.BackupTokenKey = strings.TrimSpace(v)
+	}
+	if v, ok := kv["BACKUP_REPO_DIR"]; ok {
+		cfg.BackupRepoDir = strings.TrimSpace(v)
 	}
 	return cfg, nil
 }

@@ -1,7 +1,7 @@
 // Command refine-verify：写 3 行 L1、跑一次精炼（桩模型）、打印结果。
 package main
 import("context";"fmt";"log";"os";"strings";"time";"007-super-agent/internal/ledger";"007-super-agent/internal/memory";"007-super-agent/internal/watchdog")
-func stub(_ context.Context,_ string)([]memory.WikiEntry,error){return []memory.WikiEntry{{Kind:memory.KindConcepts,Title:"测试词条",Summary:"桩模型提炼",Body:"正文"}},nil}
+func stub(_ context.Context, _ string, _ string)([]memory.WikiEntry,error){return []memory.WikiEntry{{Kind:memory.KindConcepts,Title:"测试词条",Summary:"桩模型提炼",Body:"正文"}},nil}
 func main(){
 dir,_:=os.MkdirTemp("","refverify");l,err:=ledger.Open(dir+"/ledger.db");if err!=nil{log.Fatal(err)};defer ledger.Close(l)
 m,err:=memory.Open(dir+"/memory");if err!=nil{log.Fatal(err)}

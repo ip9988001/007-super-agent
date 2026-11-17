@@ -2,6 +2,7 @@ package triage
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -89,7 +90,7 @@ func openLedger(t *testing.T) *ledger.Ledger {
 
 // stubModel 返回固定回复的 Tier-1 桩。
 func stubModel(reply string) ModelCallFunc {
-	return func(prompt string) (string, int64, int64, error) {
+	return func(taskID, frozen, tail string) (string, int64, int64, error) {
 		return reply, 100, 20, nil
 	}
 }
@@ -133,20 +134,62 @@ func TestTier0PrefixHit(t *testing.T) {
 }
 
 func TestBuildTriagePrompt(t *testing.T) {
-	p := BuildTriagePrompt("帮我查一下今天天气怎么样")
+	rg := loadReg(t)
+	p := BuildTriagePrompt(rg, "帮我查一下今天天气怎么样")
 	for _, want := range []string{"DIRECT|TOOL|META", `{"route"`, "帮我查一下今天天气怎么样"} {
 		if !strings.Contains(p, want) {
 			t.Errorf("prompt missing %q", want)
 		}
 	}
-	if strings.Contains(p, "cap-") {
-		t.Errorf("plain prompt must not leak tool ids")
+	// 第 13 步：提示词必须带可用工具清单（模型只能从清单里挑，
+	// 清单外的一律非法），不再是光秃秃的提示词头。
+	for _, want := range []string{"可用工具清单", "只许从中挑", "cap-code-semgrep", "cap-fetch-curl-jq"} {
+		if !strings.Contains(p, want) {
+			t.Errorf("prompt missing %q", want)
+		}
 	}
-	pn := BuildTriagePromptNarrowed("/seo 优化", []string{"cap-seo-llms-txt", "cap-seo-claude-seo"})
+	// available:false 的不进清单。
+	if strings.Contains(p, "cap-memory-playbooks") {
+		t.Errorf("prompt must not list unavailable tool cap-memory-playbooks")
+	}
+	pn := BuildTriagePromptNarrowed(rg, "/seo 优化", []string{"cap-seo-llms-txt", "cap-seo-claude-seo"})
 	for _, want := range []string{"cap-seo-llms-txt", "cap-seo-claude-seo", "只许从中挑"} {
 		if !strings.Contains(pn, want) {
 			t.Errorf("narrowed prompt missing %q", want)
 		}
+	}
+	// 收窄清单里不许出现候选集之外的工具。
+	if strings.Contains(pn, "cap-code-semgrep") {
+		t.Errorf("narrowed prompt must not list tools outside candidates")
+	}
+}
+
+// TestFrozenListDeterministic：冻结清单跨调用内容固定（顺序、条数一致），
+// 否则缓存前缀命中不了；且清单与总账可用条目一一对应。
+func TestFrozenListDeterministic(t *testing.T) {
+	rg := loadReg(t)
+	a := BuildTriageFrozen(rg, nil)
+	b := BuildTriageFrozen(rg, nil)
+	if a != b {
+		t.Fatalf("frozen prompt not deterministic")
+	}
+	lines := 0
+	for _, ln := range strings.Split(a, "\n") {
+		if strings.HasPrefix(ln, "- ") {
+			lines++
+		}
+	}
+	if lines != 72 { // 73 条总账，1 条 available:false 不进清单
+		// （清单行含 cap-/ext-/skill- 三种前缀，不能只数 "- cap-"）
+		t.Errorf("frozen tool list lines = %d, want 72", lines)
+	}
+	// 冻结前缀 + 尾部分开发送：天气问题走 DIRECT（清单里没有天气工具，
+	// 模型不许编 tool_id；这里用桩模拟模型回 DIRECT，验证链路本身）。
+	led := openLedger(t)
+	d, err := Triage(rg, led, Input{Text: "帮我查一下今天天气怎么样", TaskID: "w1", SessionID: "s1"},
+		stubModel(`{"route":"DIRECT","tool_id":"","reason":"无天气工具，直接答"}`))
+	if err != nil || d.Route != RouteDirect {
+		t.Fatalf("Triage weather = %+v, %v, want DIRECT", d, err)
 	}
 }
 
@@ -269,5 +312,75 @@ func TestTriageNoModel(t *testing.T) {
 	rg := loadReg(t)
 	if _, err := Triage(rg, nil, Input{Text: "你好"}, nil); !errors.Is(err, ErrNoModel) {
 		t.Errorf("Triage without model = %v, want ErrNoModel", err)
+	}
+}
+
+// fixtureWithEntryPoint 把 fixture 里某条工具的 entry_point 改掉
+// （verified 保持 false，用于确定性地测探针通过/失败两条路）。
+func fixtureWithEntryPoint(t *testing.T, toolID, entryPoint string) string {
+	t.Helper()
+	dir := fixture(t)
+	path := filepath.Join(dir, "registry", "registry.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read registry.json: %v", err)
+	}
+	var f struct {
+		Version   string           `json:"version"`
+		Generated string           `json:"generated"`
+		Total     int              `json:"total"`
+		Entries   []map[string]any `json:"entries"`
+	}
+	if err := json.Unmarshal(raw, &f); err != nil {
+		t.Fatalf("parse registry.json: %v", err)
+	}
+	found := false
+	for _, e := range f.Entries {
+		if e["tool_id"] == toolID {
+			e["entry_point"] = entryPoint
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("tool %s not in fixture", toolID)
+	}
+	out, err := json.Marshal(f)
+	if err != nil {
+		t.Fatalf("marshal registry.json: %v", err)
+	}
+	if err := os.WriteFile(path, out, 0o644); err != nil {
+		t.Fatalf("write registry.json: %v", err)
+	}
+	return dir
+}
+
+// TestResolveToolProbeFailed 是 B-03 的失败路：verified=false 且
+// entry_point 不存在的工具，ResolveTool 必须报 ErrProbeFailed，
+// 调用方据此记账，不执行。
+func TestResolveToolProbeFailed(t *testing.T) {
+	dir := fixtureWithEntryPoint(t, "cap-design-hyperframes", "no-such-cmd-xyz-123")
+	rg, err := registry.Load(dir)
+	if err != nil {
+		t.Fatalf("load registry: %v", err)
+	}
+	if _, _, err := ResolveTool(rg, "cap-design-hyperframes"); !errors.Is(err, ErrProbeFailed) {
+		t.Fatalf("ResolveTool err = %v, want ErrProbeFailed", err)
+	}
+}
+
+// TestResolveToolProbePasses 是 B-03 的通过路：verified=false 但
+// entry_point 真实存在的工具，探针通过后照常定位，不禁用。
+func TestResolveToolProbePasses(t *testing.T) {
+	dir := fixtureWithEntryPoint(t, "cap-design-hyperframes", "echo hyperframes")
+	rg, err := registry.Load(dir)
+	if err != nil {
+		t.Fatalf("load registry: %v", err)
+	}
+	e, l3, err := ResolveTool(rg, "cap-design-hyperframes")
+	if err != nil || e == nil || l3 == "" {
+		t.Fatalf("ResolveTool = %v, %q, %v, want success after probe", e, l3, err)
+	}
+	if rg.NeedsProbe("cap-design-hyperframes") {
+		t.Fatal("probe passed but NeedsProbe still true")
 	}
 }

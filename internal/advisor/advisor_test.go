@@ -20,8 +20,8 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// stubModel 是一台本地桩模型：按请求里的证据内容回 verdict。
-// 请求 JSON 里含 does_not_assert_fixed_field → HALT；否则 NOTE。
+// stubModel 是一台本地桩模型：按请求里的证据内容回 verdict，
+// 并回固定的 usage（供费用记账测试用）。
 func stubModel(t *testing.T, haltReason string) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -38,7 +38,7 @@ func stubModel(t *testing.T, haltReason string) *httptest.Server {
 				break
 			}
 		}
-		fmt.Fprintf(w, `{"choices":[{"message":{"content":%q}}]}`,
+		fmt.Fprintf(w, `{"choices":[{"message":{"content":%q}}],"usage":{"prompt_tokens":1100000,"prompt_cache_hit_tokens":1000000,"prompt_cache_miss_tokens":100000,"completion_tokens":50000}}`,
 			fmt.Sprintf(`{"verdict":%q,"reason":%q,"fix_directive":"给测试补上对该字段的断言"}`, verdict, reason))
 	}))
 }
@@ -143,7 +143,7 @@ func TestAdapterHaltFlow(t *testing.T) {
 	defer adv.Close()
 	task := executor.Task{TaskID: "t9", Text: "修 amount 字段校验", Draft: "已修"}
 	// 假测试证据：先收证据（WorkDir 是空 git 目录，diff 为空串占位），再手填 Diff 走 Check
-	ev, err := adv.CollectEvidenceBundle(task)
+	ev, err := adv.CollectEvidenceBundle(task, executor.TriggerDelivery)
 	if err != nil {
 		t.Fatalf("collect: %v", err)
 	}
@@ -158,5 +158,100 @@ func TestAdapterHaltFlow(t *testing.T) {
 	res2, err := adv.Check(ev, executor.TriggerDelivery)
 	if err != nil || res2.Verdict != executor.VerdictHalt || !strings.Contains(res2.Note, "ESCALATE") {
 		t.Fatalf("check2 同因二连应早退: res=%+v err=%v", res2, err)
+	}
+}
+
+// TestAdvisorExpenseRecorded：第 13 步——监工调用的费用进 expense_ledger，
+// 模型名、hit/miss、费用毫分齐全，按任务归属。
+func TestAdvisorExpenseRecorded(t *testing.T) {
+	srv := stubModel(t, "x")
+	defer srv.Close()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "ledger.db")
+	led, err := ledger.Open(dbPath)
+	if err != nil {
+		t.Fatalf("ledger open: %v", err)
+	}
+	defer ledger.Close(led)
+	adv, err := New(dbPath, AdvisorConfig{Endpoint: srv.URL, APIKey: "test-key", Model: "deepseek-reasoner", Timeout: 10 * time.Second}, dir)
+	if err != nil {
+		t.Fatalf("advisor new: %v", err)
+	}
+	defer adv.Close()
+	adv.Ledger = led
+	task := executor.Task{TaskID: "t-exp", SessionID: "s9", Text: "修 bug", Draft: "已修"}
+	ev, err := adv.CollectEvidenceBundle(task, executor.TriggerDelivery)
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	if _, err := adv.Check(ev, executor.TriggerDelivery); err != nil {
+		t.Fatalf("check: %v", err)
+	}
+	// 桩 usage：hit 1000000 / miss 100000 / out 50000，按 Flash 价
+	// (1000000*20 + 100000*1000 + 50000*4000 + 500000) / 1000000 = 320 毫分。
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var model, taskID, sessionID string
+	var hit, miss, out, cost int64
+	err = db.QueryRow(`SELECT model, task_id, session_id, cache_hit_tokens,
+		cache_miss_tokens, completion_tokens, cost_cny_milli
+		FROM expense_ledger ORDER BY id DESC LIMIT 1`).
+		Scan(&model, &taskID, &sessionID, &hit, &miss, &out, &cost)
+	if err != nil {
+		t.Fatalf("query expense: %v", err)
+	}
+	if model != "deepseek-reasoner" || taskID != "t-exp" || sessionID != "s9" ||
+		hit != 1000000 || miss != 100000 || out != 50000 || cost != 320 {
+		t.Errorf("expense row = model=%s task=%s session=%s hit=%d miss=%d out=%d cost=%d, want reasoner/t-exp/s9/1000000/100000/50000/320",
+			model, taskID, sessionID, hit, miss, out, cost)
+	}
+}
+
+// TestPreActionBundleCarriesCommand：第 13 步——pre-action 预审证据包
+// 必须带拟执行命令与目标文件指纹；delivery 不带预审备注。
+func TestPreActionBundleCarriesCommand(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "ledger.db")
+	led, err := ledger.Open(dbPath)
+	if err != nil {
+		t.Fatalf("ledger open: %v", err)
+	}
+	defer ledger.Close(led)
+	adv, err := New(dbPath, AdvisorConfig{Endpoint: "http://127.0.0.1:1", APIKey: "test-key", Model: "stub", Timeout: time.Second}, dir)
+	if err != nil {
+		t.Fatalf("advisor new: %v", err)
+	}
+	defer adv.Close()
+	target := filepath.Join(dir, "del.txt")
+	if err := os.WriteFile(target, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	task := executor.Task{
+		TaskID: "t-pre", SessionID: "s9", Text: "删临时文件",
+		Command: "rm -f " + target, Irreversible: true,
+		IrreversibleKind: executor.KindDeleteFile,
+	}
+	ev, err := adv.CollectEvidenceBundle(task, executor.TriggerPreAction)
+	if err != nil {
+		t.Fatalf("collect pre-action: %v", err)
+	}
+	for _, want := range []string{"拟执行命令", "rm -f " + target, "【预审】", "不验证完成度"} {
+		if !strings.Contains(ev.TaskText, want) {
+			t.Errorf("pre-action TaskText %q missing %q", ev.TaskText, want)
+		}
+	}
+	if !strings.Contains(ev.ArtifactFingerprint, "del.txt: size=") {
+		t.Errorf("pre-action ArtifactFingerprint %q missing target stat", ev.ArtifactFingerprint)
+	}
+	// delivery 触发不带预审备注与命令。
+	ev2, err := adv.CollectEvidenceBundle(task, executor.TriggerDelivery)
+	if err != nil {
+		t.Fatalf("collect delivery: %v", err)
+	}
+	if strings.Contains(ev2.TaskText, "拟执行命令") || strings.Contains(ev2.TaskText, "【预审】") {
+		t.Errorf("delivery TaskText %q must not carry pre-action note", ev2.TaskText)
 	}
 }

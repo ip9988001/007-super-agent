@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -169,7 +170,7 @@ func TestTriageBadJSON(t *testing.T) {
 	defer srv.Close()
 	c := New("deepseek-flash", "test-key")
 	c.BaseURL = srv.URL
-	reply, _, _, err := c.TriageCall("用户原话：你好")
+	reply, _, _, err := c.TriageCall("t1", "你是分诊器。", "用户原话：你好")
 	if err != nil {
 		t.Fatalf("TriageCall: %v", err)
 	}
@@ -236,6 +237,102 @@ func TestBuildArgv(t *testing.T) {
 	if _, err := BuildArgv(reg, "cap-does-not-exist", nil); err == nil {
 		t.Error("unknown tool should be rejected")
 	}
+}
+
+// TestCostMilliForModel：监工模型 deepseek-reasoner 是已退役旧别名，
+// 按官方定价页重定向到 V4.1 Flash、按 Flash 价计费；V4 Pro 另有价表。
+func TestCostMilliForModel(t *testing.T) {
+	// reasoner 与 flash 同价：100 万命中 = 20 毫分。
+	if got := CostMilliForModel("deepseek-reasoner", 1000000, 0, 0, false); got != 20 {
+		t.Errorf("reasoner hit 1M = %d milli, want 20 (flash price)", got)
+	}
+	if got := CostMilliForModel("deepseek-chat", 0, 1000000, 0, false); got != 1000 {
+		t.Errorf("chat miss 1M = %d milli, want 1000 (flash price)", got)
+	}
+	// V4 Pro：100 万命中 = 147 毫分，未命中 = 4402，输出 = 13207。
+	if got := CostMilliForModel("deepseek-v4-pro", 1000000, 0, 0, false); got != 147 {
+		t.Errorf("pro hit 1M = %d milli, want 147", got)
+	}
+	if got := CostMilliForModel("deepseek-v4-pro", 0, 1000000, 0, false); got != 4402 {
+		t.Errorf("pro miss 1M = %d milli, want 4402", got)
+	}
+	if got := CostMilliForModel("deepseek-v4-pro", 0, 0, 1000000, false); got != 13207 {
+		t.Errorf("pro out 1M = %d milli, want 13207", got)
+	}
+	if got := CostMilliForModel("deepseek-v4-pro", 1000000, 0, 0, true); got != 294 {
+		t.Errorf("pro hit 1M peak = %d milli, want 294", got)
+	}
+}
+
+// TestTriageCallZonesAndTask：TriageCall 把 frozen 放第一条 system 消息
+// （缓存分区 A 区）、tail 放最后一条 user 消息（C 区）；费用行按传入
+// 的 taskID 归属，不按 c.TaskID。
+func TestTriageCallZonesAndTask(t *testing.T) {
+	var gotMsgs []Message
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Messages []Message `json:"messages"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		gotMsgs = req.Messages
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(chatOKBody(`{"route":"DIRECT","tool_id":"","reason":"x"}`, 100, 10, 5)))
+	}))
+	defer srv.Close()
+	db := t.TempDir() + "/ledger.db"
+	led, err := ledger.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ledger.Close(led)
+	c := New("deepseek-flash", "test-key")
+	c.BaseURL = srv.URL
+	c.Ledger = led
+	c.SessionID = "s1"
+	c.TaskID = "stale-task-id" // 故意放一个旧值：费用行不许用它
+	if _, _, _, err := c.TriageCall("t-real", "FROZEN-HEAD", "用户原话：你好"); err != nil {
+		t.Fatalf("TriageCall: %v", err)
+	}
+	if len(gotMsgs) != 2 || gotMsgs[0].Role != "system" || gotMsgs[0].Content != "FROZEN-HEAD" ||
+		gotMsgs[1].Role != "user" || gotMsgs[1].Content != "用户原话：你好" {
+		t.Fatalf("messages = %+v, want [system FROZEN-HEAD, user tail]", gotMsgs)
+	}
+	sum, err := led.SummarizeExpense("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.Calls != 1 {
+		t.Fatalf("expense calls = %d, want 1", sum.Calls)
+	}
+	// 费用行 task_id 必须是 t-real，不是 stale-task-id。
+	rows := queryExpenseTaskIDs(t, db)
+	if len(rows) != 1 || rows[0] != "t-real" {
+		t.Errorf("expense task_ids = %v, want [t-real]", rows)
+	}
+}
+
+// queryExpenseTaskIDs 读 expense_ledger 全部 task_id（账本包没有读方法）。
+func queryExpenseTaskIDs(t *testing.T, dbPath string) []string {
+	t.Helper()
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rows, err := db.Query(`SELECT task_id FROM expense_ledger ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, id)
+	}
+	return out
 }
 
 // TestResolveAPIKey：环境变量优先找到密钥；值只返回，不写日志。

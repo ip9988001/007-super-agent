@@ -13,6 +13,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -25,6 +26,7 @@ import (
 	"time"
 
 	"007-super-agent/internal/advisor"
+	"007-super-agent/internal/backup"
 	"007-super-agent/internal/config"
 	"007-super-agent/internal/executor"
 	"007-super-agent/internal/gateway"
@@ -42,7 +44,7 @@ const Version = "v0.1.0"
 // 不调任何模型。非影子模式用 internal/advisor 真实监工（第 11 步已接线）。
 type shadowAdvisor struct{}
 
-func (shadowAdvisor) CollectEvidenceBundle(t executor.Task) (executor.Evidence, error) {
+func (shadowAdvisor) CollectEvidenceBundle(t executor.Task, _ executor.Trigger) (executor.Evidence, error) {
 	return executor.Evidence{TaskText: t.Text, Draft: t.Draft}, nil
 }
 
@@ -98,6 +100,17 @@ func (d *daemon) handleInner(env gateway.Envelope) (route, toolID, status string
 	e, _, err := triage.ResolveTool(d.reg, dec.ToolID)
 	if err != nil {
 		log.Printf("task=%s resolve %s: %v", env.TaskID, dec.ToolID, err)
+		// 第 14 步 B-03：预检探针失败要记账（失败行进 execution_ledger），
+		// 不禁用、不静默跳过，任务本身失败返回，不执行。
+		if errors.Is(err, triage.ErrProbeFailed) {
+			if _, rerr := d.led.RecordExecution(ledger.ExecutionRecord{
+				SessionID: d.session, TaskID: env.TaskID, ToolID: dec.ToolID,
+				Command: "probe " + dec.ToolID, ExitCode: 1, Status: "failure",
+				ErrHead: err.Error(),
+			}); rerr != nil {
+				log.Printf("probe record task=%s: %v", env.TaskID, rerr)
+			}
+		}
 		return string(dec.Route), dec.ToolID, "resolve_error"
 	}
 	if d.shadow {
@@ -262,10 +275,18 @@ func main() {
 				log.Fatalf("advisor: %v", err)
 			}
 			ex.Advisor = adv
+			adv.Ledger = led // 第 13 步：监工调用的费用进 expense_ledger
 			log.Printf("advisor ready: model=%s (key found, value never logged)", cfg.AdvisorModel)
 		}
 	}
 	gw := gateway.New(cfg, led, d.handle)
+	gw.SetSession(d.session)
+	// 第 14 步 B-02：启动时重放崩溃前没确认的 inbox 行（先于 Start）。
+	if n, err := gw.ReplayInbox(); err != nil {
+		log.Printf("gateway replay: %v", err)
+	} else if n > 0 {
+		log.Printf("gateway replay: %d inbox rows requeued", n)
+	}
 	gw.Start()
 
 	// 每日精炼（第 12 步）：影子模式不启动（精炼会真写 Wiki）；
@@ -278,6 +299,34 @@ func main() {
 		log.Printf("refine loop started: daily 04:00 Beijing, model=%s", cfg.WorkerModel)
 	} else if !shadow {
 		log.Printf("refine loop disabled: no llm client")
+	}
+
+	// 记忆自动备份（第 15 步）：仅非影子模式且 BACKUP_ENABLED=1 时接线，
+	// 默认关闭。备份在 RefineLoop 精炼成功后触发，失败只记账+告警，
+	// 不阻塞精炼与主程序。Token 只认键名（BACKUP_TOKEN_KEY），值永不进日志。
+	if !shadow && cfg.BackupEnabled {
+		br := backup.NewRunner(backup.Config{
+			Enabled:     true,
+			Repo:        cfg.BackupRepo,
+			ServerID:    cfg.BackupServerID,
+			TokenEnvKey: cfg.BackupTokenKey,
+			DataDir:     dataDir,
+			RepoDir:     cfg.BackupRepoDir,
+		}, led)
+		wd.SetBackupHook(func(ctx context.Context, date string) error {
+			_, err := br.Run(ctx, date)
+			return err
+		})
+		log.Printf("memory backup enabled: repo=%s server=%s token_key=%s", br.RepoName(), br.ServerID(), cfg.BackupTokenKey)
+	} else if !shadow {
+		log.Printf("memory backup disabled (default off)")
+	}
+
+	// 每日账本备份（第 14 步 B-07）：影子模式不启动；
+	// 非影子模式下每天北京时间 03:30 热备 ledger.db，留 7 天。
+	if !shadow {
+		go wd.BackupLoop(refineCtx, dataDir)
+		log.Printf("backup loop started: daily 03:30 Beijing")
 	}
 
 	srv := &http.Server{Addr: cfg.ListenAddr, Handler: gw}

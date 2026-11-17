@@ -9,8 +9,8 @@ import (
 )
 
 // stubModelCall 是 Tier-1 的确定性桩：生产上换成真实模型调用。
-func stubModelCall(p string) (string, int64, int64, error) {
-	if strings.Contains(p, "天气") {
+func stubModelCall(taskID, frozen, tail string) (string, int64, int64, error) {
+	if strings.Contains(tail, "天气") {
 		return `{"route":"DIRECT","tool_id":"","reason":"常识问答"}`, 120, 20, nil
 	}
 	return `{"route":"META","tool_id":"","reason":"改自身定时任务"}`, 120, 20, nil

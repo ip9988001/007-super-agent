@@ -12,7 +12,7 @@ import (
 
 type stub struct{}
 
-func (stub) CollectEvidenceBundle(t executor.Task) (executor.Evidence, error) { return executor.Evidence{TaskText: t.Text}, nil }
+func (stub) CollectEvidenceBundle(t executor.Task, _ executor.Trigger) (executor.Evidence, error) { return executor.Evidence{TaskText: t.Text}, nil }
 func (stub) Check(e executor.Evidence, tr executor.Trigger) (executor.CheckResult, error) { return executor.CheckResult{Verdict: executor.VerdictNote, Note: "路径确认无误"}, nil }
 
 func main() {

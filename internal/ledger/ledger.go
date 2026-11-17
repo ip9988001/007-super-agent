@@ -51,6 +51,25 @@ func Open(path string) (*Ledger, error) {
 		db.Close()
 		return nil, fmt.Errorf("ledger create schema: %w", err)
 	}
+	// 迁移：第 14 步 B-06 给 execution_ledger 加 stage_no / artifact_path
+	// （Stage 边界落盘）。旧库建表时没有这两列，用 ALTER TABLE 补；
+	// 列名是代码里的常量，不是外部输入。
+	for _, col := range []struct{ name, typ string }{
+		{"stage_no", "INTEGER NOT NULL DEFAULT 0"},
+		{"artifact_path", "TEXT NOT NULL DEFAULT ''"},
+	} {
+		var n int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('execution_ledger') WHERE name = ?`, col.name).Scan(&n); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("ledger migrate check %s: %w", col.name, err)
+		}
+		if n == 0 {
+			if _, err := db.Exec(`ALTER TABLE execution_ledger ADD COLUMN ` + col.name + ` ` + col.typ); err != nil {
+				db.Close()
+				return nil, fmt.Errorf("ledger migrate add %s: %w", col.name, err)
+			}
+		}
+	}
 	if err := db.Ping(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("ledger ping: %w", err)
@@ -122,6 +141,8 @@ type ExecutionRecord struct {
 	AdvisorVerdict    string // NONE / NOTE / CONCERN / HALT，为空时记 NONE
 	AdvisorRetryCount int    // 0..2
 	AdvisorNote       string // 入库时自动按字符截断到 600 字
+	StageNo           int    // 第 14 步 B-06：长任务已完成 Stage 号，0 表示非分片记录
+	ArtifactPath      string // 第 14 步 B-06：该 Stage 的落盘产物路径
 }
 
 // RecordExecution 写一行执行回执。失败返回错误。
@@ -140,12 +161,13 @@ func (l *Ledger) RecordExecution(r ExecutionRecord) (int64, error) {
 	}
 	res, err := l.db.Exec(`INSERT INTO execution_ledger
 		(ts, session_id, task_id, tool_id, command, exit_code, stdout_tail, err_head,
-		 duration_ms, status, advisor_verdict, advisor_retry_count, advisor_note)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 duration_ms, status, advisor_verdict, advisor_retry_count, advisor_note,
+		 stage_no, artifact_path)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		time.Now().UTC().Format(time.RFC3339), r.SessionID, r.TaskID, r.ToolID,
 		r.Command, r.ExitCode, lastLines(r.StdoutTail, 20), truncateRunes(r.ErrHead, 600),
 		r.DurationMs, r.Status, r.AdvisorVerdict, r.AdvisorRetryCount,
-		truncateRunes(r.AdvisorNote, 600))
+		truncateRunes(r.AdvisorNote, 600), r.StageNo, r.ArtifactPath)
 	if err != nil {
 		return 0, fmt.Errorf("ledger insert execution_ledger: %w", err)
 	}
@@ -168,6 +190,8 @@ type Execution struct {
 	AdvisorVerdict    string
 	AdvisorRetryCount int
 	AdvisorNote       string
+	StageNo           int
+	ArtifactPath      string
 }
 
 // ListExecutions 按任务查执行回执（最新在前，最多 limit 行）。
@@ -176,7 +200,8 @@ func (l *Ledger) ListExecutions(taskID string, limit int) ([]Execution, error) {
 	defer l.mu.RUnlock()
 	rows, err := l.db.Query(`SELECT id, ts, session_id, task_id, tool_id, command,
 		exit_code, stdout_tail, err_head, duration_ms, status,
-		advisor_verdict, advisor_retry_count, advisor_note
+		advisor_verdict, advisor_retry_count, advisor_note,
+		stage_no, artifact_path
 		FROM execution_ledger WHERE task_id = ? ORDER BY id DESC LIMIT ?`, taskID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("ledger query execution_ledger: %w", err)
@@ -187,7 +212,8 @@ func (l *Ledger) ListExecutions(taskID string, limit int) ([]Execution, error) {
 		var e Execution
 		if err := rows.Scan(&e.ID, &e.TS, &e.SessionID, &e.TaskID, &e.ToolID,
 			&e.Command, &e.ExitCode, &e.StdoutTail, &e.ErrHead, &e.DurationMs,
-			&e.Status, &e.AdvisorVerdict, &e.AdvisorRetryCount, &e.AdvisorNote); err != nil {
+			&e.Status, &e.AdvisorVerdict, &e.AdvisorRetryCount, &e.AdvisorNote,
+			&e.StageNo, &e.ArtifactPath); err != nil {
 			return nil, fmt.Errorf("ledger scan execution_ledger: %w", err)
 		}
 		out = append(out, e)
@@ -278,4 +304,244 @@ func (l *Ledger) SummarizeExpense(sessionID string) (ExpenseSummary, error) {
 		return s, fmt.Errorf("ledger summarize expense_ledger: %w", err)
 	}
 	return s, nil
+}
+
+// ---- inbox_queue：网关持久化入队队列（第 14 步 B-02）----
+
+// InboxStatus 是 inbox_queue 一行的状态。
+const (
+	InboxPending = "PENDING" // 待处理
+	InboxRunning = "RUNNING" // 已取走未确认
+	InboxDone    = "DONE"    // 已确认
+	InboxFailed  = "FAILED"  // 已失败
+)
+
+// InboxRecord 是一次入队的信。
+type InboxRecord struct {
+	SessionID string
+	TaskID    string
+	Seq       int64 // 发信方给的入站序号；0 表示发信方没给序号，不做去重
+	Source    string
+	Text      string
+}
+
+// InboxRow 是从 inbox_queue 读回的一行。
+type InboxRow struct {
+	ID         int64
+	TS         string
+	SessionID  string
+	TaskID     string
+	Seq        int64
+	Source     string
+	Text       string
+	Status     string
+	RetryCount int
+	CreatedTS  string
+	UpdatedTS  string
+}
+
+// EnqueueInbox 先落盘再回执：同一事务里写 PENDING 行，返回行 id。
+// seq>0 且同 (task_id, seq) 已有 PENDING/RUNNING 行时视为重复投递，
+// 返回 inserted=false，不写新行（调用方直接回合并回执）。
+// seq==0 时每条都是独立投递，恒插入。失败返回错误，调用方不得发回执。
+func (l *Ledger) EnqueueInbox(r InboxRecord) (id int64, inserted bool, err error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := time.Now().UTC().Format(time.RFC3339)
+	tx, err := l.db.Begin()
+	if err != nil {
+		return 0, false, fmt.Errorf("ledger inbox begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if r.Seq > 0 {
+		var n int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM inbox_queue
+			WHERE task_id = ? AND inbound_seq = ? AND status IN ('PENDING','RUNNING')`,
+			r.TaskID, r.Seq).Scan(&n); err != nil {
+			return 0, false, fmt.Errorf("ledger inbox dedup check: %w", err)
+		}
+		if n > 0 {
+			return 0, false, nil
+		}
+	}
+	res, err := tx.Exec(`INSERT INTO inbox_queue
+		(ts, session_id, task_id, inbound_seq, source, text, status, retry_count, created_ts, updated_ts)
+		VALUES (?, ?, ?, ?, ?, ?, 'PENDING', 0, ?, ?)`,
+		now, r.SessionID, r.TaskID, r.Seq, r.Source, r.Text, now, now)
+	if err != nil {
+		return 0, false, fmt.Errorf("ledger inbox insert: %w", err)
+	}
+	id, err = res.LastInsertId()
+	if err != nil {
+		return 0, false, fmt.Errorf("ledger inbox last id: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, false, fmt.Errorf("ledger inbox commit: %w", err)
+	}
+	return id, true, nil
+}
+
+// ListInboxByStatus 按状态读 inbox_queue 行（启动重放用，按 id 升序）。
+func (l *Ledger) ListInboxByStatus(status string) ([]InboxRow, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	rows, err := l.db.Query(`SELECT id, ts, session_id, task_id, inbound_seq,
+		source, text, status, retry_count, created_ts, updated_ts
+		FROM inbox_queue WHERE status = ? ORDER BY id ASC`, status)
+	if err != nil {
+		return nil, fmt.Errorf("ledger query inbox_queue: %w", err)
+	}
+	defer rows.Close()
+	return scanInboxRows(rows)
+}
+
+// ListStaleInbox 读出超阈值未确认的 RUNNING 行（水位重排用）：
+// updated_ts 早于 now-threshold 且 retry_count==0 的才算（只重排 1 次）。
+func (l *Ledger) ListStaleInbox(olderThan time.Duration) ([]InboxRow, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	cutoff := time.Now().UTC().Add(-olderThan).Format(time.RFC3339)
+	rows, err := l.db.Query(`SELECT id, ts, session_id, task_id, inbound_seq,
+		source, text, status, retry_count, created_ts, updated_ts
+		FROM inbox_queue WHERE status = 'RUNNING' AND retry_count = 0
+		AND updated_ts < ? ORDER BY id ASC`, cutoff)
+	if err != nil {
+		return nil, fmt.Errorf("ledger query stale inbox: %w", err)
+	}
+	defer rows.Close()
+	return scanInboxRows(rows)
+}
+
+func scanInboxRows(rows *sql.Rows) ([]InboxRow, error) {
+	var out []InboxRow
+	for rows.Next() {
+		var r InboxRow
+		if err := rows.Scan(&r.ID, &r.TS, &r.SessionID, &r.TaskID, &r.Seq,
+			&r.Source, &r.Text, &r.Status, &r.RetryCount, &r.CreatedTS, &r.UpdatedTS); err != nil {
+			return nil, fmt.Errorf("ledger scan inbox_queue: %w", err)
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// MarkInboxRunning 按行 id 把一行 PENDING 行改成 RUNNING（取走待确认）。
+// 只在当前状态为 PENDING 时才改。按行 id 改，不按 (task_id, seq) 改——
+// seq==0 的多条投递共享 task_id。
+func (l *Ledger) MarkInboxRunning(id int64) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	res, err := l.db.Exec(`UPDATE inbox_queue SET status = 'RUNNING', updated_ts = ?
+		WHERE id = ? AND status = 'PENDING'`,
+		time.Now().UTC().Format(time.RFC3339), id)
+	if err != nil {
+		return fmt.Errorf("ledger inbox mark RUNNING: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("ledger inbox mark RUNNING: id %d 不是 PENDING 行", id)
+	}
+	return nil
+}
+
+// MarkInboxDone 按行 id 把一行 RUNNING 行改成 DONE（已确认）。
+// 只在当前状态为 RUNNING 时才改——被水位重排回 PENDING 的行不会被
+// 原始执行误标为 DONE（重排后的副本仍会走自己的 RUNNING→DONE）。
+func (l *Ledger) MarkInboxDone(id int64) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	res, err := l.db.Exec(`UPDATE inbox_queue SET status = 'DONE', updated_ts = ?
+		WHERE id = ? AND status = 'RUNNING'`,
+		time.Now().UTC().Format(time.RFC3339), id)
+	if err != nil {
+		return fmt.Errorf("ledger inbox mark DONE: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("ledger inbox mark DONE: id %d 不是 RUNNING 行", id)
+	}
+	return nil
+}
+
+// MarkInboxFailed 按行 id 把一行 RUNNING 行改成 FAILED（执行时崩溃）。
+func (l *Ledger) MarkInboxFailed(id int64) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	res, err := l.db.Exec(`UPDATE inbox_queue SET status = 'FAILED', updated_ts = ?
+		WHERE id = ? AND status = 'RUNNING'`,
+		time.Now().UTC().Format(time.RFC3339), id)
+	if err != nil {
+		return fmt.Errorf("ledger inbox mark FAILED: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("ledger inbox mark FAILED: id %d 不是 RUNNING 行", id)
+	}
+	return nil
+}
+
+// RequeueInbox 按行 id 把一行 RUNNING 行重排回 PENDING（水位超时自动重排 1 次）：
+// retry_count+1，调用方只对 retry_count==0 的行调本方法。
+func (l *Ledger) RequeueInbox(id int64) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	res, err := l.db.Exec(`UPDATE inbox_queue
+		SET status = 'PENDING', retry_count = retry_count + 1, updated_ts = ?
+		WHERE id = ? AND status = 'RUNNING' AND retry_count = 0`,
+		time.Now().UTC().Format(time.RFC3339), id)
+	if err != nil {
+		return fmt.Errorf("ledger inbox requeue: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("ledger inbox requeue: id %d 不是可重排的 RUNNING 行", id)
+	}
+	return nil
+}
+
+// ---- Stage 边界落盘（第 14 步 B-06）----
+
+// StageRecord 是长任务一个已完成 Stage 的落盘记录。
+type StageRecord struct {
+	SessionID    string
+	TaskID       string
+	ToolID       string
+	StageNo      int    // 从 1 开始编号
+	ArtifactPath string // 该 Stage 的落盘产物路径（为空表示无产物）
+	Command      string // 该 Stage 跑过的命令摘要（为空时自动填 stage <n>）
+}
+
+// RecordStage 把一个已完成 Stage 写进 execution_ledger（stage_no /
+// artifact_path 两列）。失败返回错误，不许静默吞掉。
+func (l *Ledger) RecordStage(r StageRecord) (int64, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	cmd := r.Command
+	if cmd == "" {
+		cmd = fmt.Sprintf("stage %d", r.StageNo)
+	}
+	res, err := l.db.Exec(`INSERT INTO execution_ledger
+		(ts, session_id, task_id, tool_id, command, exit_code, stdout_tail, err_head,
+		 duration_ms, status, advisor_verdict, advisor_retry_count, advisor_note,
+		 stage_no, artifact_path)
+		VALUES (?, ?, ?, ?, ?, 0, '', '', 0, 'success', 'NONE', 0, '', ?, ?)`,
+		time.Now().UTC().Format(time.RFC3339), r.SessionID, r.TaskID, r.ToolID,
+		cmd, r.StageNo, r.ArtifactPath)
+	if err != nil {
+		return 0, fmt.Errorf("ledger insert stage: %w", err)
+	}
+	return res.LastInsertId()
+}
+
+// LastStage 查某任务某工具最后一个已完成 Stage（重跑时从下一 Stage 接续）。
+// 无记录时 found=false，不报错。
+func (l *Ledger) LastStage(taskID, toolID string) (stageNo int, artifactPath string, found bool, err error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	err = l.db.QueryRow(`SELECT stage_no, artifact_path FROM execution_ledger
+		WHERE task_id = ? AND tool_id = ? AND stage_no > 0
+		ORDER BY stage_no DESC LIMIT 1`, taskID, toolID).Scan(&stageNo, &artifactPath)
+	if err == sql.ErrNoRows {
+		return 0, "", false, nil
+	}
+	if err != nil {
+		return 0, "", false, fmt.Errorf("ledger query last stage: %w", err)
+	}
+	return stageNo, artifactPath, true, nil
 }

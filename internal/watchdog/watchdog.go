@@ -13,11 +13,11 @@
 package watchdog
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
-	"os"
-	"os/exec"
+	"log"
 	"strings"
 	"time"
 
@@ -37,22 +37,9 @@ type ProbeFunc func(e registry.Entry) error
 
 // DefaultProbe 是默认探针：entry_point 首词含 "/" 时看文件在不在，
 // 否则在 PATH 里找命令。只做存在性检查，不执行。
+// 实现委托给 registry.ProbeEntry（探针口径唯一实现，防两处漂移）。
 func DefaultProbe(e registry.Entry) error {
-	ep := strings.TrimSpace(e.EntryPoint)
-	if ep == "" {
-		return errors.New("entry_point 为空")
-	}
-	first := strings.Fields(ep)[0]
-	if strings.Contains(first, "/") {
-		if _, err := os.Stat(first); err != nil {
-			return fmt.Errorf("entry_point %q 不存在: %v", first, err)
-		}
-		return nil
-	}
-	if _, err := exec.LookPath(first); err != nil {
-		return fmt.Errorf("命令 %q 不在 PATH: %v", first, err)
-	}
-	return nil
+	return registry.ProbeEntry(e)
 }
 
 // Watchdog 是看护：体检写账本用 led，核算只读 dbPath 指定的 ledger.db。
@@ -61,6 +48,24 @@ type Watchdog struct {
 	led    *ledger.Ledger
 	dbPath string
 	probe  ProbeFunc
+	// backupHook 是精炼成功后调的记忆备份钩子（第 15 步）；为 nil 时不跑。
+	// 由 main.go 接线；钩子失败只记日志，不影响精炼标记与主循环。
+	backupHook func(ctx context.Context, date string) error
+}
+
+// SetBackupHook 接入精炼成功后的记忆备份钩子（第 15 步）。
+func (w *Watchdog) SetBackupHook(fn func(ctx context.Context, date string) error) {
+	w.backupHook = fn
+}
+
+// afterRefine 在精炼成功后调备份钩子；钩子失败只记日志，不报错、不阻塞。
+func (w *Watchdog) afterRefine(ctx context.Context, date string) {
+	if w.backupHook == nil {
+		return
+	}
+	if err := w.backupHook(ctx, date); err != nil {
+		log.Printf("refine loop: 记忆备份失败（只记日志，不影响精炼）: %v", err)
+	}
 }
 
 // New 建一个看护。probe 为 nil 时用 DefaultProbe。
@@ -89,15 +94,16 @@ type CheckResult struct {
 var sopMarkers = []string{"输入", "步骤", "验收"}
 
 // CheckRegistry 体检总账：逐条核对真身（entry_point 存在、探针通过、
-// L3 的 SOP 三要素齐全）。坏条目记进 execution_ledger（状态 failed，
-// 原因写清），不删总账、不改总账。记账失败会汇总进返回的错误。
+// L3 的 SOP 三要素齐全）。坏条目只写一行汇总回执进 execution_ledger
+// （checked/ok/broken 数 + 前 5 个坏条目名），明细只记日志——
+// 逐条写 failure 会淹没账本（一次启动曾写 66 行）。不删总账、不改总账。
+// 记账失败会汇总进返回的错误。
 func (w *Watchdog) CheckRegistry(dataDir string) (CheckResult, error) {
 	var res CheckResult
 	rg, err := registry.Load(dataDir)
 	if err != nil {
 		return res, fmt.Errorf("watchdog: load registry: %w", err)
 	}
-	var recordErrs []string
 	for _, cat := range registry.Categories() {
 		for _, e := range rg.EntriesByCategory(cat) {
 			if !e.Available {
@@ -123,26 +129,52 @@ func (w *Watchdog) CheckRegistry(dataDir string) (CheckResult, error) {
 				continue
 			}
 			res.Broken = append(res.Broken, BrokenEntry{ToolID: e.ToolID, Reason: reason})
-			if w.led != nil {
-				_, err := w.led.RecordExecution(ledger.ExecutionRecord{
-					SessionID: "watchdog",
-					TaskID:    "watchdog-daily-check",
-					ToolID:    e.ToolID,
-					Command:   "watchdog check " + e.ToolID,
-					ExitCode:  1,
-					Status:    "failure",
-					ErrHead:   reason,
-				})
-				if err != nil {
-					recordErrs = append(recordErrs, fmt.Sprintf("%s 记账失败：%v", e.ToolID, err))
-				}
-			}
+			// 明细只记日志，不进账本。
+			log.Printf("watchdog check broken: %s: %s", e.ToolID, reason)
 		}
 	}
-	if len(recordErrs) > 0 {
-		return res, fmt.Errorf("watchdog: %s", strings.Join(recordErrs, "；"))
+	if w.led != nil {
+		if err := w.recordCheckSummary(res); err != nil {
+			return res, fmt.Errorf("watchdog: 体检汇总记账失败：%w", err)
+		}
 	}
 	return res, nil
+}
+
+// recordCheckSummary 只写一行体检汇总回执：checked/ok/broken 数 +
+// 前 5 个坏条目名。有坏条目时状态 failure，否则 success。
+func (w *Watchdog) recordCheckSummary(res CheckResult) error {
+	names := make([]string, 0, 5)
+	for i, b := range res.Broken {
+		if i >= 5 {
+			break
+		}
+		names = append(names, b.ToolID)
+	}
+	broken := "none"
+	if len(names) > 0 {
+		broken = strings.Join(names, ", ")
+		if len(res.Broken) > 5 {
+			broken += fmt.Sprintf(" 等 %d 条", len(res.Broken))
+		}
+	}
+	status := "success"
+	exitCode := 0
+	if len(res.Broken) > 0 {
+		status = "failure"
+		exitCode = 1
+	}
+	_, err := w.led.RecordExecution(ledger.ExecutionRecord{
+		SessionID: "watchdog",
+		TaskID:    "watchdog-daily-check",
+		ToolID:    "watchdog-daily-check",
+		Command:   "watchdog check summary",
+		ExitCode:  exitCode,
+		Status:    status,
+		ErrHead: fmt.Sprintf("checked=%d ok=%d broken=%d skipped=%d; broken: %s",
+			res.Checked, res.OK, len(res.Broken), res.Skipped, broken),
+	})
+	return err
 }
 
 // Savings 是一次每日省 token 核算的结果。

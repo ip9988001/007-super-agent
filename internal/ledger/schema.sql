@@ -70,6 +70,28 @@ CREATE TABLE IF NOT EXISTS queue_watermarks (
     unacked_alert       INTEGER NOT NULL DEFAULT 0  -- 1=触发未确认告警
 );
 
+-- inbox_queue 是网关的持久化入队队列表（第 14 步 B-02）：收信先落盘
+-- 再回执，进程崩溃也不丢任务；启动时重放 PENDING/RUNNING 行。
+-- status：PENDING 待处理 / RUNNING 已取走未确认 / DONE 已确认 / FAILED 已失败。
+-- (task_id, inbound_seq) 只在 seq>0 时唯一（发信方给了序号才防重放；
+-- seq=0 表示发信方没给序号，每条都是独立投递，不做去重）。
+CREATE TABLE IF NOT EXISTS inbox_queue (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          TEXT    NOT NULL,  -- RFC3339 UTC，入队时间
+    session_id  TEXT    NOT NULL,
+    task_id     TEXT    NOT NULL,
+    inbound_seq INTEGER NOT NULL DEFAULT 0,
+    source      TEXT    NOT NULL DEFAULT '',
+    text        TEXT    NOT NULL,
+    status      TEXT    NOT NULL,  -- PENDING / RUNNING / DONE / FAILED
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    created_ts  TEXT    NOT NULL,
+    updated_ts  TEXT    NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_inbox_dedup ON inbox_queue(task_id, inbound_seq) WHERE inbound_seq > 0;
+CREATE INDEX IF NOT EXISTS idx_inbox_status ON inbox_queue(status, updated_ts);
+
 CREATE INDEX IF NOT EXISTS idx_execution_task ON execution_ledger(task_id);
 CREATE INDEX IF NOT EXISTS idx_expense_session ON expense_ledger(session_id);
 CREATE INDEX IF NOT EXISTS idx_triage_task ON triage_metrics(task_id);

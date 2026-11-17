@@ -10,17 +10,17 @@ func main() {
 	defer srv.Close()
 	c := llm.New("deepseek-flash", "test-key")
 	c.BaseURL = srv.URL
-	reply, _, _, err := c.TriageCall(triage.BuildTriagePrompt("帮我查一下今天天气怎么样"))
-	if err != nil {
-		fmt.Println("triage call:", err)
-		os.Exit(1)
-	}
 	reg, err := registry.Load("/root/super-agent-007/data")
 	if err != nil {
 		reg, err = registry.Load("step1")
 	}
 	if err != nil {
 		fmt.Println("registry:", err)
+		os.Exit(1)
+	}
+	reply, _, _, err := c.TriageCall("v1", triage.BuildTriageFrozen(reg, nil), triage.BuildTriageTail("帮我查一下今天天气怎么样"))
+	if err != nil {
+		fmt.Println("triage call:", err)
 		os.Exit(1)
 	}
 	dec, err := triage.ParseTriageReply(reply, reg)

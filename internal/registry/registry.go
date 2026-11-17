@@ -16,8 +16,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 // 硬上限（第 4 轮规格 + 第 1 步审计报告口径）。
@@ -92,7 +94,9 @@ func WithSession(sessionID, taskID string) Option {
 }
 
 // Registry 是加载后的总账 + 三级索引服务。读操作无锁；
-// 加载后内容不可变，调用方只读。
+// 加载后内容不可变，调用方只读。唯一的例外是探针标记：
+// verifiedOverride 只记“本进程内已探针通过”的工具（不写回 registry.json，
+// registry.json 是第 1 步的真相源，运行时绝不重写），由 mu 保护。
 type Registry struct {
 	dataDir   string
 	entries   []Entry
@@ -101,6 +105,9 @@ type Registry struct {
 	metrics   MetricsRecorder
 	sessionID string
 	taskID    string
+
+	mu               sync.RWMutex
+	verifiedOverride map[string]bool
 }
 
 // Load 读 DATA_DIR/registry/registry.json 并全量校验：
@@ -204,6 +211,66 @@ func (rg *Registry) Entry(toolID string) (*Entry, bool) {
 func (rg *Registry) Callable(toolID string) bool {
 	e, ok := rg.byID[toolID]
 	return ok && e.Available
+}
+
+// NeedsProbe 判断一条工具在调用前是否需要先跑预检探针（第 14 步 B-03）：
+// 存在、available 为真，但 StatusTriad.Verified 为假、且本进程内还没探针通过。
+// verified=false 不是禁用——只是还没在实机上验过，探针通过即可调用。
+func (rg *Registry) NeedsProbe(toolID string) bool {
+	e, ok := rg.byID[toolID]
+	if !ok || !e.Available || e.StatusTriad.Verified {
+		return false
+	}
+	rg.mu.RLock()
+	defer rg.mu.RUnlock()
+	return !rg.verifiedOverride[toolID]
+}
+
+// MarkVerified 把一条工具标记为本进程内已探针通过（只记内存，不写回
+// registry.json；进程重启后重新探针）。
+func (rg *Registry) MarkVerified(toolID string) {
+	rg.mu.Lock()
+	defer rg.mu.Unlock()
+	if rg.verifiedOverride == nil {
+		rg.verifiedOverride = map[string]bool{}
+	}
+	rg.verifiedOverride[toolID] = true
+}
+
+// Probe 对一条工具跑预检探针（只做存在性检查，不真跑命令）：
+// entry_point 首词含 "/" 时看文件在不在，否则在 PATH 里找命令。
+// 通过则标记本进程内已验证并返回 nil；失败返回原因，不标记。
+// 与 watchdog.DefaultProbe 同一口径，探针逻辑的唯一实现放在这里，
+// watchdog.DefaultProbe 只是委托（防两处口径漂移）。
+func (rg *Registry) Probe(toolID string) error {
+	e, ok := rg.byID[toolID]
+	if !ok {
+		return fmt.Errorf("%w: %q", ErrNotFound, toolID)
+	}
+	if err := ProbeEntry(*e); err != nil {
+		return err
+	}
+	rg.MarkVerified(toolID)
+	return nil
+}
+
+// ProbeEntry 对一条总账条目做存在性探针（不真跑命令）。
+func ProbeEntry(e Entry) error {
+	ep := strings.TrimSpace(e.EntryPoint)
+	if ep == "" {
+		return errors.New("registry probe: entry_point 为空")
+	}
+	first := strings.Fields(ep)[0]
+	if strings.Contains(first, "/") {
+		if _, err := os.Stat(first); err != nil {
+			return fmt.Errorf("registry probe: entry_point %q 不存在: %v", first, err)
+		}
+		return nil
+	}
+	if _, err := exec.LookPath(first); err != nil {
+		return fmt.Errorf("registry probe: 命令 %q 不在 PATH: %v", first, err)
+	}
+	return nil
 }
 
 // EntriesByCategory 按类取条目（返回拷贝的指针切片，只读）。
