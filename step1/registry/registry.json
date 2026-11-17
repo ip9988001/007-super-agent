@@ -1,7 +1,7 @@
 {
- "version": "1.0",
- "generated": "2026-11-17 Step 1",
- "total": 73,
+ "version": "1.1",
+ "generated": "2026-11-17 Step 1; 2026-11-18 Step 19 batch 5 修订（84 条）",
+ "total": 84,
  "entries": [
   {
    "tool_id": "cap-fetch-agent-reach",
@@ -41,12 +41,12 @@
     "runnable": true,
     "verified": true
    },
-   "available": true,
+   "available": false,
    "last_verified_at": "2026-10-26",
    "source_file": "CAPABILITIES/01-取数与抓取/B-bili.md",
    "one_liner": "bili 0.6.2 —— Bilibili 的命令行客户端：只读热门/排行/搜索/UP主/收藏/历史/动态，外加 `audio` 把视频音频下下来切成 ASR-ready WAV；点赞投币三连发动态等写操作要扫码登录。",
    "verified_basis": "原文件 实际效果（实测 2026-10-26）",
-   "note": "未登录；只读热门/排行/搜索可用",
+   "note": "未登录；只读热门/排行/搜索可用；第 19 步 v2 过滤版不装：CLI 存在但最小调用未出数据，未验证",
    "exact_deepseek_tokens": 536
   },
   {
@@ -79,7 +79,7 @@
    "call_type": "cli",
    "trigger_prefix": null,
    "pre_command": null,
-   "entry_point": "python API（camoufox）",
+   "entry_point": "python3 -c import camoufox",
    "param_schema": {},
    "output_contract": "退出码 0 为成功；失败返回 code 与 stderr 头 600 字；输出截断 8MB",
    "status_triad": {
@@ -90,9 +90,9 @@
    "available": true,
    "last_verified_at": "2026-10-26",
    "source_file": "CAPABILITIES/01-取数与抓取/C-camoufox.md",
-   "one_liner": "Firefox(Gecko) 内核的反检测浏览器：Camoufox v0.5.8 + 指纹生成器 fpgen + 配对 Playwright 1.62.0。`camoufox` 这个 CLI 只管\"下载/切换/查看浏览器\"，真正抓活得在 Python 里 `with Camoufox(...)`。",
+   "one_liner": "Firefox(Gecko) 内核的反检测浏览器：Camoufox v0.5.9 + 指纹生成器 fpgen + 配对 Playwright 1.64.1。`camoufox` 这个 CLI 只管\"下载/切换/查看浏览器\"，真正抓活得在 Python 里 `with Camoufox(...)`。",
    "verified_basis": "原文件 实际效果（实测 2026-10-26）",
-   "note": "CLI 只管版本，抓取走 Python API",
+   "note": "Python API，无 CLI；探针跑 python3 -c import camoufox（第 19 步）",
    "exact_deepseek_tokens": 623
   },
   {
@@ -276,12 +276,12 @@
     "runnable": true,
     "verified": true
    },
-   "available": true,
+   "available": false,
    "last_verified_at": "2026-10-26",
    "source_file": "CAPABILITIES/01-取数与抓取/T-tvly.md",
    "one_liner": "Tavily 的官方命令行：search / extract / crawl / map / research 一把梭，`--json` 适合给 agent 用。",
    "verified_basis": "原文件 实际效果（实测 2026-10-26）",
-   "note": "未登录也有免费返回",
+   "note": "未登录也有免费返回；第 19 步 v2 过滤版不装：无 Tavily key，三号上同样不可用",
    "exact_deepseek_tokens": 528
   },
   {
@@ -357,7 +357,7 @@
    "available": true,
    "last_verified_at": "2026-10-26",
    "source_file": "CAPABILITIES/02-代码与审计/G-ghidra.md",
-   "one_liner": "本地逆向平台 12.1.4 (PUBLIC)，装在 `/data/tools/ghidra`，headless 分析器可跑（JDK 25），不用开 GUI。",
+   "one_liner": "本地逆向平台 12.2 (PUBLIC)，装在 `/data/tools/ghidra`，headless 分析器可跑（JDK 25），不用开 GUI。",
    "verified_basis": "原文件 实际效果（实测 2026-10-26）",
    "note": "headless 分析器可跑（JDK 25），不用开 GUI",
    "exact_deepseek_tokens": 568
@@ -441,7 +441,7 @@
    "category": "code",
    "subcategory": "audit",
    "call_type": "cli",
-   "trigger_prefix": "/audit",
+   "trigger_prefix": null,
    "pre_command": null,
    "entry_point": "semgrep",
    "param_schema": {},
@@ -466,7 +466,7 @@
    "call_type": "cli",
    "trigger_prefix": "/seo",
    "pre_command": null,
-   "entry_point": "content_quality.py",
+   "entry_point": "tools/seo-toolkit/claude-seo/scripts/content_quality.py",
    "param_schema": {},
    "output_contract": "退出码 0 为成功；失败返回 code 与 stderr 头 600 字；输出截断 8MB",
    "status_triad": {
@@ -479,7 +479,7 @@
    "source_file": "CAPABILITIES/03-SEO与内容/C-content-scorers.md",
    "one_liner": "claude-seo 里三个纯文本内容工具（吃 txt/md/html，支持 stdin 与 `--json`）：`content_quality.py` 出 0–100 质量分 · `content_humanize.py` 去 AI 腔 · `content_verify.py` 查主张与引用缺口。",
    "verified_basis": "原文件 实际效果（实测 2026-10-26）",
-   "note": "三个纯文本内容工具，吃 txt/md/html，支持 stdin 与 --json",
+   "note": "入口为种子内脚本（相对部署根目录）；调用走 scripts/runtime.py run（见 L3）",
    "exact_deepseek_tokens": 529
   },
   {
@@ -512,7 +512,7 @@
    "call_type": "cli",
    "trigger_prefix": "/seo",
    "pre_command": null,
-   "entry_point": "audit.py",
+   "entry_point": "tools/seo-toolkit/geo-seo-aeo-skill/scripts/audit.py",
    "param_schema": {},
    "output_contract": "退出码 0 为成功；失败返回 code 与 stderr 头 600 字；输出截断 8MB",
    "status_triad": {
@@ -525,7 +525,7 @@
    "source_file": "CAPABILITIES/03-SEO与内容/G-geo-seo-aeo.md",
    "one_liner": "纯标准库的确定性 SEO/GEO/AEO 体检器：抓一页 → 输出 JSON 事实（布尔+计数，不含总分），零依赖、秒级、可复现。",
    "verified_basis": "原文件 实际效果（实测 2026-10-26）",
-   "note": "纯标准库确定性体检，输出 JSON 事实（布尔+计数，不含总分）",
+   "note": "入口为种子内脚本（相对部署根目录）",
    "exact_deepseek_tokens": 570
   },
   {
@@ -558,7 +558,7 @@
    "call_type": "cli",
    "trigger_prefix": "/seo",
    "pre_command": null,
-   "entry_point": "claude-seo skill 脚本",
+   "entry_point": "tools/seo-toolkit/claude-seo/scripts/claude-seo",
    "param_schema": {},
    "output_contract": "退出码 0 为成功；失败返回 code 与 stderr 头 600 字；输出截断 8MB",
    "status_triad": {
@@ -571,7 +571,7 @@
    "source_file": "CAPABILITIES/03-SEO与内容/S-claude-seo.md",
    "one_liner": "26 个 SEO skill + 19 个 agent + 60 个 py 脚本的技能库（v2.5.0，AgriciDaniel/claude-seo）；所有脚本走 `/data/state/claude-seo/.venv` 托管环境，不污染系统 python。",
    "verified_basis": "原文件 实际效果（实测 2026-10-26）",
-   "note": "26 skill + 19 agent + 60 py 脚本（v2.5.0）",
+   "note": "入口为种子内启动器（相对部署根目录，自带 runtime.py 同级）",
    "exact_deepseek_tokens": 658
   },
   {
@@ -988,7 +988,7 @@
    "available": true,
    "last_verified_at": "2026-10-26",
    "source_file": "CAPABILITIES/05-系统与运维/J-jdk25.md",
-   "one_liner": "`/data/tools/jdk25` = Temurin JDK 25.0.5（bin 下 30 个工具），是 Ghidra 12.1.4 的必需运行时；注意 PATH 里的 `java` 其实是 JDK 17，两套并存。",
+   "one_liner": "`/data/tools/jdk25` = Temurin JDK 25.0.5（bin 下 30 个工具），是 Ghidra 12.2 的必需运行时；注意 PATH 里的 `java` 其实是 JDK 17，两套并存。",
    "verified_basis": "原文件 实际效果（实测 2026-10-26）",
    "note": "Temurin JDK 25.0.5；Ghidra 必需运行时",
    "exact_deepseek_tokens": 658
@@ -1031,12 +1031,12 @@
     "runnable": true,
     "verified": true
    },
-   "available": true,
+   "available": false,
    "last_verified_at": "2026-11-16",
    "source_file": "CAPABILITIES/05-系统与运维/L-lean-ctx.md",
    "one_liner": "终端命令与文件阅读的降噪/压缩网关（单二进制），rtk 已退役，由 lean-ctx 接管。",
    "verified_basis": "no3-tools.md 2026-11-16 盘点（版本+运行）",
-   "note": "实测累计省 1.2K token、22 天零使用；能力表 60% 为单样本，不作主力省 token 手段",
+   "note": "实测累计省 1.2K token、22 天零使用；能力表 60% 为单样本，不作主力省 token 手段；第 19 步 v2 过滤版不装：已死，累计 1.2K token，最后使用 2026-10-26",
    "exact_deepseek_tokens": 547
   },
   {
@@ -1054,12 +1054,12 @@
     "runnable": true,
     "verified": true
    },
-   "available": true,
+   "available": false,
    "last_verified_at": "2026-11-16",
    "source_file": "CAPABILITIES/05-系统与运维/L-llmtrim.md",
    "one_liner": "本地 MITM 压缩代理（`127.0.0.1:43117`），改写发往各家 LLM API 的请求体以少付 input token。",
    "verified_basis": "no3-tools.md 2026-11-16 盘点（版本+运行）",
-   "note": "实测省 5.43%，11-01 后 16 天零新增；改历史消息会击穿 DeepSeek 前缀缓存，新 Agent 不用",
+   "note": "实测省 5.43%，11-01 后 16 天零新增；改历史消息会击穿 DeepSeek 前缀缓存，新 Agent 不用；第 19 步 v2 过滤版不装：已死，实测仅省 5.43%，最后压缩 2026-11-01",
    "exact_deepseek_tokens": 581
   },
   {
@@ -1293,29 +1293,6 @@
    "exact_deepseek_tokens": 521
   },
   {
-   "tool_id": "cap-memory-l1-watcher",
-   "category": "memory",
-   "subcategory": "memory-system",
-   "call_type": "service",
-   "trigger_prefix": null,
-   "pre_command": null,
-   "entry_point": "python3 l1_watcher.py",
-   "param_schema": {},
-   "output_contract": "退出码 0 为成功；失败返回 code 与 stderr 头 600 字；输出截断 8MB",
-   "status_triad": {
-    "installed": true,
-    "runnable": true,
-    "verified": true
-   },
-   "available": true,
-   "last_verified_at": "2026-11-17",
-   "source_file": "CAPABILITIES/06-记忆与知识/L-l1-watcher.md",
-   "one_liner": "常驻 Python 进程（1543 行），每 200ms 扫一遍 `~/.pi/agent/sessions/*.jsonl`，按命中词把用户发言写进 `memory/l1/<日期>.md`。",
-   "verified_basis": "2026-11-17 审计：进程在跑（PID 95/96）",
-   "note": "PID 95 在跑；L1 采集 0.2 秒扫、7 天过期删",
-   "exact_deepseek_tokens": 581
-  },
-  {
    "tool_id": "cap-memory-memory-layers",
    "category": "memory",
    "subcategory": "memory-system",
@@ -1396,29 +1373,6 @@
    "verified_basis": "2026-11-17 审计：扩展已加载（日志命中）",
    "note": "与扩展工具同一实现，勿重复注册",
    "exact_deepseek_tokens": 496
-  },
-  {
-   "tool_id": "cap-memory-refine-daily",
-   "category": "memory",
-   "subcategory": "memory-system",
-   "call_type": "service",
-   "trigger_prefix": null,
-   "pre_command": null,
-   "entry_point": "python3 refine_daily.py",
-   "param_schema": {},
-   "output_contract": "退出码 0 为成功；失败返回 code 与 stderr 头 600 字；输出截断 8MB",
-   "status_triad": {
-    "installed": true,
-    "runnable": true,
-    "verified": true
-   },
-   "available": true,
-   "last_verified_at": "2026-11-17",
-   "source_file": "CAPABILITIES/06-记忆与知识/R-refine-daily.md",
-   "one_liner": "31 行守护脚本，替容器里不存在的 cron/systemd，每天 04:00（北京时间）调一次 `l1_watcher.py --refine-only`。",
-   "verified_basis": "2026-11-17 审计：进程在跑（PID 95/96）",
-   "note": "PID 96 在跑；每天 04:00–04:15 精炼",
-   "exact_deepseek_tokens": 484
   },
   {
    "tool_id": "cap-memory-wiki-upsert-page",
@@ -1788,6 +1742,305 @@
    "verified_basis": "2026-11-17 审计：SKILL.md 已读（29 个归类表）；对应 .ts 停放未加载",
    "note": "SOP 文档可用；对应 .ts 停放未加载，Go 版需另写实现，不挂扩展",
    "exact_deepseek_tokens": 309
+  },
+  {
+   "tool_id": "cap-code-run-audit",
+   "category": "code",
+   "subcategory": "安全审计",
+   "call_type": "service",
+   "trigger_prefix": "/audit",
+   "pre_command": null,
+   "entry_point": "tools/scripts/run-audit.sh",
+   "param_schema": {},
+   "output_contract": "退出码 0 为成功；失败返回 code 与 stderr 头 600 字；输出截断 8MB",
+   "status_triad": {
+    "installed": true,
+    "runnable": true,
+    "verified": false
+   },
+   "available": true,
+   "last_verified_at": "2026-11-18",
+   "source_file": "tools-seed/scripts/run-audit.sh",
+   "one_liner": "安全审计入口（run-audit.sh）：Cloudflare security-audit-skill × Semgrep 双层审计——本地初筛出候选，再由 agent 对照规程研判。",
+   "verified_basis": "第 19 步第 4 批种子核验 + semgrep 1.182.1 已装（2026-11-18）",
+   "note": "本地规则快照在 007 上缺失，默认回落 registry 在线规则；OUT_DIR 建议显式设置",
+   "exact_deepseek_tokens": 477
+  },
+  {
+   "tool_id": "cap-ops-magick",
+   "category": "ops",
+   "subcategory": "文档与媒体",
+   "call_type": "cli",
+   "trigger_prefix": null,
+   "pre_command": null,
+   "entry_point": "magick",
+   "param_schema": {},
+   "output_contract": "退出码 0 为成功；失败返回 code 与 stderr 头 600 字；输出截断 8MB",
+   "status_triad": {
+    "installed": true,
+    "runnable": true,
+    "verified": false
+   },
+   "available": true,
+   "last_verified_at": "2026-11-18",
+   "source_file": "第 19 步安装核验（apt，Debian 12）",
+   "one_liner": "ImageMagick 6.9.11-60（apt 装）：图片格式转换/缩放/裁剪/拼图；本机 magick 是指向 /usr/bin/convert 的软链。",
+   "verified_basis": "第 19 步安装核验（--version 实测，2026-11-18）",
+   "note": "apt 装；/usr/local/bin/magick → /usr/bin/convert",
+   "exact_deepseek_tokens": 436
+  },
+  {
+   "tool_id": "cap-ops-mpv",
+   "category": "ops",
+   "subcategory": "文档与媒体",
+   "call_type": "cli",
+   "trigger_prefix": null,
+   "pre_command": null,
+   "entry_point": "mpv",
+   "param_schema": {},
+   "output_contract": "退出码 0 为成功；失败返回 code 与 stderr 头 600 字；输出截断 8MB",
+   "status_triad": {
+    "installed": true,
+    "runnable": true,
+    "verified": false
+   },
+   "available": true,
+   "last_verified_at": "2026-11-18",
+   "source_file": "第 19 步安装核验（apt，Debian 12）",
+   "one_liner": "mpv 0.35.1（apt 装）：音视频播放器；无头机上主要用来探媒体信息、抽音频，不开画面。",
+   "verified_basis": "第 19 步安装核验（--version 实测，2026-11-18）",
+   "note": "apt 装，0.35.1",
+   "exact_deepseek_tokens": 372
+  },
+  {
+   "tool_id": "cap-ops-npm",
+   "category": "ops",
+   "subcategory": "语言运行时",
+   "call_type": "cli",
+   "trigger_prefix": null,
+   "pre_command": null,
+   "entry_point": "npm",
+   "param_schema": {},
+   "output_contract": "退出码 0 为成功；失败返回 code 与 stderr 头 600 字；输出截断 8MB",
+   "status_triad": {
+    "installed": true,
+    "runnable": true,
+    "verified": false
+   },
+   "available": true,
+   "last_verified_at": "2026-11-18",
+   "source_file": "第 19 步安装核验（Node 22.23.4 官方包）",
+   "one_liner": "npm 10.9.9（随 Node 22.23.4 官方包）：Node 的包管理器；全局工具（rea、codegraph、playwright）都经它装。",
+   "verified_basis": "第 19 步安装核验（--version 实测，2026-11-18）",
+   "note": "随 Node 22.23.4，10.9.9",
+   "exact_deepseek_tokens": 403
+  },
+  {
+   "tool_id": "cap-ops-script-cap-drift",
+   "category": "ops",
+   "subcategory": "运维管理",
+   "call_type": "service",
+   "trigger_prefix": null,
+   "pre_command": null,
+   "entry_point": "tools/scripts/cap-drift.sh",
+   "param_schema": {},
+   "output_contract": "退出码 0 为成功；失败返回 code 与 stderr 头 600 字；输出截断 8MB",
+   "status_triad": {
+    "installed": true,
+    "runnable": true,
+    "verified": false
+   },
+   "available": true,
+   "last_verified_at": "2026-11-18",
+   "source_file": "tools-seed/scripts/cap-drift.sh",
+   "one_liner": "能力目录保鲜体检（108 行 bash）：0 token 机械比对命令在位、条目时效、版本快照，只输出差异。",
+   "verified_basis": "第 19 步第 4 批种子核验（文件数对上，2026-11-18）",
+   "note": "硬编码 CAP=/data/workspace/CAPABILITIES（三号路径），007 上第 2 节为空；只看第 1、3 节",
+   "exact_deepseek_tokens": 388
+  },
+  {
+   "tool_id": "cap-ops-script-cap-scan",
+   "category": "ops",
+   "subcategory": "运维管理",
+   "call_type": "service",
+   "trigger_prefix": null,
+   "pre_command": null,
+   "entry_point": "tools/scripts/cap-scan.sh",
+   "param_schema": {},
+   "output_contract": "退出码 0 为成功；失败返回 code 与 stderr 头 600 字；输出截断 8MB",
+   "status_triad": {
+    "installed": true,
+    "runnable": true,
+    "verified": false
+   },
+   "available": true,
+   "last_verified_at": "2026-11-18",
+   "source_file": "tools-seed/scripts/cap-scan.sh",
+   "one_liner": "能力全集穷举扫描（48 行 bash）：不靠回忆，只看文件系统，把可执行文件扫成候选清单。",
+   "verified_basis": "第 19 步第 4 批种子核验（文件数对上，2026-11-18）",
+   "note": "还扫 /data/tools/*/bin（三号路径，007 上为空）；脚本类能力不在清单里",
+   "exact_deepseek_tokens": 369
+  },
+  {
+   "tool_id": "cap-ops-script-chrome-cdp",
+   "category": "ops",
+   "subcategory": "运维管理",
+   "call_type": "service",
+   "trigger_prefix": null,
+   "pre_command": null,
+   "entry_point": "tools/scripts/chrome-cdp.sh",
+   "param_schema": {},
+   "output_contract": "退出码 0 为成功；失败返回 code 与 stderr 头 600 字；输出截断 8MB",
+   "status_triad": {
+    "installed": true,
+    "runnable": true,
+    "verified": false
+   },
+   "available": true,
+   "last_verified_at": "2026-11-18",
+   "source_file": "tools-seed/scripts/chrome-cdp.sh",
+   "one_liner": "启动带 CDP 的 Chromium（16 行 bash）：供 browser-tools 技能连 127.0.0.1:9222 调浏览器。",
+   "verified_basis": "第 19 步第 4 批种子核验（文件数对上，2026-11-18）",
+   "note": "硬编码 /data/cache/ms-playwright/chromium-*（007 在 /root/.cache/ms-playwright），须改路径",
+   "exact_deepseek_tokens": 411
+  },
+  {
+   "tool_id": "cap-ops-script-chrome-nosandbox",
+   "category": "ops",
+   "subcategory": "运维管理",
+   "call_type": "service",
+   "trigger_prefix": null,
+   "pre_command": null,
+   "entry_point": "tools/scripts/chrome-nosandbox",
+   "param_schema": {},
+   "output_contract": "退出码 0 为成功；失败返回 code 与 stderr 头 600 字；输出截断 8MB",
+   "status_triad": {
+    "installed": true,
+    "runnable": true,
+    "verified": false
+   },
+   "available": true,
+   "last_verified_at": "2026-11-18",
+   "source_file": "tools-seed/scripts/chrome-nosandbox",
+   "one_liner": "种子里的 chrome-nosandbox 副本（三号版，3 行 sh）：直调 chromium 加 --no-sandbox 的一次性浏览器入口。",
+   "verified_basis": "第 19 步第 4 批种子核验（文件数对上，2026-11-18）",
+   "note": "三号版硬编码 /data/cache/ms-playwright（007 上无此路径）；实跑走 /usr/local/bin/chrome-nosandbox",
+   "exact_deepseek_tokens": 371
+  },
+  {
+   "tool_id": "cap-ops-script-inventory",
+   "category": "ops",
+   "subcategory": "运维管理",
+   "call_type": "service",
+   "trigger_prefix": null,
+   "pre_command": null,
+   "entry_point": "tools/scripts/inventory.sh",
+   "param_schema": {},
+   "output_contract": "退出码 0 为成功；失败返回 code 与 stderr 头 600 字；输出截断 8MB",
+   "status_triad": {
+    "installed": true,
+    "runnable": true,
+    "verified": false
+   },
+   "available": true,
+   "last_verified_at": "2026-11-18",
+   "source_file": "tools-seed/scripts/inventory.sh",
+   "one_liner": "环境盘点快照（46 行 bash）：系统、网关路由、/data/bin、/data/tools、关键 CLI 在位一次写进报告。",
+   "verified_basis": "第 19 步第 4 批种子核验（文件数对上，2026-11-18）",
+   "note": "读 /data/bot-gateway.js、/data/tools/*（三号路径），007 上路由/tools 节为空",
+   "exact_deepseek_tokens": 344
+  },
+  {
+   "tool_id": "cap-ops-script-inventory2",
+   "category": "ops",
+   "subcategory": "运维管理",
+   "call_type": "service",
+   "trigger_prefix": null,
+   "pre_command": null,
+   "entry_point": "tools/scripts/inventory2.sh",
+   "param_schema": {},
+   "output_contract": "退出码 0 为成功；失败返回 code 与 stderr 头 600 字；输出截断 8MB",
+   "status_triad": {
+    "installed": true,
+    "runnable": true,
+    "verified": false
+   },
+   "available": true,
+   "last_verified_at": "2026-11-18",
+   "source_file": "tools-seed/scripts/inventory2.sh",
+   "one_liner": "环境盘点完整版（55 行 bash）：inventory.sh 加长版，多了路由真实提取、skills 描述、工具版本三节。",
+   "verified_basis": "第 19 步第 4 批种子核验（文件数对上，2026-11-18）",
+   "note": "读 /data/bot-gateway.js、/root/.agents/skills/*（三号路径），007 上 skills 在 tools/skills/",
+   "exact_deepseek_tokens": 349
+  },
+  {
+   "tool_id": "cap-ops-script-link-selftest",
+   "category": "ops",
+   "subcategory": "运维管理",
+   "call_type": "service",
+   "trigger_prefix": null,
+   "pre_command": null,
+   "entry_point": "tools/scripts/link-selftest.cjs",
+   "param_schema": {},
+   "output_contract": "退出码 0 为成功；失败返回 code 与 stderr 头 600 字；输出截断 8MB",
+   "status_triad": {
+    "installed": true,
+    "runnable": true,
+    "verified": false
+   },
+   "available": true,
+   "last_verified_at": "2026-11-18",
+   "source_file": "tools-seed/scripts/link-selftest.cjs",
+   "one_liner": "link 中继自测（17 行 node）：对三号 link 中继发 6 组探测，输出状态码对照表。",
+   "verified_basis": "第 19 步第 4 批种子核验（文件数对上，2026-11-18）",
+   "note": "三号专属（读 link.env、调中继），007 上无 link 服务，不可用；只存档",
+   "exact_deepseek_tokens": 378
+  },
+  {
+   "tool_id": "cap-ops-script-totp",
+   "category": "ops",
+   "subcategory": "运维管理",
+   "call_type": "service",
+   "trigger_prefix": null,
+   "pre_command": null,
+   "entry_point": "tools/scripts/totp.js",
+   "param_schema": {},
+   "output_contract": "退出码 0 为成功；失败返回 code 与 stderr 头 600 字；输出截断 8MB",
+   "status_triad": {
+    "installed": true,
+    "runnable": true,
+    "verified": false
+   },
+   "available": true,
+   "last_verified_at": "2026-11-18",
+   "source_file": "tools-seed/scripts/totp.js",
+   "one_liner": "TOTP 库（85 行 node）：xinxin-link 的 TOTP 算法，60 秒一步；零依赖，只用 node 内置 crypto。",
+   "verified_basis": "第 19 步第 4 批种子核验（文件数对上，2026-11-18）",
+   "note": "是库不是 CLI，须 require 后调 current(secret, unix秒)；secret 来自 link.env",
+   "exact_deepseek_tokens": 365
+  },
+  {
+   "tool_id": "cap-ops-tesseract",
+   "category": "ops",
+   "subcategory": "文档与媒体",
+   "call_type": "cli",
+   "trigger_prefix": null,
+   "pre_command": null,
+   "entry_point": "tesseract",
+   "param_schema": {},
+   "output_contract": "退出码 0 为成功；失败返回 code 与 stderr 头 600 字；输出截断 8MB",
+   "status_triad": {
+    "installed": true,
+    "runnable": true,
+    "verified": false
+   },
+   "available": true,
+   "last_verified_at": "2026-11-18",
+   "source_file": "第 19 步安装核验（apt，Debian 12）",
+   "one_liner": "tesseract 5.3.0（apt 装）：命令行 OCR，把图片里的文字认成文本；配 --oem 1 --psm 6 认排版文本最稳。",
+   "verified_basis": "第 19 步安装核验（--version 实测，2026-11-18）",
+   "note": "apt 装，5.3.0",
+   "exact_deepseek_tokens": 402
   }
  ]
 }

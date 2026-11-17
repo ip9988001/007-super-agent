@@ -43,13 +43,13 @@ func testDaemon(t *testing.T) (*daemon, *memory.Store, string) {
 func TestHandleWritesL1(t *testing.T) {
 	d, mem, _ := testDaemon(t)
 	d.handle(gateway.Envelope{TaskID: "t1", Text: "你好，你是谁"})
-	d.handle(gateway.Envelope{TaskID: "t2", Text: "/audit 审一下这段代码"})
+	d.handle(gateway.Envelope{TaskID: "t2", Text: "/rea 逆向这个二进制"})
 	today := time.Now().Format("2006-01-02")
 	text, err := mem.ReadL1(today)
 	if err != nil {
 		t.Fatalf("ReadL1: %v", err)
 	}
-	for _, want := range []string{"task t1 route=ERROR tool= status=triage_error", "task t2 route=TOOL tool=cap-code-semgrep status=shadow"} {
+	for _, want := range []string{"task t1 route=ERROR tool= status=triage_error", "task t2 route=TOOL tool=cap-code-rea status=shadow"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("L1 日志里没有 %q，实际内容：\n%s", want, text)
 		}

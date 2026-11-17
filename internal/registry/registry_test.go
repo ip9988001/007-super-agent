@@ -66,19 +66,19 @@ func copyFile(src, dst string) error {
 	return err
 }
 
-// 1. 加载 73 条（第 11 步加了 cap-design-hyperframes，design 7→8）。
-func TestLoad73Entries(t *testing.T) {
+// 1. 加载 84 条（第 19 步第 5 批：73 − 2 遗留 + 13 新增）。
+func TestLoad84Entries(t *testing.T) {
 	rg, err := Load(fixture(t))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if got := rg.Count(); got != 73 {
-		t.Fatalf("Count = %d, want 73", got)
+	if got := rg.Count(); got != 84 {
+		t.Fatalf("Count = %d, want 84", got)
 	}
 	if got := len(Categories()); got != 6 {
 		t.Fatalf("Categories = %d, want 6", got)
 	}
-	want := map[string]int{"fetch": 13, "code": 7, "seo": 7, "design": 8, "ops": 22, "memory": 16}
+	want := map[string]int{"fetch": 13, "code": 8, "seo": 7, "design": 8, "ops": 34, "memory": 14}
 	for cat, n := range want {
 		if got := len(rg.EntriesByCategory(cat)); got != n {
 			t.Errorf("category %s = %d entries, want %d", cat, got, n)
@@ -106,21 +106,21 @@ func TestL1SixCategories(t *testing.T) {
 	}
 }
 
-// 3. L2 读一份（ops 正好 25 行，顶格必须过）。
+// 3. L2 读一份（seo 单份 10 行）；ops 拆成两份，见 TestL2SplitOps。
 func TestL2OneCategory(t *testing.T) {
 	rg, err := Load(fixture(t))
 	if err != nil {
 		t.Fatal(err)
 	}
-	l2, err := rg.L2("ops")
+	l2, err := rg.L2("seo")
 	if err != nil {
-		t.Fatalf("L2(ops): %v", err)
+		t.Fatalf("L2(seo): %v", err)
 	}
-	if n := countLines(l2); n != 25 {
-		t.Errorf("L2(ops) = %d lines, want 25", n)
+	if n := countLines(l2); n != 10 {
+		t.Errorf("L2(seo) = %d lines, want 10", n)
 	}
-	if !strings.Contains(l2, "cap-ops-ffmpeg") {
-		t.Error("L2(ops) missing cap-ops-ffmpeg")
+	if !strings.Contains(l2, "cap-seo-content-scorers") {
+		t.Error("L2(seo) missing cap-seo-content-scorers")
 	}
 	if _, err := rg.L2("fetch"); err != nil {
 		t.Errorf("L2(fetch): %v", err)
@@ -305,5 +305,72 @@ func TestProbeEntry(t *testing.T) {
 	}
 	if err := ProbeEntry(Entry{EntryPoint: ""}); err == nil {
 		t.Fatal("ProbeEntry(empty) should fail")
+	}
+}
+
+// TestProbeEntryByCallType 是第 19 步第 5 批的探针分流：
+// doc/sop/tool/mcp/data 不探针（知识条目，描述性 entry_point 也通过）；
+// service 只查脚本文件在位；cli 的 "python3 -c ..." 跑真实 import 检查。
+func TestProbeEntryByCallType(t *testing.T) {
+	// 知识条目：entry_point 是描述文字也不探针。
+	for _, ct := range []string{"doc", "sop", "tool", "mcp", "data"} {
+		if err := ProbeEntry(Entry{CallType: ct, EntryPoint: "SKILL.md: steel-will-long-term"}); err != nil {
+			t.Fatalf("ProbeEntry(%s, descriptive): %v", ct, err)
+		}
+		if err := ProbeEntry(Entry{CallType: ct, EntryPoint: "stdio scrapling-mcp server"}); err != nil {
+			t.Fatalf("ProbeEntry(%s, mcp text): %v", ct, err)
+		}
+	}
+	// service：文件在就通过，不在就失败（不查 PATH）。
+	tmp := t.TempDir()
+	script := filepath.Join(tmp, "x.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := ProbeEntry(Entry{CallType: "service", EntryPoint: script}); err != nil {
+		t.Fatalf("ProbeEntry(service, existing file): %v", err)
+	}
+	if err := ProbeEntry(Entry{CallType: "service", EntryPoint: filepath.Join(tmp, "nope.sh")}); err == nil {
+		t.Fatal("ProbeEntry(service, missing file) should fail")
+	}
+	// service 的 entry_point 是命令名也不查 PATH：只当文件查。
+	if err := ProbeEntry(Entry{CallType: "service", EntryPoint: "echo"}); err == nil {
+		t.Fatal("ProbeEntry(service, bare command) should fail (file lookup only)")
+	}
+	// cli 的 python3 -c：真实 import 检查。
+	if err := ProbeEntry(Entry{CallType: "cli", EntryPoint: "python3 -c import json"}); err != nil {
+		t.Fatalf("ProbeEntry(python3 -c import json): %v", err)
+	}
+	if err := ProbeEntry(Entry{CallType: "cli", EntryPoint: "python3 -c import no_such_mod_xyz_123"}); err == nil {
+		t.Fatal("ProbeEntry(python3 -c import missing) should fail")
+	}
+}
+
+// TestL2SplitOps 是第 19 步第 5 批的 L2 拆分：ops 类 34 条拆成
+// ops.md（25 行）+ ops-2.md（15 行），L2("ops") 拼后两份都有，
+// 且每份都不超 25 行上限；其余类仍是单份。
+func TestL2SplitOps(t *testing.T) {
+	rg, err := Load(fixture(t))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	l2, err := rg.L2("ops")
+	if err != nil {
+		t.Fatalf("L2(ops): %v", err)
+	}
+	for _, want := range []string{"cap-ops-ffmpeg", "cap-ops-tesseract", "cap-ops-script-totp", "cap-ops-script-chrome-nosandbox"} {
+		if !strings.Contains(l2, want) {
+			t.Fatalf("L2(ops) missing %q", want)
+		}
+	}
+	if n := countLines(l2); n != 40 {
+		t.Fatalf("L2(ops) lines = %d, want 40 (25+15)", n)
+	}
+	l2seo, err := rg.L2("seo")
+	if err != nil {
+		t.Fatalf("L2(seo): %v", err)
+	}
+	if !strings.Contains(l2seo, "cap-seo-content-scorers") {
+		t.Fatal("L2(seo) missing cap-seo-content-scorers")
 	}
 }

@@ -4,7 +4,7 @@
 纯标准库的确定性 SEO/GEO/AEO 体检器：抓一页 → 输出 JSON 事实（布尔+计数，不含总分），零依赖、秒级、可复现。
 
 ## 怎么调
-cd /data/workspace/seo-toolkit/geo-seo-aeo-skill python3 scripts/audit.py https://target/page # 直连（压缩站点会失真，见坑） curl -sS --compressed -A "Mozilla/5.0" <url> -o /tmp/p.html # 唯一可靠姿势：先落地 python3 scripts/audit.py --file /tmp/p.html --base-url https://target python3 scripts/audit.py --file p.html --base-url https://t/ | python3 -m json.tool # 只取某一维 python3 scripts/audit.py <url> | python3 -c "import j…
+cd tools/seo-toolkit/geo-seo-aeo-skill python3 scripts/audit.py https://target/page # 直连（压缩站点会失真，见坑） curl -sS --compressed -A "Mozilla/5.0" <url> -o /tmp/p.html # 唯一可靠姿势：先落地 python3 scripts/audit.py --file /tmp/p.html --base-url https://target python3 scripts/audit.py --file p.html --base-url https://t/ | python3 -m json.tool # 只取某一维 python3 scripts/audit.py <url> | python3 -c "import j…
 
 ## 坑
 ❌ 完全不处理 Content-Encoding：`fetch()` 只 `resp.read().decode(charset)`，gzip 字节直接喂 HTMLParser。python.org 直连 → titl…；结论固定：目标站开 gzip/brotli 时，直连 URL 的数全废。先 `curl --compressed` 落地再 `--file`（实测这样才出真值）。

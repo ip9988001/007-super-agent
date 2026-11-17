@@ -4,7 +4,7 @@
 claude-seo 里三个纯文本内容工具（吃 txt/md/html，支持 stdin 与 `--json`）：`content_quality.py` 出 0–100 质量分 · `content_humanize.py` 去 AI 腔 · `content_verify.py` 查主张与引用缺口。
 
 ## 怎么调
-export CLAUDE_SEO_DATA_DIR=/data/state/claude-seo # 不设会 Runtime not ready cd /data/workspace/seo-toolkit/claude-seo python3 scripts/runtime.py run content_quality.py draft.md # 人读版 python3 scripts/runtime.py run content_quality.py draft.md --json --threshold 70 python3 scripts/runtime.py run content_humanize.py draft.md -o clean.md # 去 AI 腔，不覆盖原文件 python3 scripts/runtime.py run content_verify.py…
+export CLAUDE_SEO_DATA_DIR=tools/seo-toolkit/claude-seo-data # 不设会 Runtime not ready cd tools/seo-toolkit/claude-seo python3 scripts/runtime.py run content_quality.py draft.md # 人读版 python3 scripts/runtime.py run content_quality.py draft.md --json --threshold 70 python3 scripts/runtime.py run content_humanize.py draft.md -o clean.md # 去 AI 腔，不覆盖原文件 python3 scripts/runtime.py run content_verify.py…
 
 ## 坑
 指标是可解释启发式，不是 LLM 判断：`thin-content` 对短文案一律报，<200 词的落地页别当真分。；`--threshold` 只影响退出码/提示，不改分数；接 CI 时看退出码别看文本。

@@ -12,14 +12,17 @@
 package registry
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 // 硬上限（第 4 轮规格 + 第 1 步审计报告口径）。
@@ -238,7 +241,8 @@ func (rg *Registry) MarkVerified(toolID string) {
 }
 
 // Probe 对一条工具跑预检探针（只做存在性检查，不真跑命令）：
-// entry_point 首词含 "/" 时看文件在不在，否则在 PATH 里找命令。
+// 按 call_type 分流（第 19 步第 5 批）：cli 查命令/路径、service 查
+// 脚本文件、doc/sop/tool/mcp/data 不探针（只记知识，不可执行）。
 // 通过则标记本进程内已验证并返回 nil；失败返回原因，不标记。
 // 与 watchdog.DefaultProbe 同一口径，探针逻辑的唯一实现放在这里，
 // watchdog.DefaultProbe 只是委托（防两处口径漂移）。
@@ -254,21 +258,57 @@ func (rg *Registry) Probe(toolID string) error {
 	return nil
 }
 
-// ProbeEntry 对一条总账条目做存在性探针（不真跑命令）。
+// ProbeEntry 对一条总账条目做存在性探针（不真跑命令），按 call_type 分流：
+//   - cli：entry_point 首词是命令（PATH 里找）或路径（文件在位）；
+//     "python3 -c ..." 形式跑一次只读 import 检查（Python API 类工具，
+//     如 camoufox，没有 CLI，LookPath 只能验到 python3 本身）。
+//   - service：entry_point 就是脚本路径（相对部署根目录），只查文件在位。
+//   - doc/sop/tool/mcp/data：知识条目，不探针（只记知识，不可执行）。
+// 未知 call_type 按 cli 处理。空 entry_point 一律失败。
+// 注意：相对路径按进程工作目录解析——守护进程必须以部署根目录为
+// 工作目录启动（systemd WorkingDirectory），否则脚本类探针失败。
 func ProbeEntry(e Entry) error {
 	ep := strings.TrimSpace(e.EntryPoint)
 	if ep == "" {
 		return errors.New("registry probe: entry_point 为空")
 	}
-	first := strings.Fields(ep)[0]
-	if strings.Contains(first, "/") {
+	switch e.CallType {
+	case "doc", "sop", "tool", "mcp", "data":
+		return nil
+	case "service":
+		first := strings.Fields(ep)[0]
 		if _, err := os.Stat(first); err != nil {
-			return fmt.Errorf("registry probe: entry_point %q 不存在: %v", first, err)
+			return fmt.Errorf("registry probe: 脚本 %q 不存在: %v", first, err)
+		}
+		return nil
+	default: // cli 与未知类型
+		if strings.HasPrefix(ep, "python3 -c ") {
+			return probePythonImport(strings.TrimPrefix(ep, "python3 -c "))
+		}
+		first := strings.Fields(ep)[0]
+		if strings.Contains(first, "/") {
+			if _, err := os.Stat(first); err != nil {
+				return fmt.Errorf("registry probe: entry_point %q 不存在: %v", first, err)
+			}
+			return nil
+		}
+		if _, err := exec.LookPath(first); err != nil {
+			return fmt.Errorf("registry probe: 命令 %q 不在 PATH: %v", first, err)
 		}
 		return nil
 	}
-	if _, err := exec.LookPath(first); err != nil {
-		return fmt.Errorf("registry probe: 命令 %q 不在 PATH: %v", first, err)
+}
+
+// probePythonImport 跑一次只读的 python3 -c 检查（10 秒超时），
+// 给没有 CLI 的 Python API 工具（如 camoufox）一个真实探针，
+// 而不是只验到 python3 本身。只做 import，不写、不联网。
+func probePythonImport(code string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "python3", "-c", code)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("registry probe: python3 -c %q 失败: %v: %s",
+			code, err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }
@@ -292,21 +332,38 @@ func (rg *Registry) L1() (string, error) {
 	return string(content), nil
 }
 
-// L2 按类名读一份二级索引，并校验 ≤25 行。超了返回错误并记账。
+// L2 按类名读二级索引，并校验每份 ≤25 行。超了返回错误并记账。
+// ops 类条目超过 25 条时拆成多份（ops.md、ops-2.md……），按“主文件
+// 在先、续文件按名排序”拼接后返回；每份单独校验上限（第 19 步第 5 批）。
+// 续文件只在确实超限的类上出现，其余类仍是单份。
 func (rg *Registry) L2(category string) (string, error) {
 	if !validCategory[category] {
 		return "", fmt.Errorf("%w: unknown category %q", ErrNotFound, category)
 	}
-	content, err := os.ReadFile(filepath.Join(rg.dataDir, "index", "L2", category+".md"))
+	base := filepath.Join(rg.dataDir, "index", "L2", category+".md")
+	rest, err := filepath.Glob(filepath.Join(rg.dataDir, "index", "L2", category+"-*.md"))
 	if err != nil {
-		return "", fmt.Errorf("registry: read L2 %s: %w", category, err)
+		return "", fmt.Errorf("registry: glob L2 %s: %w", category, err)
 	}
-	if n := countLines(string(content)); n > MaxL2Lines {
-		rg.recordViolation("L2", category, n, 0)
-		return "", fmt.Errorf("%w: L2 %s has %d lines, cap %d",
-			ErrLimitExceeded, category, n, MaxL2Lines)
+	sort.Strings(rest)
+	files := append([]string{base}, rest...)
+	var sb strings.Builder
+	for _, f := range files {
+		content, err := os.ReadFile(f)
+		if err != nil {
+			return "", fmt.Errorf("registry: read L2 %s: %w", category, err)
+		}
+		if n := countLines(string(content)); n > MaxL2Lines {
+			rg.recordViolation("L2", category, n, 0)
+			return "", fmt.Errorf("%w: L2 %s (%s) has %d lines, cap %d",
+				ErrLimitExceeded, category, filepath.Base(f), n, MaxL2Lines)
+		}
+		sb.Write(content)
+		if !strings.HasSuffix(string(content), "\n") {
+			sb.WriteString("\n")
+		}
 	}
-	return string(content), nil
+	return sb.String(), nil
 }
 
 // L3 按工具名读一份三级索引，并校验 ≤1600 字符（按字符数）。

@@ -101,9 +101,9 @@ func TestTier0PrefixHit(t *testing.T) {
 		text   string
 		toolID string
 	}{
-		{"/audit 审一下这段代码", "cap-code-semgrep"},
+		{"/audit 审一下这段代码", "cap-code-run-audit"},
 		{"/rea 逆向这个二进制", "cap-code-rea"},
-		{"/audit审一下", "cap-code-semgrep"}, // 前缀后直接跟中文也命中
+		{"/audit审一下", "cap-code-run-audit"}, // 前缀后直接跟中文也命中
 	}
 	for _, c := range cases {
 		r := Tier0(rg, Input{Text: c.text})
@@ -179,9 +179,9 @@ func TestFrozenListDeterministic(t *testing.T) {
 			lines++
 		}
 	}
-	if lines != 72 { // 73 条总账，1 条 available:false 不进清单
+	if lines != 79 { // 84 条总账，5 条 available:false 不进清单
 		// （清单行含 cap-/ext-/skill- 三种前缀，不能只数 "- cap-"）
-		t.Errorf("frozen tool list lines = %d, want 72", lines)
+		t.Errorf("frozen tool list lines = %d, want 79", lines)
 	}
 	// 冻结前缀 + 尾部分开发送：天气问题走 DIRECT（清单里没有天气工具，
 	// 模型不许编 tool_id；这里用桩模拟模型回 DIRECT，验证链路本身）。

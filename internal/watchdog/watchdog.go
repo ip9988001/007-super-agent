@@ -35,8 +35,9 @@ const UnackedAlertThresholdS = 1800
 // （例如跑 --version）。
 type ProbeFunc func(e registry.Entry) error
 
-// DefaultProbe 是默认探针：entry_point 首词含 "/" 时看文件在不在，
-// 否则在 PATH 里找命令。只做存在性检查，不执行。
+// DefaultProbe 是默认探针：按 call_type 分流（cli 查命令/路径、service
+// 查脚本文件、doc/sop/tool/mcp/data 不探针）。只做存在性检查，
+// 除 "python3 -c ..." 的只读 import 外不执行命令。
 // 实现委托给 registry.ProbeEntry（探针口径唯一实现，防两处漂移）。
 func DefaultProbe(e registry.Entry) error {
 	return registry.ProbeEntry(e)
