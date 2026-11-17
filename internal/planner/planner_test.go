@@ -280,6 +280,64 @@ func TestVerifyFindingsCoverage(t *testing.T) {
 	}
 }
 
+// TestParseVerificationExtractsJSON：模型在 JSON 前后加解释文字时，
+// 解析应抠出最外层 JSON 对象，不直接报错。
+func TestParseVerificationExtractsJSON(t *testing.T) {
+	wrapped := "下面是核验结果：\n" + approveJSON() + "\n以上供参考。"
+	ver, err := parseVerification(wrapped)
+	if err != nil {
+		t.Fatalf("prose-wrapped JSON should parse: %v", err)
+	}
+	if ver.Verdict != VerdictApprove {
+		t.Fatalf("verdict = %s, want APPROVE", ver.Verdict)
+	}
+}
+
+// TestVerifyRetriesMalformedJSON：核验器第一轮回非法 JSON（第 6 轮
+// 的真故障：reasoner 回了个 'q' 字符），重调一次回合法 APPROVE，
+// Verify 应重试并成功，不把任务杀掉。
+func TestVerifyRetriesMalformedJSON(t *testing.T) {
+	bad := `{"verdict":"APPROVE","findings":[{"question":"necessity","text":"x"q}]}`
+	pl, _ := newTestPlanner(t, stubJSON(""), stubSeq([]string{bad, approveJSON()}), nil)
+	plan := &Plan{TaskID: "t-retry", TaskText: "x", Steps: []Step{
+		{StepNo: 1, ToolID: "test-echo", Inputs: []string{"hi"}, ExpectedOutput: "x", EstimatedTokens: 10},
+	}}
+	ver, err := pl.Verify("t-retry", plan)
+	if err != nil {
+		t.Fatalf("Verify should retry and succeed: %v", err)
+	}
+	if ver.Verdict != VerdictApprove {
+		t.Fatalf("verdict = %s, want APPROVE", ver.Verdict)
+	}
+}
+
+// TestPlanAndVerifyFallsBackWhenVerifyBroken：核验器三轮都回非法 JSON，
+// PlanAndVerify 不杀任务，按原计划执行，并记一笔“核验不可用”。
+func TestPlanAndVerifyFallsBackWhenVerifyBroken(t *testing.T) {
+	bad := `{"verdict":"APPROVE","findings":[{"question":"necessity","text":"x"q}]}`
+	pl, led := newTestPlanner(t, stubJSON(stepsJSON(2)), stubJSON(bad), nil)
+	plan, ver, err := pl.PlanAndVerify("t-fallback", "核验器坏了的活", "")
+	if err != nil {
+		t.Fatalf("PlanAndVerify should fall back, not fail: %v", err)
+	}
+	if len(plan.Steps) != 2 || ver.Verdict != VerdictApprove {
+		t.Fatalf("plan = %d steps verdict=%s, want 2/APPROVE", len(plan.Steps), ver.Verdict)
+	}
+	found := false
+	for _, f := range ver.Findings {
+		if strings.Contains(f.Text, "核验器连续返回非法 JSON") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("findings 未记核验不可用：%+v", ver.Findings)
+	}
+	rows, err := led.ListPlanRuns("t-fallback", 5)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("plan_runs = %+v, %v, want 1 row", rows, err)
+	}
+}
+
 // TestPlanValidation：规划器输出非法步骤表时 Plan() 必须报错。
 func TestPlanValidation(t *testing.T) {
 	badTool := `{"steps":[{"step_no":1,"tool_id":"cap-no-such-tool","inputs":[],"depends_on":[],"expected_output":"x","estimated_tokens":10}]}`

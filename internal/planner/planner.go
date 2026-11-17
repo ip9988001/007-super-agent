@@ -129,6 +129,8 @@ const planPromptHead = `你是 007 超级 Agent 的多步骤规划器。把下�
 规则：
 - 一步只做一件事；tool_id 只能从下面可用工具清单里挑，清单外的不许编；
 - inputs 是传给工具的参数（字符串数组），不要写空字符串；正则、URL 里的 & | ( ) 等字符可以直接写，执行时不经过 shell；
+- inputs 的每个字符串就是命令行上的一个参数（argv 的一个元素），执行时直接拼在工具名后面、不经过 shell：不要写 shell 语法——不要写管道 |、重定向 > >>、分号 ;、&&、$变量、for 循环、反引号，也不要在 inputs 里再写一遍工具名；需要多个操作拼起来时拆成多个步骤，每步只调一个工具；需要落盘文件时，把绝对路径当参数传给工具（比如 --out /绝对路径/文件），不要写重定向；路径直接写绝对路径，不要用 $变量缩写；
+- 不确定的命令先跑 --help 确认用法，不要编参数（比如 playwright screenshot 没有 --out 这个选项，编了会直接报错）；
 - depends_on 只写前面步骤的 step_no（依赖前面步骤的产物才能做的才写），不要循环依赖、不要依赖后面的步骤；
 - expected_output 写这步要产出什么、后一步拿它做什么；
 - estimated_tokens 估这步的 token 量（输入+输出，整数）；
@@ -143,7 +145,7 @@ const verifyPromptHead = `你是 007 超级 Agent 的多步骤核验器。你是
 {"verdict":"APPROVE|REVISE|REJECT","findings":[{"question":"necessity","text":"..."}],"revised_plan":[{"step_no":1,"tool_id":"...","inputs":[],"depends_on":[],"expected_output":"...","estimated_tokens":0}]}
 你必须逐项回答下面四个问题，每个问题至少一条 finding，question 只能是 necessity / rationality / reasons / suggestion 四个之一：
 ① necessity：要不要这么多步骤？每一步是否必要？相邻两步能不能合并？不能合并的要写清楚为什么；
-② rationality：合理吗？依赖对不对（后一步用的东西前一步真给得出吗）？有没有漏掉的步骤（比如部署了却没验证）？
+② rationality：合理吗？依赖对不对（后一步用的东西前一步真给得出吗）？有没有漏掉的步骤（比如部署了却没验证）？每步的 inputs 是不是分开的 argv（每个字符串一个参数）？含 shell 语法（管道、重定向、分号、$变量、for 循环）或在 inputs 里重复工具名的，一律不合理、打回；
 ③ reasons：不合理的原因是什么？逐条点名，哪一步、哪个工具、什么问题；
 ④ suggestion：建议如何规划步骤？给出修改后的步骤表（revised_plan），合并哪几步、补哪步、改哪个工具，都要写进表里。
 规则：
@@ -348,13 +350,28 @@ func (p *Planner) registryCheck(plan *Plan) (findings []Finding, table string) {
 	return findings, tb.String()
 }
 
+// extractJSON 从回复里抠出最外层 JSON 对象（模型常在 JSON 前后加
+// 解释文字，直接解析会失败；抠出来再试一次）。
+func extractJSON(s string) string {
+	start := strings.Index(s, "{")
+	end := strings.LastIndex(s, "}")
+	if start < 0 || end < 0 || end <= start {
+		return s
+	}
+	return s[start : end+1]
+}
+
 // parseVerification 解析核验器的 JSON 回复并严格校验：
 // verdict 三档；findings 非空、question 四键齐全、每条有内容；
 // REVISE 的 revised_plan 在 Verify 里另过 validateSteps（这里只解析）。
 func parseVerification(reply string) (*Verification, error) {
 	var ver Verification
-	if err := json.Unmarshal([]byte(stripFences(reply)), &ver); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidVerify, err)
+	cleaned := stripFences(reply)
+	if err := json.Unmarshal([]byte(cleaned), &ver); err != nil {
+		// 回退：抠出最外层 JSON 对象再试一次（模型常在前后加解释文字）。
+		if err2 := json.Unmarshal([]byte(extractJSON(cleaned)), &ver); err2 != nil {
+			return nil, fmt.Errorf("%w: %v", ErrInvalidVerify, err)
+		}
 	}
 	switch ver.Verdict {
 	case VerdictApprove, VerdictRevise, VerdictReject:
@@ -394,6 +411,9 @@ func findingsText(findings []Finding) string {
 // Verify 调一次 reasoner 模型核验一张计划：先代码实核（注册表真实状态），
 // 再调模型，最后合并代码发现——模型说 APPROVE 但实核有问题的，
 // 降级为 REVISE；REVISE 的修订版再过代码校验，不过就置空（调用方重规划）。
+// 模型偶尔返回非法 JSON（第 6 轮：reasoner 回了个 'q' 字符，
+// 整个任务因此被杀掉，无计划、无执行、无产物）；解析失败时重调
+// 最多 2 次，重调时提醒它只返回 JSON——仍失败才返回错误。
 func (p *Planner) Verify(taskID string, plan *Plan) (*Verification, error) {
 	if p.VerifyCall == nil {
 		return nil, ErrPlannerUnavaiable
@@ -407,13 +427,24 @@ func (p *Planner) Verify(taskID string, plan *Plan) (*Verification, error) {
 	tail.WriteString("任务：" + strings.TrimSpace(plan.TaskText) + "\n")
 	tail.WriteString("步骤表：\n" + string(planJSON) + "\n")
 	tail.WriteString(table)
-	reply, _, _, err := p.VerifyCall(taskID, verifyPromptHead, tail.String())
-	if err != nil {
-		return nil, fmt.Errorf("planner verify: %w", err)
+	var ver *Verification
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		tailStr := tail.String()
+		if attempt > 0 {
+			tailStr += "\n注意：上一轮回复不是合法 JSON，只返回 JSON 对象，不要加任何解释文字。\n"
+		}
+		reply, _, _, err := p.VerifyCall(taskID, verifyPromptHead, tailStr)
+		if err != nil {
+			return nil, fmt.Errorf("planner verify: %w", err)
+		}
+		ver, lastErr = parseVerification(reply)
+		if lastErr == nil {
+			break
+		}
 	}
-	ver, err := parseVerification(reply)
-	if err != nil {
-		return nil, err
+	if lastErr != nil {
+		return nil, lastErr
 	}
 	if len(codeFindings) > 0 {
 		ver.Findings = append(ver.Findings, codeFindings...)
@@ -492,7 +523,20 @@ func (p *Planner) PlanAndVerify(taskID, taskText, memSummary string) (*Plan, *Ve
 	for {
 		ver, err := p.Verify(taskID, plan)
 		if err != nil {
-			return nil, nil, fmt.Errorf("planner verify: %w", err)
+			// 核验器连续失败（非法 JSON，重调 2 次仍不过）：不杀任务，
+			// 按原计划执行，但记一笔“核验不可用”，让执行与交付都知道
+			// 这张计划没被核过。工具本身已过 Verify 内的代码实核，
+			// 真正的不可逆动作仍有监工把关。
+			ver = &Verification{
+				Verdict: VerdictApprove,
+				Findings: []Finding{{
+					Question: "reasons",
+					Text:     "核验器连续返回非法 JSON，未能核验（" + err.Error() + "），按原计划执行；工具均已过代码实核。",
+				}},
+			}
+			plan.Rounds = rounds
+			p.recordPlanRun(plan, ver)
+			return plan, ver, nil
 		}
 		switch ver.Verdict {
 		case VerdictApprove:

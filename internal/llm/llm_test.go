@@ -240,6 +240,24 @@ func TestBuildArgv(t *testing.T) {
 	if _, err := BuildArgv(reg, "cap-code-semgrep", []string{"a;b", `x|y(z)`}); err != nil {
 		t.Errorf("shell meta args should pass: %v", err)
 	}
+	// 模型照着 L3 整行命令抄、把工具名也写进 inputs 时，首参数与
+	// 命令名重复的去掉一个（第 5 轮：chrome-nosandbox 被当 URL 打开）。
+	argv, err = BuildArgv(reg, "cap-code-semgrep", []string{"semgrep", "--limit", "5"})
+	if err != nil {
+		t.Fatalf("BuildArgv dup: %v", err)
+	}
+	count := 0
+	for _, a := range argv {
+		if a == "semgrep" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("argv = %v, want exactly one 'semgrep'", argv)
+	}
+	if len(argv) < 1 || argv[len(argv)-2] != "--limit" || argv[len(argv)-1] != "5" {
+		t.Errorf("argv after dedup = %v", argv)
+	}
 	if _, err := BuildArgv(reg, "cap-memory-playbooks", nil); err == nil {
 		t.Error("available:false tool should be rejected")
 	}

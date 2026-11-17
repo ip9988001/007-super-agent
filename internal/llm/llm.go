@@ -402,6 +402,14 @@ func BuildArgv(reg *registry.Registry, toolID string, args []string) ([]string, 
 	if len(argv) == 0 {
 		return nil, ErrEmptyEntryPoint
 	}
+	// 模型常把工具名也写进 inputs（照着 L3 里的整行命令抄），
+	// 首参数与命令名重复时直接去掉——argv[0] 已是工具名，
+	// 再拼一遍会让它变成传给工具的第一个参数（比如 Chrome 会
+	// 把 "chrome-nosandbox" 当 URL 去打开）。只去一个，且只当
+	// 首参数与命令名字面相等时才去，别的参数原样保留。
+	if len(args) > 0 && args[0] == argv[0] {
+		args = args[1:]
+	}
 	if err := ValidateArgs(args); err != nil {
 		return nil, err
 	}
