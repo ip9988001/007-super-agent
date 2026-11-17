@@ -66,7 +66,7 @@
 
 **没有的**：工具种子（`tools/`，933 个文件）不在公开库里。那是另一台机器上自带的文件：9 个助手脚本、SEO 工具包的脚本、14 个 skill 的文件、67 篇能力文档、84 个品牌的设计资料、30 个停用的扩展。种子只在私有构建里。
 
-**对你的影响**：注册表里有 11 条可执行工具的入口指着种子里的文件——2 个 SEO 脚本（content-scorers、geo-seo-aeo）、claude-seo、run-audit.sh、cap-drift.sh、cap-scan.sh、chrome-cdp.sh、chrome-nosandbox、inventory.sh、inventory2.sh、totp.js；还有 13 个 skill 的文件也在种子里。没有种子时，启动自检会把这 11 条报成坏掉（`watchdog check` 里看得到），规划器目前仍会把它们列给模型，模型挑中了会跑失败、报文件找不到——这条正在修，修完启动时会自动把缺文件的工具从清单里拿掉。9 个助手脚本里的 link-selftest.cjs 是三号专属、已标不可用，只存档。
+**对你的影响**：注册表里有 11 条可执行工具的入口指着种子里的文件——2 个 SEO 脚本（content-scorers、geo-seo-aeo）、claude-seo、run-audit.sh、cap-drift.sh、cap-scan.sh、chrome-cdp.sh、chrome-nosandbox、inventory.sh、inventory2.sh、totp.js；还有 13 个 skill 的文件也在种子里。没有种子时，启动自检会把这 11 条报成坏掉（`watchdog check` 里看得到），启动探针也会把它们从规划器清单里拿掉，模型没机会挑中它们。9 个助手脚本里的 link-selftest.cjs 是三号专属、已标不可用，只存档。
 
 ## 快在哪里：分诊 + 三级索引
 
