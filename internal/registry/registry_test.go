@@ -184,6 +184,37 @@ func TestUnavailableNotCallable(t *testing.T) {
 	}
 }
 
+// 6b. 知识条目（doc/sop/tool/mcp/data）即使 available:true 也不可调用：
+// 只能读、不能跑。2026-11-18 ping0 测试：cap-memory-recall-memory
+// （call_type=tool，entry_point "recall_memory" 不存在）被规划器挑中，
+// 执行器启动即失败。
+func TestDocToolNotCallable(t *testing.T) {
+	rg, err := Load(fixture(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"cap-memory-recall-memory", "cap-seo-design-md", "cap-seo-llms-txt"} {
+		e, ok := rg.Entry(id)
+		if !ok {
+			t.Errorf("Entry(%s) missing from fixture", id)
+			continue
+		}
+		if !e.Available {
+			t.Errorf("Entry(%s) should be available:true in fixture", id)
+		}
+		if e.Executable() {
+			t.Errorf("Executable(%s) = true, want false (call_type=%s)", id, e.CallType)
+		}
+		if rg.Callable(id) {
+			t.Errorf("Callable(%s) = true, want false", id)
+		}
+	}
+	// 可执行工具仍可调用。
+	if !rg.Callable("cap-code-rea") || !rg.Callable("cap-fetch-curl-jq") {
+		t.Errorf("cli tools should stay callable")
+	}
+}
+
 // 7. 超限记账：L3 超 1600 字符报错，且一行落进 index_metrics。
 func TestLimitViolationRecorded(t *testing.T) {
 	dir := fixture(t)
@@ -372,5 +403,84 @@ func TestL2SplitOps(t *testing.T) {
 	}
 	if !strings.Contains(l2seo, "cap-seo-content-scorers") {
 		t.Fatal("L2(seo) missing cap-seo-content-scorers")
+	}
+}
+
+// 第 20 步：entry_point 内存覆盖层——先探针、通过才存；
+// registry.json 文件本身永远不动。
+func TestEntryPointOverride(t *testing.T) {
+	dst := fixture(t)
+	rg, err := Load(dst)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	tool := "cap-design-hyperframes" // cli、available、verified=false
+	before, ok := rg.Entry(tool)
+	if !ok {
+		t.Fatalf("Entry(%s) missing", tool)
+	}
+	origEP := before.EntryPoint
+
+	// 1. 新入口探针失败 → 拒绝，不存覆盖层。
+	if err := rg.ApplyEntryPointFix(tool, "/nonexistent/xyz-123"); err == nil {
+		t.Fatal("ApplyEntryPointFix bogus entry point: want error, got nil")
+	}
+	if got, _ := rg.Entry(tool); got.EntryPoint != origEP {
+		t.Fatalf("bogus fix changed entry point to %q", got.EntryPoint)
+	}
+	if len(rg.EntryPointOverrides()) != 0 {
+		t.Fatal("bogus fix left an override behind")
+	}
+
+	// 2. 新入口探针通过 → 存入覆盖层，Entry() 返回新入口。
+	if err := rg.ApplyEntryPointFix(tool, "git"); err != nil {
+		t.Fatalf("ApplyEntryPointFix git: %v", err)
+	}
+	if got, _ := rg.Entry(tool); got.EntryPoint != "git" {
+		t.Fatalf("EntryPoint after fix = %q, want %q", got.EntryPoint, "git")
+	}
+	if ov := rg.EntryPointOverrides(); ov[tool] != "git" {
+		t.Fatalf("EntryPointOverrides = %v, want %q", ov, "git")
+	}
+
+	// 3. registry.json 磁盘文件本身未被改动（仍是原入口）。
+	raw, err := os.ReadFile(filepath.Join(dst, "registry", "registry.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"entry_point": "`+origEP+`"`) {
+		t.Fatalf("registry.json on disk changed: original entry_point %q gone", origEP)
+	}
+
+	// 4. 不存在的工具 / 不可用工具 / 空入口都拒绝。
+	if err := rg.ApplyEntryPointFix("cap-no-such-tool", "git"); err == nil {
+		t.Fatal("ApplyEntryPointFix missing tool: want error, got nil")
+	}
+	if err := rg.ApplyEntryPointFix("cap-fetch-bili", "git"); err == nil {
+		t.Fatal("ApplyEntryPointFix unavailable tool: want error, got nil")
+	}
+	if err := rg.ApplyEntryPointFix(tool, "  "); err == nil {
+		t.Fatal("ApplyEntryPointFix empty entry point: want error, got nil")
+	}
+}
+
+// 第 20 步：UnmarkVerified 与 MarkVerified 对称——
+// 重建时新坏的工具要把旧标记清掉，否则 NeedsProbe 永远认为它已验证。
+func TestUnmarkVerified(t *testing.T) {
+	rg, err := Load(fixture(t))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	tool := "cap-design-hyperframes" // verified=false
+	if !rg.NeedsProbe(tool) {
+		t.Fatal("NeedsProbe before MarkVerified = false, want true")
+	}
+	rg.MarkVerified(tool)
+	if rg.NeedsProbe(tool) {
+		t.Fatal("NeedsProbe after MarkVerified = true, want false")
+	}
+	rg.UnmarkVerified(tool)
+	if !rg.NeedsProbe(tool) {
+		t.Fatal("NeedsProbe after UnmarkVerified = false, want true")
 	}
 }

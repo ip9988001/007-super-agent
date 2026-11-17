@@ -198,19 +198,24 @@ func loadTestRegistry(t *testing.T) *registry.Registry {
 	return reg
 }
 
-// TestValidateArgs：参数含 shell 元字符一律拒绝；
-// 干净参数与空参数列表放行。
+// TestValidateArgs：只拦空串与 NUL 字节；shell 元字符是普通数据
+// （argv 不经过 /bin/sh），正则、URL 带 &、管道等一律放行（B-04）。
 func TestValidateArgs(t *testing.T) {
-	bad := []string{
-		"a;b", "a&b", "a|b", "a`b`", "a$b", "a(b)", "a\nb", "a\rb", "",
-	}
+	bad := []string{"", "a\x00b"}
 	for _, a := range bad {
 		if err := ValidateArgs([]string{a}); err == nil {
 			t.Errorf("ValidateArgs(%q) should reject", a)
 		}
 	}
-	if err := ValidateArgs([]string{"--limit", "10", "plain-text_1.txt"}); err != nil {
-		t.Errorf("ValidateArgs clean args: %v", err)
+	// 曾经被误杀的合法参数：正则里的 |()、URL 里的 &、分号等。
+	ok := []string{
+		`(?<=src=")[^"]+\.js[^"]*|(?<=href=")[^"]+\.css[^"]*`,
+		"https://example.com/?a=1&b=2",
+		"a;b", "a|b", "a`b`", "a$b", "a(b)", "a\nb", "a\rb",
+		"--limit", "10", "plain-text_1.txt",
+	}
+	if err := ValidateArgs(ok); err != nil {
+		t.Errorf("ValidateArgs legit args should pass: %v", err)
 	}
 	if err := ValidateArgs(nil); err != nil {
 		t.Errorf("ValidateArgs nil: %v", err)
@@ -228,8 +233,12 @@ func TestBuildArgv(t *testing.T) {
 	if len(argv) < 1 || argv[len(argv)-2] != "--limit" || argv[len(argv)-1] != "5" {
 		t.Errorf("argv = %v", argv)
 	}
-	if _, err := BuildArgv(reg, "cap-code-semgrep", []string{"a;b"}); err == nil {
-		t.Error("shell meta arg should be rejected before exec")
+	if _, err := BuildArgv(reg, "cap-code-semgrep", []string{"a\x00b"}); err == nil {
+		t.Error("NUL arg should be rejected before exec")
+	}
+	// shell 元字符是普通数据（argv 不经过 /bin/sh），应放行（B-04）。
+	if _, err := BuildArgv(reg, "cap-code-semgrep", []string{"a;b", `x|y(z)`}); err != nil {
+		t.Errorf("shell meta args should pass: %v", err)
 	}
 	if _, err := BuildArgv(reg, "cap-memory-playbooks", nil); err == nil {
 		t.Error("available:false tool should be rejected")
@@ -340,5 +349,45 @@ func TestResolveAPIKey(t *testing.T) {
 	t.Setenv("DEEPSEEK_API_KEY", "test-key")
 	if k, ok := ResolveAPIKey(); !ok || k != "test-key" {
 		t.Errorf("ResolveAPIKey = (%q, %v), want (test-key, true)", k, ok)
+	}
+}
+
+// 第 20 步：ReviewSelfEvolve 调一次 worker 模型做自查点评，
+// 费用按 selfevolve-<日期> 任务号记账；信号为空时不调模型。
+func TestReviewSelfEvolve(t *testing.T) {
+	want := `{"lessons":["探针失败要先看路径"],"proposals":[]}`
+	srv := stubServer(t, http.StatusOK, chatOKBody(want, 1000, 500, 200))
+	defer srv.Close()
+	db := t.TempDir() + "/ledger.db"
+	led, err := ledger.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ledger.Close(led)
+	c := New("deepseek-flash", "test-key")
+	c.BaseURL = srv.URL
+	c.Ledger = led
+	c.SessionID = "s1"
+
+	reply, err := c.ReviewSelfEvolve(t.Context(), "selfevolve-2026-11-19", "exec_fail:cap-code-run-audit: 3\n")
+	if err != nil {
+		t.Fatalf("ReviewSelfEvolve: %v", err)
+	}
+	if reply != want {
+		t.Errorf("reply = %q, want %q", reply, want)
+	}
+	// 费用行按 selfevolve-<日期> 归属：1000 命中 + 500 未命中 + 200 输出
+	// = (1000*20 + 500*1000 + 200*4000) / 1e6 = 1.32 → 四舍五入 1 毫分。
+	rows, err := led.ListExpenseByTask("selfevolve-2026-11-19", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].CostCNYMilli != 1 || rows[0].Model != "deepseek-flash" {
+		t.Errorf("expense rows = %+v, want 1 row cost=1 model=deepseek-flash", rows)
+	}
+
+	// 信号为空：不调模型，直接报错。
+	if _, err := c.ReviewSelfEvolve(t.Context(), "selfevolve-2026-11-19", "  "); err == nil {
+		t.Error("ReviewSelfEvolve empty signals: want error, got nil")
 	}
 }

@@ -92,6 +92,42 @@ CREATE TABLE IF NOT EXISTS inbox_queue (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_inbox_dedup ON inbox_queue(task_id, inbound_seq) WHERE inbound_seq > 0;
 CREATE INDEX IF NOT EXISTS idx_inbox_status ON inbox_queue(status, updated_ts);
 
+-- selfevolve_proposals 是自进化闭环（第 20 步）的提议表：同一问题签名
+-- 7 天内出现 3 次及以上才产生一条提议；status：pending 待人批 /
+-- applied 已应用 / rejected 应用失败。只记提议内容与状态，不记任何密钥。
+CREATE TABLE IF NOT EXISTS selfevolve_proposals (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    proposal_id    TEXT    NOT NULL,  -- se-YYYY-MM-DD-NNN，全局唯一
+    date           TEXT    NOT NULL,  -- 自查日期（北京时间 YYYY-MM-DD）
+    signature      TEXT    NOT NULL,  -- 问题签名，如 exec_fail:cap-code-run-audit
+    evidence_count INTEGER NOT NULL DEFAULT 0,  -- 7 天内该签名的出现次数
+    proposal_text  TEXT    NOT NULL,  -- 提议内容（模型原文，截断 ≤2000 字）
+    status         TEXT    NOT NULL DEFAULT 'pending',  -- pending / applied / rejected
+    created_ts     TEXT    NOT NULL   -- RFC3339 UTC，创建时间
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_proposal_id ON selfevolve_proposals(proposal_id);
+CREATE INDEX IF NOT EXISTS idx_proposal_sig ON selfevolve_proposals(signature, created_ts);
+
+-- plan_runs 是多步骤规划器（第 21 步）的计划表：一次 PlanAndVerify
+-- 记一行（规划器输出的步骤表原文、核验结论、修改轮数、预估费用）。
+-- verdict：APPROVE / REVISE / REJECT；plan_id 全局唯一 pl-YYYY-MM-DD-NNN。
+CREATE TABLE IF NOT EXISTS plan_runs (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id              TEXT    NOT NULL,  -- pl-YYYY-MM-DD-NNN，全局唯一
+    task_id              TEXT    NOT NULL,
+    task_text            TEXT    NOT NULL,  -- 任务原话（截断 ≤2000 字）
+    steps                INTEGER NOT NULL DEFAULT 0,
+    plan_json            TEXT    NOT NULL DEFAULT '',  -- 规划器输出的步骤表原文
+    verdict              TEXT    NOT NULL DEFAULT '',  -- APPROVE / REVISE / REJECT
+    revise_rounds        INTEGER NOT NULL DEFAULT 0,
+    estimated_cost_milli INTEGER NOT NULL DEFAULT 0,  -- 预估费用（毫分，上限口径）
+    created_ts           TEXT    NOT NULL   -- RFC3339 UTC，创建时间
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_id ON plan_runs(plan_id);
+CREATE INDEX IF NOT EXISTS idx_plan_task ON plan_runs(task_id);
+
 CREATE INDEX IF NOT EXISTS idx_execution_task ON execution_ledger(task_id);
 CREATE INDEX IF NOT EXISTS idx_expense_session ON expense_ledger(session_id);
 CREATE INDEX IF NOT EXISTS idx_triage_task ON triage_metrics(task_id);

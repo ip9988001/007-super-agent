@@ -545,3 +545,468 @@ func (l *Ledger) LastStage(taskID, toolID string) (stageNo int, artifactPath str
 	}
 	return stageNo, artifactPath, true, nil
 }
+
+// ---- 自进化提议表（第 20 步）----
+
+// ProposalStatus 是 selfevolve_proposals 一行的状态。
+const (
+	ProposalPending  = "pending"  // 待人批（宪法/分诊提示词/代码类提议只到这一步）
+	ProposalApplied  = "applied"  // 已应用（仅注册表元数据修正可自动到这一步）
+	ProposalRejected = "rejected" // 应用失败（探针未通过等）
+)
+
+// Proposal 是自进化提议表里的一行。
+type Proposal struct {
+	ID            int64
+	ProposalID    string // se-YYYY-MM-DD-NNN，全局唯一
+	Date          string // 自查日期（北京时间 YYYY-MM-DD）
+	Signature     string // 问题签名，如 exec_fail:cap-code-run-audit
+	EvidenceCount int
+	Text          string
+	Status        string // pending / applied / rejected
+	CreatedTS     string
+}
+
+// RecordProposal 写一条提议（初始状态一律 pending；应用与否由调用方
+// 再调 UpdateProposalStatus）。proposal_id 重复时返回错误。
+func (l *Ledger) RecordProposal(p Proposal) (int64, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if p.Status == "" {
+		p.Status = ProposalPending
+	}
+	res, err := l.db.Exec(`INSERT INTO selfevolve_proposals
+		(proposal_id, date, signature, evidence_count, proposal_text, status, created_ts)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		p.ProposalID, p.Date, p.Signature, p.EvidenceCount,
+		truncateRunes(p.Text, 2000), p.Status, time.Now().UTC().Format(time.RFC3339))
+	if err != nil {
+		return 0, fmt.Errorf("ledger insert selfevolve_proposals: %w", err)
+	}
+	return res.LastInsertId()
+}
+
+// CountProposalsByDate 数某天已有的提议数（proposal_id 编号用：se-日期-NNN）。
+func (l *Ledger) CountProposalsByDate(date string) (int, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	var n int
+	if err := l.db.QueryRow(`SELECT COUNT(*) FROM selfevolve_proposals WHERE date = ?`, date).Scan(&n); err != nil {
+		return 0, fmt.Errorf("ledger count proposals: %w", err)
+	}
+	return n, nil
+}
+
+// FindProposalBySignature 查某签名最近 7 天内是否已有提议（任一状态）：
+// 有则返回该行（最新一条），供自查去重——同一问题一周内只提一次，
+// 不重复刷屏。无则 found=false，不报错。
+func (l *Ledger) FindProposalBySignature(signature string, days int) (Proposal, bool, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	var p Proposal
+	err := l.db.QueryRow(`SELECT id, proposal_id, date, signature,
+		evidence_count, proposal_text, status, created_ts
+		FROM selfevolve_proposals
+		WHERE signature = ? AND created_ts >= datetime('now', ?)
+		ORDER BY id DESC LIMIT 1`, signature, fmt.Sprintf("-%d days", days)).Scan(
+		&p.ID, &p.ProposalID, &p.Date, &p.Signature,
+		&p.EvidenceCount, &p.Text, &p.Status, &p.CreatedTS)
+	if err == sql.ErrNoRows {
+		return p, false, nil
+	}
+	if err != nil {
+		return p, false, fmt.Errorf("ledger find proposal: %w", err)
+	}
+	return p, true, nil
+}
+
+// ListProposals 按状态读提议（最新在前，最多 limit 行；status 为空时读全部）。
+func (l *Ledger) ListProposals(status string, limit int) ([]Proposal, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	var rows *sql.Rows
+	var err error
+	if status == "" {
+		rows, err = l.db.Query(`SELECT id, proposal_id, date, signature,
+			evidence_count, proposal_text, status, created_ts
+			FROM selfevolve_proposals ORDER BY id DESC LIMIT ?`, limit)
+	} else {
+		rows, err = l.db.Query(`SELECT id, proposal_id, date, signature,
+			evidence_count, proposal_text, status, created_ts
+			FROM selfevolve_proposals WHERE status = ? ORDER BY id DESC LIMIT ?`, status, limit)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("ledger list proposals: %w", err)
+	}
+	defer rows.Close()
+	var out []Proposal
+	for rows.Next() {
+		var p Proposal
+		if err := rows.Scan(&p.ID, &p.ProposalID, &p.Date, &p.Signature,
+			&p.EvidenceCount, &p.Text, &p.Status, &p.CreatedTS); err != nil {
+			return nil, fmt.Errorf("ledger scan proposals: %w", err)
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// UpdateProposalStatus 按 proposal_id 改提议状态。状态不在
+// pending/applied/rejected 三者之内时拒绝；行不存在时返回错误。
+func (l *Ledger) UpdateProposalStatus(proposalID, status string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	switch status {
+	case ProposalPending, ProposalApplied, ProposalRejected:
+	default:
+		return fmt.Errorf("ledger update proposal %s: 非法状态 %q", proposalID, status)
+	}
+	res, err := l.db.Exec(`UPDATE selfevolve_proposals SET status = ?
+		WHERE proposal_id = ?`, status, proposalID)
+	if err != nil {
+		return fmt.Errorf("ledger update proposal: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("ledger update proposal: %s 不存在", proposalID)
+	}
+	return nil
+}
+
+// ---- 多步骤计划表（第 21 步）----
+
+// PlanRun 是 plan_runs 里的一行：一次 PlanAndVerify 的结论。
+type PlanRun struct {
+	ID                 int64
+	PlanID             string // pl-YYYY-MM-DD-NNN，全局唯一
+	TaskID             string
+	TaskText           string
+	Steps              int
+	PlanJSON           string // 规划器输出的步骤表原文
+	Verdict            string // APPROVE / REVISE / REJECT
+	ReviseRounds       int
+	EstimatedCostMilli int64
+	CreatedTS          string
+}
+
+// RecordPlanRun 写一行计划结论。plan_id 重复时返回错误。
+func (l *Ledger) RecordPlanRun(p PlanRun) (int64, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	res, err := l.db.Exec(`INSERT INTO plan_runs
+		(plan_id, task_id, task_text, steps, plan_json, verdict,
+		 revise_rounds, estimated_cost_milli, created_ts)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		p.PlanID, p.TaskID, truncateRunes(p.TaskText, 2000), p.Steps,
+		p.PlanJSON, p.Verdict, p.ReviseRounds, p.EstimatedCostMilli,
+		time.Now().UTC().Format(time.RFC3339))
+	if err != nil {
+		return 0, fmt.Errorf("ledger insert plan_runs: %w", err)
+	}
+	return res.LastInsertId()
+}
+
+// CountPlanRunsByDate 数某天已有的计划数（plan_id 编号用：pl-日期-NNN）。
+func (l *Ledger) CountPlanRunsByDate(date string) (int, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	var n int
+	// created_ts 是 UTC，plan_id 里的日期是北京时间：按 plan_id 数更准。
+	// GLOB 精确匹配 pl-日期-NNN（3 位数字），重规划的 -r1 后缀行不算进来。
+	if err := l.db.QueryRow(`SELECT COUNT(*) FROM plan_runs WHERE plan_id GLOB ?`,
+		"pl-"+date+"-[0-9][0-9][0-9]").Scan(&n); err != nil {
+		return 0, fmt.Errorf("ledger count plan runs: %w", err)
+	}
+	return n, nil
+}
+
+// ListPlanRuns 按任务读计划结论（最新在前，最多 limit 行）。
+func (l *Ledger) ListPlanRuns(taskID string, limit int) ([]PlanRun, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	rows, err := l.db.Query(`SELECT id, plan_id, task_id, task_text, steps,
+		plan_json, verdict, revise_rounds, estimated_cost_milli, created_ts
+		FROM plan_runs WHERE task_id = ? ORDER BY id DESC LIMIT ?`, taskID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("ledger list plan runs: %w", err)
+	}
+	defer rows.Close()
+	var out []PlanRun
+	for rows.Next() {
+		var p PlanRun
+		if err := rows.Scan(&p.ID, &p.PlanID, &p.TaskID, &p.TaskText, &p.Steps,
+			&p.PlanJSON, &p.Verdict, &p.ReviseRounds, &p.EstimatedCostMilli,
+			&p.CreatedTS); err != nil {
+			return nil, fmt.Errorf("ledger scan plan runs: %w", err)
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// ---- 自查信号聚合（第 20 步）----
+
+// SignalSample 是一条失败样本（供模型点评时看错误原文，最多 5 条）。
+type SignalSample struct {
+	ToolID  string
+	Command string
+	ErrHead string
+}
+
+// SignalCounts 是最近 N 天账本聚合的信号：按 tool_id 计数的四类失败 +
+// 分诊错选代理信号 + 当日费用与前 7 日均值的对比。所有日期口径
+// 均为北京时间（ts 是 UTC 存的，date(ts,'+8 hours') 转北京日期）。
+type SignalCounts struct {
+	ExecFailures              map[string]int // 执行失败（真跑失败，command 不以 probe 开头）
+	ProbeFailures             map[string]int // 探针失败（command 以 probe 开头）
+	AdvisorHalts              map[string]int // 监工 HALT
+	AdvisorConcerns           map[string]int // 监工 CONCERN
+	TriageMisfires            map[string]int // 分诊错选代理：Tier-1 挑了工具、执行随后失败（按任务去重）
+	ExpenseTodayMilli         int64          // 当日费用（毫分）
+	ExpensePrior7DayMeanMilli int64          // 前 7 日均费用（毫分，缺数据的天按 0 算）
+	ExpenseSpike              bool           // 当日费用 > 2× 前 7 日均值（且均值 >0）
+	ExpenseSpikeDays          int            // 7 天内费用突增天数（以今日前 7 日均值为基准；
+	// CountFor("expense_spike") 返回该天数，突增天天数 ≥3 才够提议阈值）
+	Samples []SignalSample
+}
+
+// signalKind 是问题签名的种类前缀。
+const (
+	SigExecFail       = "exec_fail"
+	SigProbeFail      = "probe_fail"
+	SigAdvisorHalt    = "advisor_halt"
+	SigAdvisorConcern = "advisor_concern"
+	SigTriageMisfire  = "triage_misfire"
+	SigExpenseSpike   = "expense_spike"
+)
+
+// Signature 拼一条问题签名：exec_fail:cap-x；费用突增没有 tool_id，
+// 就是 expense_spike 本身。
+func Signature(kind, toolID string) string {
+	if toolID == "" {
+		return kind
+	}
+	return kind + ":" + toolID
+}
+
+// TotalSignals 是信号总数（各计数之和；费用突增算 1）。
+func (s SignalCounts) TotalSignals() int {
+	n := 0
+	for _, m := range []map[string]int{s.ExecFailures, s.ProbeFailures, s.AdvisorHalts, s.AdvisorConcerns, s.TriageMisfires} {
+		for _, c := range m {
+			n += c
+		}
+	}
+	if s.ExpenseSpike {
+		n++
+	}
+	return n
+}
+
+// CountFor 按签名取 7 天内的出现次数；签名不在信号里时 ok=false。
+// 费用突增签名返回 7 天内的突增天数（天级信号按天计，不按次计）。
+func (s SignalCounts) CountFor(signature string) (int, bool) {
+	if signature == SigExpenseSpike {
+		if s.ExpenseSpikeDays > 0 {
+			return s.ExpenseSpikeDays, true
+		}
+		return 0, false
+	}
+	kind, toolID, ok := strings.Cut(signature, ":")
+	if !ok || toolID == "" {
+		return 0, false
+	}
+	var m map[string]int
+	switch kind {
+	case SigExecFail:
+		m = s.ExecFailures
+	case SigProbeFail:
+		m = s.ProbeFailures
+	case SigAdvisorHalt:
+		m = s.AdvisorHalts
+	case SigAdvisorConcern:
+		m = s.AdvisorConcerns
+	case SigTriageMisfire:
+		m = s.TriageMisfires
+	default:
+		return 0, false
+	}
+	c, ok := m[toolID]
+	return c, ok
+}
+
+// AggregateSignals 聚合最近 days 天的账本信号（days 含今天；
+// 北京日期口径）。只统计 tool_id 以 cap- 开头的工具行——
+// 看护/备份/精炼等框架任务（watchdog-daily-check、backup-ledger、
+// refine-daily）不是工具，不进信号。
+func (l *Ledger) AggregateSignals(days int) (SignalCounts, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	out := SignalCounts{
+		ExecFailures:    map[string]int{},
+		ProbeFailures:   map[string]int{},
+		AdvisorHalts:    map[string]int{},
+		AdvisorConcerns: map[string]int{},
+		TriageMisfires:  map[string]int{},
+	}
+	if days < 1 {
+		days = 1
+	}
+	window := fmt.Sprintf("date(ts, '+8 hours') >= date('now', '+8 hours', '-%d days')", days-1)
+	toolFilter := `tool_id LIKE 'cap-%'`
+
+	// 执行失败 vs 探针失败：按 command 是否以 probe 开头分流。
+	queries := []struct {
+		m     map[string]int
+		where string
+	}{
+		{out.ExecFailures, `status='failure' AND command NOT LIKE 'probe %'`},
+		{out.ProbeFailures, `status='failure' AND command LIKE 'probe %'`},
+		{out.AdvisorHalts, `advisor_verdict='HALT'`},
+		{out.AdvisorConcerns, `advisor_verdict='CONCERN'`},
+	}
+	for _, q := range queries {
+		rows, err := l.db.Query(fmt.Sprintf(`SELECT tool_id, COUNT(*) FROM execution_ledger
+			WHERE %s AND %s AND %s GROUP BY tool_id`, q.where, toolFilter, window))
+		if err != nil {
+			return out, fmt.Errorf("ledger aggregate signals: %w", err)
+		}
+		for rows.Next() {
+			var toolID string
+			var n int
+			if err := rows.Scan(&toolID, &n); err != nil {
+				rows.Close()
+				return out, fmt.Errorf("ledger aggregate scan: %w", err)
+			}
+			q.m[toolID] = n
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return out, fmt.Errorf("ledger aggregate rows: %w", err)
+		}
+	}
+
+	// 分诊错选代理：Tier-1 挑了工具、同一任务的执行随后失败（按任务去重）。
+	rows, err := l.db.Query(fmt.Sprintf(`SELECT t.tool_id, COUNT(DISTINCT t.task_id)
+		FROM triage_metrics t JOIN execution_ledger e
+		  ON e.task_id = t.task_id AND e.tool_id = t.tool_id
+		WHERE t.route='TOOL' AND t.tier=1 AND e.status='failure'
+		  AND t.tool_id LIKE 'cap-%%'
+		  AND date(t.ts, '+8 hours') >= date('now', '+8 hours', '-%d days')
+		GROUP BY t.tool_id`, days-1))
+	if err != nil {
+		return out, fmt.Errorf("ledger aggregate misfire: %w", err)
+	}
+	for rows.Next() {
+		var toolID string
+		var n int
+		if err := rows.Scan(&toolID, &n); err != nil {
+			rows.Close()
+			return out, fmt.Errorf("ledger aggregate misfire scan: %w", err)
+		}
+		out.TriageMisfires[toolID] = n
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return out, fmt.Errorf("ledger aggregate misfire rows: %w", err)
+	}
+
+	// 费用：当日（北京）与前 7 日均值（缺数据的天按 0 算进 7 天）。
+	if err := l.db.QueryRow(`SELECT COALESCE(SUM(cost_cny_milli), 0) FROM expense_ledger
+		WHERE date(ts, '+8 hours') = date('now', '+8 hours')`).Scan(&out.ExpenseTodayMilli); err != nil {
+		return out, fmt.Errorf("ledger aggregate expense today: %w", err)
+	}
+	var priorSum int64
+	if err := l.db.QueryRow(`SELECT COALESCE(SUM(cost_cny_milli), 0) FROM expense_ledger
+		WHERE date(ts, '+8 hours') >= date('now', '+8 hours', '-7 days')
+		  AND date(ts, '+8 hours') < date('now', '+8 hours')`).Scan(&priorSum); err != nil {
+		return out, fmt.Errorf("ledger aggregate expense prior: %w", err)
+	}
+	out.ExpensePrior7DayMeanMilli = priorSum / 7
+	if out.ExpensePrior7DayMeanMilli > 0 && out.ExpenseTodayMilli > 2*out.ExpensePrior7DayMeanMilli {
+		out.ExpenseSpike = true
+	}
+	// 7 天内突增天数：逐日费用与今日前 7 日均值比（同一基准），
+	// 供 CountFor("expense_spike") 作阈值判断。
+	dayRows, err := l.db.Query(`SELECT COALESCE(SUM(cost_cny_milli), 0)
+		FROM expense_ledger
+		WHERE date(ts, '+8 hours') >= date('now', '+8 hours', '-6 days')
+		GROUP BY date(ts, '+8 hours')`)
+	if err != nil {
+		return out, fmt.Errorf("ledger aggregate expense days: %w", err)
+	}
+	for dayRows.Next() {
+		var daySum int64
+		if err := dayRows.Scan(&daySum); err != nil {
+			dayRows.Close()
+			return out, fmt.Errorf("ledger aggregate expense days scan: %w", err)
+		}
+		if out.ExpensePrior7DayMeanMilli > 0 && daySum > 2*out.ExpensePrior7DayMeanMilli {
+			out.ExpenseSpikeDays++
+		}
+	}
+	dayRows.Close()
+	if err := dayRows.Err(); err != nil {
+		return out, fmt.Errorf("ledger aggregate expense days rows: %w", err)
+	}
+
+	// 失败样本：最近 5 条（供模型点评看错误原文）。
+	srows, err := l.db.Query(fmt.Sprintf(`SELECT tool_id, command, err_head
+		FROM execution_ledger WHERE status='failure' AND %s AND %s
+		ORDER BY id DESC LIMIT 5`, toolFilter, window))
+	if err != nil {
+		return out, fmt.Errorf("ledger aggregate samples: %w", err)
+	}
+	defer srows.Close()
+	for srows.Next() {
+		var sm SignalSample
+		if err := srows.Scan(&sm.ToolID, &sm.Command, &sm.ErrHead); err != nil {
+			return out, fmt.Errorf("ledger aggregate samples scan: %w", err)
+		}
+		out.Samples = append(out.Samples, sm)
+	}
+	return out, srows.Err()
+}
+
+// SummarizeExpenseByTask 按 task_id 汇总费用（自进化汇总行用）。
+// 汇总行本身（model='selfevolve-summary'）不计入，避免二次自查时重复累加。
+func (l *Ledger) SummarizeExpenseByTask(taskID string) (ExpenseSummary, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	var s ExpenseSummary
+	err := l.db.QueryRow(`SELECT COUNT(*),
+		COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(cache_hit_tokens),0),
+		COALESCE(SUM(cache_miss_tokens),0), COALESCE(SUM(completion_tokens),0),
+		COALESCE(SUM(cost_cny_milli),0)
+		FROM expense_ledger WHERE task_id = ? AND model <> 'selfevolve-summary'`,
+		taskID).Scan(&s.Calls, &s.PromptTokens, &s.CacheHitTokens, &s.CacheMissTokens,
+		&s.CompletionTokens, &s.CostCNYMilli)
+	if err != nil {
+		return s, fmt.Errorf("ledger summarize expense by task: %w", err)
+	}
+	return s, nil
+}
+
+// ListExpenseByTask 按 task_id 读费用行（最新在前，最多 limit 行；
+// 自查费用 task_id 格式测试用）。
+func (l *Ledger) ListExpenseByTask(taskID string, limit int) ([]ExpenseRecord, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	rows, err := l.db.Query(`SELECT session_id, task_id, model, prompt_tokens,
+		cache_hit_tokens, cache_miss_tokens, completion_tokens, cost_cny_milli
+		FROM expense_ledger WHERE task_id = ? ORDER BY id DESC LIMIT ?`, taskID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("ledger list expense by task: %w", err)
+	}
+	defer rows.Close()
+	var out []ExpenseRecord
+	for rows.Next() {
+		var r ExpenseRecord
+		if err := rows.Scan(&r.SessionID, &r.TaskID, &r.Model, &r.PromptTokens,
+			&r.CacheHitTokens, &r.CacheMissTokens, &r.CompletionTokens,
+			&r.CostCNYMilli); err != nil {
+			return nil, fmt.Errorf("ledger scan expense by task: %w", err)
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}

@@ -33,7 +33,9 @@ import (
 	"007-super-agent/internal/ledger"
 	"007-super-agent/internal/llm"
 	"007-super-agent/internal/memory"
+	"007-super-agent/internal/planner"
 	"007-super-agent/internal/registry"
+	"007-super-agent/internal/selfevolve"
 	"007-super-agent/internal/triage"
 	"007-super-agent/internal/watchdog"
 )
@@ -60,6 +62,7 @@ type daemon struct {
 	mem       *memory.Store
 	ex        *executor.Executor
 	wd        *watchdog.Watchdog
+	pl        *planner.Planner     // 第 21 步：多步骤规划器；nil 表示未接线（无模型调用）
 	modelCall triage.ModelCallFunc // Tier-1 模型调用（llm 客户端）；nil 时 Tier-1 报错
 	session   string
 	shadow    bool
@@ -92,6 +95,11 @@ func (d *daemon) handleInner(env gateway.Envelope) (route, toolID, status string
 		// 模型调用失败时只记日志，不执行。
 		log.Printf("triage task=%s: %v", env.TaskID, err)
 		return "ERROR", "", "triage_error"
+	}
+	// 第 21 步：PLAN 去向走规划器（拆步 → 核验 → 按步执行），
+	// 不再只挑一个工具；单步路径行为不变。
+	if dec.Route == triage.RoutePlan {
+		return string(dec.Route), "", d.runPlan(env)
 	}
 	if dec.Route != triage.RouteTool {
 		log.Printf("task=%s route=%s tier=%d (no tool to run)", env.TaskID, dec.Route, dec.Tier)
@@ -170,6 +178,73 @@ func (d *daemon) runTool(env gateway.Envelope, e *registry.Entry) string {
 		return "background"
 	}
 	log.Printf("task=%s tool=%s exit=%d status=%s", env.TaskID, e.ToolID, res.ExitCode, res.Status)
+	return res.Status
+}
+
+// memorySummary 给规划器用的相关记忆摘要：Recall 前 3 条（每条 ≤240 字），
+// 无关或查不到时返回空串，规划器不靠它编造。失败只记日志，不阻塞任务。
+func (d *daemon) memorySummary(text string) string {
+	if d.mem == nil {
+		return ""
+	}
+	rs, err := d.mem.Recall(text)
+	if err != nil || len(rs) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("相关记忆摘要（供规划参考，不在其中不要编造）：\n")
+	for _, r := range rs {
+		fmt.Fprintf(&b, "- 【%s】%s\n", r.Source, r.Text)
+	}
+	return b.String()
+}
+
+// runPlan 是 PLAN 去向的真执行：规划 → 核验 → 按步跑 → 综合 → 交活前审。
+// 影子模式只出规划+核验结论：记一行 shadow 回执，不执行、不综合。
+// 返回执行结果状态（供 handle 记 L1）。
+func (d *daemon) runPlan(env gateway.Envelope) string {
+	if d.pl == nil {
+		log.Printf("task=%s PLAN but planner not wired (no llm client)", env.TaskID)
+		return "planner_unavailable"
+	}
+	memSummary := d.memorySummary(env.Text)
+	plan, ver, err := d.pl.PlanAndVerify(env.TaskID, env.Text, memSummary)
+	if err != nil {
+		log.Printf("task=%s plan failed: %v", env.TaskID, err)
+		return "plan_error"
+	}
+	log.Printf("task=%s plan=%s steps=%d verdict=%s rounds=%d", env.TaskID, plan.PlanID, len(plan.Steps), ver.Verdict, plan.Rounds)
+	if d.shadow {
+		if _, rerr := d.led.RecordExecution(ledger.ExecutionRecord{
+			SessionID: d.session, TaskID: env.TaskID, ToolID: "planner",
+			Command:  fmt.Sprintf("shadow plan %s (%d steps, verdict=%s)", plan.PlanID, len(plan.Steps), ver.Verdict),
+			ExitCode: 0, Status: "shadow", AdvisorVerdict: string(executor.VerdictNote),
+			AdvisorNote: "影子模式：只出规划+核验结论，不执行",
+		}); rerr != nil {
+			log.Printf("shadow plan record task=%s: %v", env.TaskID, rerr)
+		}
+		return "shadow_plan"
+	}
+	res, err := d.pl.RunPlan(plan, env.Text, memSummary)
+	if err != nil {
+		log.Printf("task=%s run plan %s: %v", env.TaskID, plan.PlanID, err)
+		return "plan_run_error"
+	}
+	// 交活前审（触发点 ①）：Draft 为综合回复。HALT 时不交付，原因已记账。
+	if d.ex.Advisor != nil {
+		rres, rerr := d.ex.ReviewDelivery(executor.Task{
+			TaskID: env.TaskID, SessionID: d.session, ToolID: "planner",
+			Text: env.Text, Command: "plan " + plan.PlanID, Draft: res.ReplyDraft,
+			WorkDir: d.pl.WorkDir(env.TaskID),
+		})
+		if rerr != nil && !errors.Is(rerr, executor.ErrAdvisorHalt) && !errors.Is(rerr, executor.ErrAdvisorHaltFinal) {
+			log.Printf("task=%s delivery review: %v", env.TaskID, rerr)
+		} else if rres.Verdict == executor.VerdictHalt {
+			log.Printf("task=%s delivery HALT (retry=%d): %s", env.TaskID, rres.RetryCount, rres.Note)
+			return "delivery_halt"
+		}
+	}
+	log.Printf("task=%s plan=%s status=%s steps=%d/%d skipped=%v", env.TaskID, plan.PlanID, res.Status, res.CompletedSteps, len(plan.Steps), res.SkippedSteps)
 	return res.Status
 }
 
@@ -278,6 +353,16 @@ func main() {
 			adv.Ledger = led // 第 13 步：监工调用的费用进 expense_ledger
 			log.Printf("advisor ready: model=%s (key found, value never logged)", cfg.AdvisorModel)
 		}
+		// 规划器接线（第 21 步）：规划走 worker 模型（flash），核验走
+		// reasoner 模型（cfg.AdvisorModel，与监工同模型、共用同一把 key，
+		// 不另配密钥）。核验温度 0.1，要确定性 JSON；影子模式也接线，
+		// 只出规划+核验结论，不执行。
+		vc := llm.New(cfg.AdvisorModel, apiKey)
+		vc.Ledger = led
+		vc.SessionID = d.session
+		vc.Temperature = 0.1
+		d.pl = planner.New(lc.CallTask, vc.CallTask, reg, led, ex, dataDir, d.session, shadow)
+		log.Printf("planner ready: worker=%s verifier=%s shadow=%v", cfg.WorkerModel, cfg.AdvisorModel, shadow)
 	}
 	gw := gateway.New(cfg, led, d.handle)
 	gw.SetSession(d.session)
@@ -300,6 +385,19 @@ func main() {
 	} else if !shadow {
 		log.Printf("refine loop disabled: no llm client")
 	}
+
+	// 自进化闭环（第 20 步）：非影子模式起常驻循环，每天北京时间 04:30
+	// 自查、每周日 04:30 重建注册表；影子模式也起循环，但只记
+	// “本应自查”，不执行、不写账本、不写 Wiki。非影子模式下 lc 一定
+	// 非空（无密钥时上面已 fatal）；影子模式下 lc 可能为空，循环内
+	// 的影子分支不调模型，安全。
+	var reviewFn selfevolve.ReviewFunc
+	if lc != nil {
+		reviewFn = lc.ReviewSelfEvolve
+	}
+	seLoop := selfevolve.New(led, reg, mem, dataDir, d.session, reviewFn, shadow)
+	go seLoop.Run(refineCtx)
+	log.Printf("self-evolve loop started: daily 04:30 Beijing, rebuild Sunday 04:30")
 
 	// 记忆自动备份（第 15 步）：仅非影子模式且 BACKUP_ENABLED=1 时接线，
 	// 默认关闭。备份在 RefineLoop 精炼成功后触发，失败只记账+告警，

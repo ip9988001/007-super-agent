@@ -12,6 +12,8 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -68,6 +70,22 @@ func (a *Advisor) CollectEvidenceBundle(task executor.Task, trigger executor.Tri
 			if target := deleteTarget(task.Command); target != "" {
 				artifacts = append(artifacts, target)
 			}
+		}
+	}
+	// 交活前审：把计划任务的工作目录落盘文件也放进产物指纹，否则监工
+	// 看不到任何落盘证据。2026-11-18 ping0 第三轮：4 个文件已落盘，
+	// 监工却因 artifact_stats 为空而写下“无任何落盘文件”。
+	if trigger == executor.TriggerDelivery && strings.TrimSpace(task.WorkDir) != "" {
+		if entries, err := os.ReadDir(task.WorkDir); err == nil {
+			for i, de := range entries {
+				if i >= 20 {
+					break
+				}
+				artifacts = append(artifacts, filepath.Join(task.WorkDir, de.Name()))
+			}
+		} else {
+			// 目录本身不存在也是一种证据：让监工看到工作目录根本没建。
+			artifacts = append(artifacts, task.WorkDir)
 		}
 	}
 	b, err := CollectEvidenceBundle(context.Background(), a.db, EvidenceRequest{

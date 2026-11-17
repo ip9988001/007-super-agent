@@ -1,7 +1,8 @@
-// Package triage 是 007 超级 Agent 的分诊（大脑核心）：三选一 + 工具定位。
+// Package triage 是 007 超级 Agent 的分诊（大脑核心）：四选一 + 工具定位。
 //
 // 设计依据（《超级Agent-全新设计方案》v1.5，第 1、4 轮）：
-//   - 三选一：DIRECT 不用工具直接答；TOOL 要动工具走执行；META 元配置自己做。
+//   - 四选一：DIRECT 不用工具直接答；TOOL 要动工具走执行；META 元配置自己做；
+//     PLAN 多步任务走规划器（第 21 步：先拆步、核验、再按步执行）。
 //   - Tier-0 规则 0 token 先行：已注册前缀 / 定时任务；未命中走 Tier-1。
 //   - Tier-1 模型分诊：固定前缀、短 JSON 输出，只回一行
 //     {"route":"DIRECT|TOOL|META","tool_id":"...","reason":"..."}。
@@ -41,13 +42,14 @@ var (
 	ErrProbeFailed    = errors.New("triage: 工具预检探针失败")
 )
 
-// Route 是分诊三选一。
+// Route 是分诊四选一。
 type Route string
 
 const (
 	RouteDirect Route = "DIRECT" // 不用工具直接答
 	RouteTool   Route = "TOOL"   // 要动工具走执行
 	RouteMeta   Route = "META"   // 元配置自己做
+	RoutePlan   Route = "PLAN"   // 多步任务走规划器（第 21 步）
 )
 
 // Input 是一次分诊的输入。
@@ -163,35 +165,45 @@ func matchPrefix(text, prefix string) bool {
 
 // triagePromptHead 是冻结的分诊提示词头：短、固定、只要求一行 JSON。
 // 生产调用时由调用方在前面再拼常驻 L1（一级索引已在上下文里，不在这里重复）。
-const triagePromptHead = `你是 007 超级 Agent 的分诊器。只按下面三选一判，不解释、不多说。
+// 第 21 步：三选一改为四选一，新增 PLAN——需要多个工具按顺序分步完成，
+// 或一个工具一次做不完、必须拆成多步的任务（先做 A、再做 B、最后汇总）。
+// PLAN 只定去向，不挑具体工具，步骤表由规划器另出；单步路径行为不变。
+const triagePromptHead = `你是 007 超级 Agent 的分诊器。只按下面四选一判，不解释、不多说。
 DIRECT：不用任何工具，凭已有知识直接答（闲聊、常识、判断、解释）。
-TOOL：必须动工具（取数、跑代码、动文件、出成品）才能做。
+TOOL：必须动工具（取数、跑代码、动文件、出成品）才能做，且一步就能做完。
 META：改 Agent 自身配置、定时任务、行为规则，不动外部工具。
-只回一行 JSON，不许加别的内容：{"route":"DIRECT|TOOL|META","tool_id":"...","reason":"..."}
-TOOL 时 tool_id 必填且必须是总账里真实存在的工具；DIRECT/META 时 tool_id 留空。
+PLAN：需要多个工具按顺序分步完成，或一个工具一次做不完、必须拆成多步的任务（先做 A、再做 B、最后汇总）。
+只回一行 JSON，不许加别的内容：{"route":"DIRECT|TOOL|META|PLAN","tool_id":"...","reason":"..."}
+TOOL 时 tool_id 必填且必须是总账里真实存在的工具；DIRECT/META/PLAN 时 tool_id 留空。
 `
 
 // CompactToolList 生成紧凑工具清单：每条一行「tool_id: 一句话」。
-// 只列可用工具（available:false 的不进清单，模型没机会挑它）。
+// 只列可执行的工具（cli/service；doc/sop/tool/mcp/data 是知识条目，
+// 不进清单，模型没机会把它当步骤派去执行）。available:false 的也不进。
 // candidates 非空时只列候选集（Tier-0 收窄用）；为空时列全量。
+// 收窄后被滤空时回落到全量可执行清单（不给模型一张空表）。
 // 顺序固定（总账 6 类顺序 + 类内文件顺序），跨调用内容不变，
 // 冻结前缀才能命中缓存。one_liner 截到 80 字，防清单过长。
 func CompactToolList(reg *registry.Registry, candidates []string) string {
 	if len(candidates) > 0 {
 		var b strings.Builder
+		listed := 0
 		for _, id := range candidates {
 			e, ok := reg.Entry(id)
-			if !ok || !e.Available {
+			if !ok || !e.Available || !e.Executable() {
 				continue
 			}
 			fmt.Fprintf(&b, "- %s: %s\n", e.ToolID, truncateRunes(e.OneLiner, 80))
+			listed++
 		}
-		return b.String()
+		if listed > 0 {
+			return b.String()
+		}
 	}
 	var b strings.Builder
 	for _, cat := range registry.Categories() {
 		for _, e := range reg.EntriesByCategory(cat) {
-			if !e.Available {
+			if !e.Available || !e.Executable() {
 				continue
 			}
 			fmt.Fprintf(&b, "- %s: %s\n", e.ToolID, truncateRunes(e.OneLiner, 80))
@@ -237,8 +249,8 @@ func BuildTriagePromptNarrowed(reg *registry.Registry, text string, candidates [
 }
 
 // ParseTriageReply 解析并校验模型的一行 JSON 回复。
-// 校验：route 必须是三选一；TOOL 必须带 tool_id 且在总账里且可用；
-// DIRECT/META 带了不存在的 tool_id 也算错（已知 tool_id 则忽略，不进结论）。
+// 校验：route 必须是四选一；TOOL 必须带 tool_id 且在总账里且可用；
+// DIRECT/META/PLAN 带了不存在的 tool_id 也算错（已知 tool_id 则忽略，不进结论）。
 func ParseTriageReply(reply string, reg *registry.Registry) (Decision, error) {
 	start := strings.Index(reply, "{")
 	end := strings.LastIndex(reply, "}")
@@ -255,7 +267,7 @@ func ParseTriageReply(reply string, reg *registry.Registry) (Decision, error) {
 	}
 	route := Route(strings.ToUpper(strings.TrimSpace(raw.Route)))
 	switch route {
-	case RouteDirect, RouteMeta:
+	case RouteDirect, RouteMeta, RoutePlan:
 		if id := strings.TrimSpace(raw.ToolID); id != "" {
 			if _, ok := reg.Entry(id); !ok {
 				return Decision{}, fmt.Errorf("%w: unknown tool_id %q", ErrInvalidReply, id)

@@ -83,6 +83,8 @@ type Task struct {
 	// 分片审通过后按此落盘；Stage 语义由调用方（工具）定义。
 	StageNo      int    // 本次分片的 Stage 号（从 1 开始；0 表示非分片）
 	ArtifactPath string // 本 Stage 的落盘产物路径（为空表示无产物）
+	// WorkDir 是计划任务的工作目录（交活前审核对落盘用；单步任务为空）。
+	WorkDir string
 }
 
 // Evidence 是监工收到的五件套硬证据（第 7 轮，硬封顶 ≤3000 token，
@@ -147,6 +149,10 @@ type Result struct {
 	AdvisorRetryCount int
 	AdvisorNote       string
 	Killed            bool // 是否被超时杀掉
+	// StdoutFull / StderrFull 是完整输出（第 21 步：多步骤计划的产物落盘用）。
+	// 只读字段，不参与既有记账口径；单路硬封顶 1MB，超了截断并留标记。
+	StdoutFull string
+	StderrFull string
 }
 
 // Handle 是后台任务的句柄：Run 立刻返回它，不等结果。
@@ -445,6 +451,18 @@ func (e *Executor) runBackground(req RunRequest, cmdStr string, timeout time.Dur
 	return h
 }
 
+// MaxFullOutputBytes 是单路完整输出的硬封顶（第 21 步产物落盘用）：
+// 工具一次吐几十 MB 不能全塞进 Result，超了截断并留标记。
+const MaxFullOutputBytes = 1 << 20
+
+// capFullOutput 把完整输出截到 1MB 以内（按字节截，超了加标记）。
+func capFullOutput(s string) string {
+	if len(s) <= MaxFullOutputBytes {
+		return s
+	}
+	return s[:MaxFullOutputBytes] + "\n...[truncated, 输出超 1MB 已截断]"
+}
+
 // runCmd 真正跑命令：建进程组（超时杀整组）、抓输出、记账。
 func (e *Executor) runCmd(ctx context.Context, req RunRequest, cmdStr string, timeout time.Duration, cancel context.CancelFunc) (*Result, error) {
 	start := time.Now()
@@ -466,6 +484,8 @@ func (e *Executor) runCmd(ctx context.Context, req RunRequest, cmdStr string, ti
 		ErrHead:        truncateRunes(stderr.String(), 600),
 		DurationMs:     dur.Milliseconds(),
 		AdvisorVerdict: req.preVerdict, AdvisorNote: req.preNote,
+		StdoutFull: capFullOutput(stdout.String()),
+		StderrFull: capFullOutput(stderr.String()),
 	}
 	if runErr != nil {
 		if ctx.Err() == context.DeadlineExceeded {

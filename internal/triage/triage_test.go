@@ -136,7 +136,7 @@ func TestTier0PrefixHit(t *testing.T) {
 func TestBuildTriagePrompt(t *testing.T) {
 	rg := loadReg(t)
 	p := BuildTriagePrompt(rg, "帮我查一下今天天气怎么样")
-	for _, want := range []string{"DIRECT|TOOL|META", `{"route"`, "帮我查一下今天天气怎么样"} {
+	for _, want := range []string{"DIRECT|TOOL|META|PLAN", `{"route"`, "帮我查一下今天天气怎么样"} {
 		if !strings.Contains(p, want) {
 			t.Errorf("prompt missing %q", want)
 		}
@@ -152,11 +152,22 @@ func TestBuildTriagePrompt(t *testing.T) {
 	if strings.Contains(p, "cap-memory-playbooks") {
 		t.Errorf("prompt must not list unavailable tool cap-memory-playbooks")
 	}
+	// 知识条目（doc/sop/tool/mcp/data）不进清单：只能读、不能跑，
+	// 模型没机会把它当步骤派去执行（2026-11-18 ping0 测试教训）。
+	for _, notWant := range []string{"cap-memory-recall-memory", "cap-seo-design-md", "cap-seo-llms-txt"} {
+		if strings.Contains(p, notWant) {
+			t.Errorf("prompt must not list non-executable tool %s", notWant)
+		}
+	}
 	pn := BuildTriagePromptNarrowed(rg, "/seo 优化", []string{"cap-seo-llms-txt", "cap-seo-claude-seo"})
-	for _, want := range []string{"cap-seo-llms-txt", "cap-seo-claude-seo", "只许从中挑"} {
+	for _, want := range []string{"cap-seo-claude-seo", "只许从中挑"} {
 		if !strings.Contains(pn, want) {
 			t.Errorf("narrowed prompt missing %q", want)
 		}
+	}
+	// 收窄候选里的知识条目（sop）同样被滤掉。
+	if strings.Contains(pn, "cap-seo-llms-txt") {
+		t.Errorf("narrowed prompt must not list non-executable tool cap-seo-llms-txt")
 	}
 	// 收窄清单里不许出现候选集之外的工具。
 	if strings.Contains(pn, "cap-code-semgrep") {
@@ -179,9 +190,11 @@ func TestFrozenListDeterministic(t *testing.T) {
 			lines++
 		}
 	}
-	if lines != 79 { // 84 条总账，5 条 available:false 不进清单
+	if lines != 48 { // 84 条总账：5 条 available:false 不进清单，
+		// 31 条知识条目（doc/sop/tool/mcp/data）不可执行、也不进清单；
+		// 清单只剩 39 cli + 9 service = 48 条可执行工具
 		// （清单行含 cap-/ext-/skill- 三种前缀，不能只数 "- cap-"）
-		t.Errorf("frozen tool list lines = %d, want 79", lines)
+		t.Errorf("frozen tool list lines = %d, want 48", lines)
 	}
 	// 冻结前缀 + 尾部分开发送：天气问题走 DIRECT（清单里没有天气工具，
 	// 模型不许编 tool_id；这里用桩模拟模型回 DIRECT，验证链路本身）。
@@ -203,6 +216,7 @@ func TestParseTriageReply(t *testing.T) {
 		{`{"route":"DIRECT","tool_id":"","reason":"常识问答"}`, RouteDirect, ""},
 		{`{"route":"META","tool_id":"","reason":"改自身配置"}`, RouteMeta, ""},
 		{`{"route":"TOOL","tool_id":"cap-code-semgrep","reason":"要审计"}`, RouteTool, "cap-code-semgrep"},
+		{`{"route":"PLAN","tool_id":"","reason":"多步任务走规划器"}`, RoutePlan, ""},
 		{"前面多一句废话\n" + `{"route":"DIRECT","tool_id":"","reason":"x"}` + "\n后面也有一句", RouteDirect, ""},
 	}
 	for _, c := range valid {
@@ -217,6 +231,7 @@ func TestParseTriageReply(t *testing.T) {
 		`{"route":"TOOL","tool_id":"no-such-tool","reason":"x"}`,         // tool_id 不存在
 		`{"route":"TOOL","tool_id":"cap-memory-playbooks","reason":"x"}`, // available:false
 		`{"route":"DIRECT","tool_id":"no-such-tool","reason":"x"}`,       // DIRECT 带不存在的 tool_id
+		`{"route":"PLAN","tool_id":"no-such-tool","reason":"x"}`,         // PLAN 带不存在的 tool_id
 		`没有 JSON`,          // 无 JSON
 		`{"route":"TOOL",`, // 残缺 JSON
 	}

@@ -164,7 +164,7 @@ npx playwright@1.64.1 install-deps chromium
 echo "--- chrome-nosandbox wrapper（指向本机 playwright chromium）---"
 CHROME=$(find /root/.cache/ms-playwright -name chrome -path "*chrome-linux*/chrome" 2>/dev/null | head -1)
 if [ -n "$CHROME" ]; then
-  printf '#!/bin/sh\nexec %s --no-sandbox --disable-dev-shm-usage --disable-gpu "$@"\n' "$CHROME" > /usr/local/bin/chrome-nosandbox
+  printf '#!/bin/sh\nexec %s --headless=new --no-sandbox --disable-dev-shm-usage --disable-gpu "$@"\n' "$CHROME" > /usr/local/bin/chrome-nosandbox
   chmod +x /usr/local/bin/chrome-nosandbox
   echo "chromium at: $CHROME"
 else

@@ -100,6 +100,9 @@ func WithSession(sessionID, taskID string) Option {
 // 加载后内容不可变，调用方只读。唯一的例外是探针标记：
 // verifiedOverride 只记“本进程内已探针通过”的工具（不写回 registry.json，
 // registry.json 是第 1 步的真相源，运行时绝不重写），由 mu 保护。
+// 第 20 步：entryPointOverride 是同一口径的第二层覆盖——
+// 自进化自动应用的 entry_point 修正只活在内存里，重启即失效，
+// 永久修正仍须由人写进 registry.json；存入前必须先过探针。
 type Registry struct {
 	dataDir   string
 	entries   []Entry
@@ -109,8 +112,9 @@ type Registry struct {
 	sessionID string
 	taskID    string
 
-	mu               sync.RWMutex
-	verifiedOverride map[string]bool
+	mu                 sync.RWMutex
+	verifiedOverride   map[string]bool
+	entryPointOverride map[string]string
 }
 
 // Load 读 DATA_DIR/registry/registry.json 并全量校验：
@@ -204,16 +208,53 @@ func (rg *Registry) checkL3Correspondence() error {
 func (rg *Registry) Count() int { return len(rg.entries) }
 
 // Entry 按 tool_id 取一条；不存在返回 false。
+// 返回的是拷贝（带上内存覆盖层的 entry_point）：调用方只读字段，
+// 改返回值的字段不会影响总账；真正的修正只走 ApplyEntryPointFix。
 func (rg *Registry) Entry(toolID string) (*Entry, bool) {
 	e, ok := rg.byID[toolID]
-	return e, ok
+	if !ok {
+		return nil, false
+	}
+	cp := *e
+	rg.mu.RLock()
+	if ep, ok := rg.entryPointOverride[toolID]; ok {
+		cp.EntryPoint = ep
+	}
+	rg.mu.RUnlock()
+	return &cp, true
+}
+
+// effectiveEntryPoint 取一条工具当前生效的 entry_point（覆盖层优先）。
+func (rg *Registry) effectiveEntryPoint(toolID string) (string, bool) {
+	e, ok := rg.byID[toolID]
+	if !ok {
+		return "", false
+	}
+	rg.mu.RLock()
+	defer rg.mu.RUnlock()
+	if ep, ok := rg.entryPointOverride[toolID]; ok {
+		return ep, true
+	}
+	return e.EntryPoint, true
 }
 
 // Callable 判断一条工具是否可调用：存在且 available 为真。
 // available:false 的条目照常加载，但永远不可调用。
+// Executable 是一条工具能不能被真正执行：只有 cli（直接跑命令）与
+// service（跑脚本文件）两类能进执行层；doc/sop/tool/mcp/data 是知识
+// 条目，只能读、不能跑。2026-11-18 ping0 真机测试：规划器挑了
+// call_type=tool 的 cap-memory-recall-memory（entry_point
+// "recall_memory" 根本不存在），执行器启动即失败，整个 15 步计划
+// 0 步完成。执行层只认可执行工具。
+func (e *Entry) Executable() bool {
+	return e.CallType == "cli" || e.CallType == "service"
+}
+
+// Callable 是一条工具能不能被派单执行：在册、可用、且可执行。
+// 只看 available 不够：知识条目也标 available:true，但跑不起来。
 func (rg *Registry) Callable(toolID string) bool {
 	e, ok := rg.byID[toolID]
-	return ok && e.Available
+	return ok && e.Available && e.Executable()
 }
 
 // NeedsProbe 判断一条工具在调用前是否需要先跑预检探针（第 14 步 B-03）：
@@ -240,6 +281,56 @@ func (rg *Registry) MarkVerified(toolID string) {
 	rg.verifiedOverride[toolID] = true
 }
 
+// UnmarkVerified 撤掉一条工具的本进程内已验证标记（第 20 步每周重建用：
+// 新坏的工具要把之前探针通过留下的标记清掉，否则 NeedsProbe 永远
+// 认为它已验证、再也不探针）。只动内存，不写回 registry.json。
+func (rg *Registry) UnmarkVerified(toolID string) {
+	rg.mu.Lock()
+	defer rg.mu.Unlock()
+	delete(rg.verifiedOverride, toolID)
+}
+
+// ApplyEntryPointFix 应用一条 entry_point 修正到内存覆盖层（第 20 步
+// 自进化自动应用档唯一可改注册表元数据的操作）：先对新入口跑探针，
+// 通过才存入覆盖层；探针失败返回错误、不存。工具不存在、不可用、
+// 新入口为空都拒绝。registry.json 文件本身永远不动。
+func (rg *Registry) ApplyEntryPointFix(toolID, newEntryPoint string) error {
+	e, ok := rg.byID[toolID]
+	if !ok {
+		return fmt.Errorf("%w: %q", ErrNotFound, toolID)
+	}
+	if !e.Available {
+		return fmt.Errorf("%w: tool %q", ErrNotAvailable, toolID)
+	}
+	newEntryPoint = strings.TrimSpace(newEntryPoint)
+	if newEntryPoint == "" {
+		return errors.New("registry apply entry_point fix: 新入口为空")
+	}
+	probeCopy := *e
+	probeCopy.EntryPoint = newEntryPoint
+	if err := ProbeEntry(probeCopy); err != nil {
+		return fmt.Errorf("registry apply entry_point fix %q: 新入口探针失败: %w", toolID, err)
+	}
+	rg.mu.Lock()
+	defer rg.mu.Unlock()
+	if rg.entryPointOverride == nil {
+		rg.entryPointOverride = map[string]string{}
+	}
+	rg.entryPointOverride[toolID] = newEntryPoint
+	return nil
+}
+
+// EntryPointOverrides 返回当前内存覆盖层的快照拷贝（重建报告与核验用）。
+func (rg *Registry) EntryPointOverrides() map[string]string {
+	rg.mu.RLock()
+	defer rg.mu.RUnlock()
+	out := make(map[string]string, len(rg.entryPointOverride))
+	for k, v := range rg.entryPointOverride {
+		out[k] = v
+	}
+	return out
+}
+
 // Probe 对一条工具跑预检探针（只做存在性检查，不真跑命令）：
 // 按 call_type 分流（第 19 步第 5 批）：cli 查命令/路径、service 查
 // 脚本文件、doc/sop/tool/mcp/data 不探针（只记知识，不可执行）。
@@ -251,7 +342,12 @@ func (rg *Registry) Probe(toolID string) error {
 	if !ok {
 		return fmt.Errorf("%w: %q", ErrNotFound, toolID)
 	}
-	if err := ProbeEntry(*e); err != nil {
+	// 探针跑生效的入口（内存覆盖层优先），否则自进化修好的路径
+	// 永远探不到、也永远标不上已验证。
+	ep, _ := rg.effectiveEntryPoint(toolID)
+	probeCopy := *e
+	probeCopy.EntryPoint = ep
+	if err := ProbeEntry(probeCopy); err != nil {
 		return err
 	}
 	rg.MarkVerified(toolID)
@@ -264,6 +360,7 @@ func (rg *Registry) Probe(toolID string) error {
 //     如 camoufox，没有 CLI，LookPath 只能验到 python3 本身）。
 //   - service：entry_point 就是脚本路径（相对部署根目录），只查文件在位。
 //   - doc/sop/tool/mcp/data：知识条目，不探针（只记知识，不可执行）。
+//
 // 未知 call_type 按 cli 处理。空 entry_point 一律失败。
 // 注意：相对路径按进程工作目录解析——守护进程必须以部署根目录为
 // 工作目录启动（systemd WorkingDirectory），否则脚本类探针失败。

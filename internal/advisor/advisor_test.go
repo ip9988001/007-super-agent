@@ -255,3 +255,50 @@ func TestPreActionBundleCarriesCommand(t *testing.T) {
 		t.Errorf("delivery TaskText %q must not carry pre-action note", ev2.TaskText)
 	}
 }
+
+// TestDeliveryBundleCarriesWorkDirListing：交活前审的证据包必须带上工作目录
+// 落盘文件的指纹（2026-11-18 ping0 第三轮：监工因 artifact_stats 为空而误判无落盘文件）。
+func TestDeliveryBundleCarriesWorkDirListing(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "ledger.db")
+	led, err := ledger.Open(dbPath)
+	if err != nil {
+		t.Fatalf("ledger open: %v", err)
+	}
+	defer ledger.Close(led)
+	adv, err := New(dbPath, AdvisorConfig{Endpoint: "http://127.0.0.1:1", APIKey: "test-key", Model: "stub", Timeout: time.Second}, dir)
+	if err != nil {
+		t.Fatalf("advisor new: %v", err)
+	}
+	defer adv.Close()
+	wd := filepath.Join(dir, "workspace", "t1")
+	if err := os.MkdirAll(wd, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wd, "home.html"), []byte("<html>"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	task := executor.Task{
+		TaskID: "t-del", SessionID: "s9", Text: "抓个站", Draft: "做完了",
+		WorkDir: wd,
+	}
+	ev, err := adv.CollectEvidenceBundle(task, executor.TriggerDelivery)
+	if err != nil {
+		t.Fatalf("collect delivery: %v", err)
+	}
+	if !strings.Contains(ev.ArtifactFingerprint, "home.html: size=") {
+		t.Errorf("delivery ArtifactFingerprint %q missing workdir file stat", ev.ArtifactFingerprint)
+	}
+	// 不存在的目录：指纹里要有 MISSING，监工才能看到工作目录根本没建。
+	task2 := executor.Task{
+		TaskID: "t-del2", SessionID: "s9", Text: "抓个站", Draft: "做完了",
+		WorkDir: filepath.Join(dir, "workspace", "t-none"),
+	}
+	ev2, err := adv.CollectEvidenceBundle(task2, executor.TriggerDelivery)
+	if err != nil {
+		t.Fatalf("collect delivery missing dir: %v", err)
+	}
+	if !strings.Contains(ev2.ArtifactFingerprint, "MISSING") {
+		t.Errorf("delivery ArtifactFingerprint %q must mark missing workdir", ev2.ArtifactFingerprint)
+	}
+}

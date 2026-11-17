@@ -12,8 +12,10 @@
 //     费率出处：2026-11-17 实测的 DeepSeek 官方定价，见设计方案。
 //   - 密钥只从环境变量或 600 权限 .env 读键名 DEEPSEEK_API_KEY，
 //     值永远不进日志、不进账本、不进代码与测试数据。
-//   - 调用失败返回错误，不伪造回复；参数化调用的参数先过白名单，
-//     含 shell 元字符直接拒绝、不执行。
+//   - 调用失败返回错误，不伪造回复；参数化调用的参数只做最小校验
+//     （空串、NUL 字节拒绝）。argv 经 exec 直接传给进程，不经过
+//     /bin/sh，shell 元字符只是普通数据，不拦截（B-04 修复：
+//     2026-11-18 ping0 真机测试里，正则参数里的 |() 曾被误杀）。
 package llm
 
 import (
@@ -326,17 +328,25 @@ func (c *Client) recordExpense(u Usage, taskID string) {
 	}
 }
 
-// TriageCall 是给 triage.Triage 注入的 ModelCallFunc：
-// frozen（分诊提示词头 + 可用工具清单）放 system 消息最前（缓存分区 A 区，
-// 跨调用内容固定才能命中缓存），tail（本次用户原话）放最后一条 user
-// 消息（C 区）。费用按 taskID 归属记账。非法 JSON 由 triage.ParseTriageReply 校验。
-func (c *Client) TriageCall(taskID, frozen, tail string) (string, int64, int64, error) {
+// CallTask 是通用的带任务归属的模型调用：frozen（冻结提示词 + 清单）
+// 放 system 消息最前（缓存分区 A 区），tail 放最后一条 user 消息
+// （C 区）。费用按 taskID 归属记账。TriageCall、规划器的 Plan/Verify
+// 调用都走这里，不各写一套 HTTP 逻辑。
+func (c *Client) CallTask(taskID, frozen, tail string) (string, int64, int64, error) {
 	msgs := BuildMessages(Zones{Frozen: frozen, Tail: tail})
 	reply, u, err := c.chatWithTask(context.Background(), msgs, taskID)
 	if err != nil {
 		return "", 0, 0, err
 	}
 	return reply, u.PromptTokens, u.CompletionTokens, nil
+}
+
+// TriageCall 是给 triage.Triage 注入的 ModelCallFunc：
+// frozen（分诊提示词头 + 可用工具清单）放 system 消息最前（缓存分区 A 区，
+// 跨调用内容固定才能命中缓存），tail（本次用户原话）放最后一条 user
+// 消息（C 区）。费用按 taskID 归属记账。非法 JSON 由 triage.ParseTriageReply 校验。
+func (c *Client) TriageCall(taskID, frozen, tail string) (string, int64, int64, error) {
+	return c.CallTask(taskID, frozen, tail)
 }
 
 // TriageCallZones 是带缓存分区的分诊调用：A 区放冻结前缀（分诊提示词头
@@ -352,25 +362,27 @@ func (c *Client) TriageCallZones(frozen, carryover string, history []Message, ta
 }
 
 var (
-	// ErrBadArg 是参数含 shell 元字符。
-	ErrBadArg = errors.New("llm: 参数含 shell 元字符，拒绝执行")
+	// ErrBadArg 是参数非法：空串或含 NUL 字节（exec 传不进去）。
+	// 注意：shell 元字符（; & | ` $ () 与换行）不在此列——argv 经
+	// exec.Command 直接传给进程，不经过 /bin/sh，这些字符只是普通
+	// 数据。2026-11-18 ping0 真机测试：规划器步骤里的正则参数
+	// "(?<=src=\")[^\"]+\\.js..." 含 |() 曾被旧版白名单误杀，
+	// 导致整个多步任务 plan_error。不可逆动作由监工把关，不由这里把关。
+	ErrBadArg = errors.New("llm: 参数非法，拒绝执行")
 	// ErrEmptyEntryPoint 是总账 entry_point 为空。
 	ErrEmptyEntryPoint = errors.New("llm: 工具 entry_point 为空")
 )
 
-// shellMeta 是参数里不许出现的字符：分号、与、管道、反引号、
-// 美元、括号、换行、回车。含了就拒绝，不拼、不执行。
-const shellMeta = "; & | ` $ ( ) \n\r"
-
-// ValidateArgs 校验参数白名单：逐个参数查 shell 元字符，
-// 含了就报错；空参数串也拒绝（防空串拼出歧义命令）。
+// ValidateArgs 做最小校验：空参数串拒绝（防空串拼出歧义命令）；
+// 含 NUL 字节的拒绝（exec 系统调用传不进去）。
+// shell 元字符不拦：见 ErrBadArg 上的说明。
 func ValidateArgs(args []string) error {
 	for _, a := range args {
 		if a == "" {
 			return fmt.Errorf("%w: 空参数", ErrBadArg)
 		}
-		if strings.ContainsAny(a, shellMeta) {
-			return fmt.Errorf("%w: %q", ErrBadArg, a)
+		if strings.ContainsRune(a, 0) {
+			return fmt.Errorf("%w: 参数含 NUL 字节: %q", ErrBadArg, a)
 		}
 	}
 	return nil
@@ -467,6 +479,41 @@ func (c *Client) RefineL1(ctx context.Context, taskID, l1Text string) ([]memory.
 		})
 	}
 	return out, nil
+}
+
+// reviewSelfEvolvePrompt 是每日自查的冻结提示词（放 A 区，内容固定才能命中缓存）：
+// 只输出一个 JSON 对象，不要任何解释、不要 markdown 代码围栏。
+// 模型只点评信号，不编造信号之外的提议；阈值（同一签名 7 天内 ≥3 次）
+// 与分档（哪些能自动应用）由调用方代码强制执行，不由模型决定。
+const reviewSelfEvolvePrompt = `你是超级 Agent 的自进化审查器。只看下面 7 天账本聚合信号（每行“签名: 次数”，费用突增是天级信号），输出一个 JSON 对象，不要任何解释、不要 markdown 代码围栏。
+对象格式：
+{"lessons":["教训1","教训2"],"proposals":[{"signature":"exec_fail:cap-code-run-audit","kind":"registry_entrypoint_fix","tool_id":"cap-code-run-audit","new_entry_point":"tools/scripts/run-audit.sh","text":"提议内容一句话"}]}
+规则：
+- lessons：每条一句话，写值得长期记住的教训；没有就空数组。
+- proposals：只给出现 3 次及以上的问题提建议；kind 只能是 registry_entrypoint_fix（修注册表 entry_point 路径）、registry_verified（工具已修好、重新探针验证）、constitution（改宪法）、triage_prompt（改分诊提示词）、code（改执行层/网关代码）、other；registry_entrypoint_fix 必须给 tool_id 与 new_entry_point；与信号无关的提议不许编。
+- 只输出 JSON 对象。`
+
+// MaxReviewRunes 是单次自查送进模型的信号文本上限（字符，先转 []rune 切），
+// 防信号过多导致费用失控；超了只留计数行，丢错误样本。
+const MaxReviewRunes = 8000
+
+// ReviewSelfEvolve 调一次 worker 模型做每日自查点评：提示词放 A 区（冻结）、
+// 信号文本放 C 区。返回模型原文（JSON 对象，调用方解析）；费用按 taskID
+// 归属记账（调用方传 selfevolve-YYYY-MM-DD）。信号文本为空时直接报错，
+// 不调模型、不花钱。
+func (c *Client) ReviewSelfEvolve(ctx context.Context, taskID, signalsText string) (string, error) {
+	if strings.TrimSpace(signalsText) == "" {
+		return "", errors.New("llm: 自查信号为空")
+	}
+	if utf8.RuneCountInString(signalsText) > MaxReviewRunes {
+		signalsText = string([]rune(signalsText)[:MaxReviewRunes])
+	}
+	msgs := BuildMessages(Zones{Frozen: reviewSelfEvolvePrompt, Tail: signalsText})
+	reply, _, err := c.chatWithTask(ctx, msgs, taskID)
+	if err != nil {
+		return "", err
+	}
+	return reply, nil
 }
 
 // truncateRunes 按字符截断到 n 个字（先转 []rune，防中文乱码）。
