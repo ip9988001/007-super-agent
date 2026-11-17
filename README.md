@@ -42,7 +42,7 @@
 
 ## 007 自带什么
 
-装完就有 **39 个命令行工具 + 9 个助手脚本 + 14 个 skill**，2026-11-18 在 Debian 12 测试机上逐个实测通过。一键安装脚本在 `scripts/install-toolchain.sh`，版本钉死，全部走公开源。
+装完就有 **39 个命令行工具**，一键安装脚本在 `install-toolchain.sh`（仓库根目录），版本钉死，全部走公开源，2026-11-18 在 Debian 12 测试机上逐个实测通过。另外注册表里还有 **9 个助手脚本 + 3 个 SEO 脚本 + 14 个 skill**，这些文件不在公开库里，见下面「公开库里有什么、没有什么」。
 
 **抓取与浏览器（10）**：agent-reach 1.6.0、playwright 1.64.1、lightpanda 1.1.0-nightly、scrapling 0.5、httpx 0.28.1、yt-dlp 2026.10.21、curl 7.88.1、gh 2.103.2、camoufox 0.5.9、chrome-nosandbox（playwright chromium 封装）
 
@@ -59,6 +59,14 @@
 **Skill（14）**：长期能力 5 个——long-term（长期记忆）、adjudicator（裁决）、retrieval（检索）、migration（迁移）、forge（锻造）；工具型 9 个——agent-reach、browser-tools、edge-tts、github-get、hyperframes、impeccable、lightpanda、reverse-engineer-anything（逆向）、scrapling
 
 另外：注册表里还有 31 条知识条目（67 篇能力文档、84 个品牌的设计资料、SEO 工具包），只读、不占执行位；另有 26 个 skill 只存档、不加载。lightpanda 是滚动 nightly，构建号钉不死。
+
+## 公开库里有什么、没有什么
+
+**有的**：Go 框架全部代码、宪法 34 条、工具总账（84 条）、三级索引、一键安装脚本（装 39 个上游工具）。
+
+**没有的**：工具种子（`tools/`，933 个文件）不在公开库里。那是另一台机器上自带的文件：9 个助手脚本、SEO 工具包的脚本、14 个 skill 的文件、67 篇能力文档、84 个品牌的设计资料、30 个停用的扩展。种子只在私有构建里。
+
+**对你的影响**：注册表里有 11 条可执行工具的入口指着种子里的文件——2 个 SEO 脚本（content-scorers、geo-seo-aeo）、claude-seo、run-audit.sh、cap-drift.sh、cap-scan.sh、chrome-cdp.sh、chrome-nosandbox、inventory.sh、inventory2.sh、totp.js；还有 13 个 skill 的文件也在种子里。没有种子时，启动自检会把这 11 条报成坏掉（`watchdog check` 里看得到），规划器目前仍会把它们列给模型，模型挑中了会跑失败、报文件找不到——这条正在修，修完启动时会自动把缺文件的工具从清单里拿掉。9 个助手脚本里的 link-selftest.cjs 是三号专属、已标不可用，只存档。
 
 ## 快在哪里：分诊 + 三级索引
 
