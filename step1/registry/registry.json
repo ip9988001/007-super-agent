@@ -1,5 +1,5 @@
 {
-  "version": "1.2",
+  "version": "v1.6",
   "generated": "2026-11-17 Step 1; 2026-11-18 Step 19 batch 5 修订（84 条）；2026-11-18 修复 browser-stack 入口（去展示串斜杠）",
   "total": 84,
   "entries": [
@@ -79,7 +79,7 @@
       "call_type": "cli",
       "trigger_prefix": null,
       "pre_command": null,
-      "entry_point": "python3 -c import camoufox",
+      "entry_point": "camoufox",
       "param_schema": {},
       "output_contract": "退出码 0 为成功；失败返回 code 与 stderr 头 600 字；输出截断 8MB",
       "status_triad": {
@@ -90,7 +90,7 @@
       "available": true,
       "last_verified_at": "2026-10-26",
       "source_file": "CAPABILITIES/01-取数与抓取/C-camoufox.md",
-      "one_liner": "Firefox(Gecko) 内核的反检测浏览器：Camoufox v0.5.9 + 指纹生成器 fpgen + 配对 Playwright 1.64.1。`camoufox` 这个 CLI 只管\"下载/切换/查看浏览器\"，真正抓活得在 Python 里 `with Camoufox(...)`。",
+      "one_liner": "绕过机器人验证（Cloudflare Turnstile 等）的反检测浏览器：Camoufox v0.5.9 + 指纹生成器 fpgen + 配对 Playwright 1.64.1。`camoufox` 这个 CLI 只管\"下载/切换/查看浏览器\"，真正抓活得在 Python 里 `with Camoufox(...)`。",
       "verified_basis": "原文件 实际效果（实测 2026-10-26）",
       "note": "Python API，无 CLI；探针跑 python3 -c import camoufox（第 19 步）",
       "exact_deepseek_tokens": 623
@@ -113,7 +113,7 @@
       "available": true,
       "last_verified_at": "2026-10-26",
       "source_file": "CAPABILITIES/01-取数与抓取/C-curl-jq.md",
-      "one_liner": "最底层的 HTTP 取数：curl 7.88.1 可用；jq 1.6 已装（见 05/J-jq.md），可直接 jq 管道；python3 仅作复杂处理备选。",
+      "one_liner": "最底层的 HTTP 取数：curl 7.88.1 可用；jq 1.6 已装（见 05/J-jq.md），可直接 jq 管道；python3 仅作复杂处理备选。抓 HTML 时要带全套浏览器请求头（Accept、Accept-Language、Sec-Fetch-*），只带 UA 常被回 40 字节空壳或验证页。",
       "verified_basis": "原文件 实际效果（实测 2026-10-26）",
       "note": "jq 1.6 已装；r.jina.ai 免 key 转 markdown",
       "exact_deepseek_tokens": 570
@@ -251,7 +251,7 @@
       "available": true,
       "last_verified_at": "2026-10-26",
       "source_file": "CAPABILITIES/01-取数与抓取/S-scrapling.md",
-      "one_liner": "抓取框架 v0.5，两条通道：CLI（`/data/tools/uv/bin/scrapling`）和 MCP server（16 个工具，已挂在 pi 里）。反爬/stealth 渲染/会话保持都在这。",
+      "one_liner": "抓取框架 v0.5：CLI `scrapling`（PATH 上，uv 工具）+ MCP `scrapling-mcp`。绕过机器人验证（Cloudflare Turnstile 等）：stealthy_fetch 带 TLS 指纹伪装，抓被验证挡住的站；反爬/stealth 渲染/会话保持都在这。",
       "verified_basis": "原文件 实际效果（实测 2026-10-26）",
       "note": "CLI + MCP 双通道",
       "exact_deepseek_tokens": 523
@@ -334,7 +334,7 @@
       "available": true,
       "last_verified_at": "2026-10-26",
       "source_file": "CAPABILITIES/02-代码与审计/C-codegraph.md",
-      "one_liner": "代码图谱 CLI 1.6.2（node:sqlite 内建后端），把仓库索引成符号 + 调用图后按需查；目前只有 `/data/workspace/rea` 建过索引。",
+      "one_liner": "代码图谱 CLI 1.6.2（node:sqlite 内建后端），把仓库索引成符号 + 调用图后按需查；007 上暂无现成索引，用前先对目标仓库建索引。",
       "verified_basis": "原文件 实际效果（实测 2026-10-26）",
       "note": "仅 /data/workspace/rea 建过索引（6,889 文件 / 128,271 节点）；与另一条 codegraph 同一真身（二进制），Go 版二合一：薄封装即工具。",
       "exact_deepseek_tokens": 586
@@ -454,7 +454,7 @@
       "available": true,
       "last_verified_at": "2026-10-26",
       "source_file": "CAPABILITIES/02-代码与审计/S-semgrep.md",
-      "one_liner": "本地静态规则扫描：semgrep 1.182.1（pip 装），规则库已在 `/data/workspace/semgrep-rules`，离线可跑、不用登录。",
+      "one_liner": "本地静态规则扫描：semgrep 1.182.1（pip 装）；007 上无本地规则快照，默认走在线规则（需联网），离线扫要先下规则。",
       "verified_basis": "原文件 实际效果（实测 2026-10-26）",
       "note": "规则库离线可跑，不用登录",
       "exact_deepseek_tokens": 489
@@ -466,7 +466,7 @@
       "call_type": "cli",
       "trigger_prefix": "/seo",
       "pre_command": null,
-      "entry_point": "tools/seo-toolkit/claude-seo/scripts/content_quality.py",
+      "entry_point": "python3 tools/seo-toolkit/claude-seo/scripts/content_quality.py",
       "param_schema": {},
       "output_contract": "退出码 0 为成功；失败返回 code 与 stderr 头 600 字；输出截断 8MB",
       "status_triad": {
@@ -512,7 +512,7 @@
       "call_type": "cli",
       "trigger_prefix": "/seo",
       "pre_command": null,
-      "entry_point": "tools/seo-toolkit/geo-seo-aeo-skill/scripts/audit.py",
+      "entry_point": "python3 tools/seo-toolkit/geo-seo-aeo-skill/scripts/audit.py",
       "param_schema": {},
       "output_contract": "退出码 0 为成功；失败返回 code 与 stderr 头 600 字；输出截断 8MB",
       "status_triad": {
@@ -569,7 +569,7 @@
       "available": true,
       "last_verified_at": "2026-10-26",
       "source_file": "CAPABILITIES/03-SEO与内容/S-claude-seo.md",
-      "one_liner": "26 个 SEO skill + 19 个 agent + 60 个 py 脚本的技能库（v2.5.0，AgriciDaniel/claude-seo）；所有脚本走 `/data/state/claude-seo/.venv` 托管环境，不污染系统 python。",
+      "one_liner": "26 个 SEO skill + 19 个 agent + 60 个 py 脚本的技能库（v2.5.0，AgriciDaniel/claude-seo）；脚本在 tools/seo-toolkit/claude-seo/，走系统 python3；007 上无 .venv 与数据目录，setup/doctor 步会报缺。",
       "verified_basis": "原文件 实际效果（实测 2026-10-26）",
       "note": "入口为种子内启动器（相对部署根目录，自带 runtime.py 同级）",
       "exact_deepseek_tokens": 658
@@ -988,7 +988,7 @@
       "available": true,
       "last_verified_at": "2026-10-26",
       "source_file": "CAPABILITIES/05-系统与运维/J-jdk25.md",
-      "one_liner": "`/data/tools/jdk25` = Temurin JDK 25.0.5（bin 下 30 个工具），是 Ghidra 12.2 的必需运行时；注意 PATH 里的 `java` 其实是 JDK 17，两套并存。",
+      "one_liner": "`/data/tools/jdk25` = Temurin JDK 25.0.5（bin 下 30 个工具），是 Ghidra 12.2 的必需运行时；PATH 上的 `java` 就是它，007 上只有这一套。",
       "verified_basis": "原文件 实际效果（实测 2026-10-26）",
       "note": "Temurin JDK 25.0.5；Ghidra 必需运行时",
       "exact_deepseek_tokens": 658
@@ -1922,7 +1922,7 @@
       "available": true,
       "last_verified_at": "2026-11-18",
       "source_file": "tools-seed/scripts/chrome-nosandbox",
-      "one_liner": "种子里的 chrome-nosandbox 副本（三号版，3 行 sh）：直调 chromium 加 --no-sandbox 的一次性浏览器入口。",
+      "one_liner": "种子里的 chrome-nosandbox 副本（007 版：自动找 ~/.cache/ms-playwright 下的 chromium，加 --headless=new 与 --timeout=60000 防页面卡住）。",
       "verified_basis": "第 19 步第 4 批种子核验（文件数对上，2026-11-18）",
       "note": "三号版硬编码 /data/cache/ms-playwright（007 上无此路径）；实跑走 /usr/local/bin/chrome-nosandbox",
       "exact_deepseek_tokens": 371
@@ -1945,7 +1945,7 @@
       "available": true,
       "last_verified_at": "2026-11-18",
       "source_file": "tools-seed/scripts/inventory.sh",
-      "one_liner": "环境盘点快照（46 行 bash）：系统、网关路由、/data/bin、/data/tools、关键 CLI 在位一次写进报告。",
+      "one_liner": "环境盘点快照（46 行 bash）：系统与命令在位节有效；网关路由与 /data/bin 节在 007 上为空，别当成工具丢了。",
       "verified_basis": "第 19 步第 4 批种子核验（文件数对上，2026-11-18）",
       "note": "读 /data/bot-gateway.js、/data/tools/*（三号路径），007 上路由/tools 节为空",
       "exact_deepseek_tokens": 344
@@ -1980,7 +1980,7 @@
       "call_type": "service",
       "trigger_prefix": null,
       "pre_command": null,
-      "entry_point": "tools/scripts/link-selftest.cjs",
+      "entry_point": "node tools/scripts/link-selftest.cjs",
       "param_schema": {},
       "output_contract": "退出码 0 为成功；失败返回 code 与 stderr 头 600 字；输出截断 8MB",
       "status_triad": {
@@ -1988,10 +1988,10 @@
         "runnable": true,
         "verified": false
       },
-      "available": true,
+      "available": false,
       "last_verified_at": "2026-11-18",
       "source_file": "tools-seed/scripts/link-selftest.cjs",
-      "one_liner": "link 中继自测（17 行 node）：对三号 link 中继发 6 组探测，输出状态码对照表。",
+      "one_liner": "link 中继自测（17 行 node）：三号专属，007 上不可用，只存档。",
       "verified_basis": "第 19 步第 4 批种子核验（文件数对上，2026-11-18）",
       "note": "三号专属（读 link.env、调中继），007 上无 link 服务，不可用；只存档",
       "exact_deepseek_tokens": 378
