@@ -1,4 +1,4 @@
-super-agent-007
+007-super-agent
 全新超级 Agent 007：合并二号（判断/分诊）与三号（执行）全部能力的单体超级 Agent，采用 Go 单文件原生部署、无沙箱无限制直通执行，测试机为美国洛杉矶 VM124655。
 核心特性
 部署形态：Go 单静态二进制原生部署（super-agent）+ deps.sh 环境脚本 + systemd 守护。

@@ -1,6 +1,6 @@
 # Binaries and build artifacts
 /super-agent
-/super-agent-007
+/007-super-agent
 *.exe
 *.out
 *.test

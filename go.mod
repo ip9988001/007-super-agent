@@ -1,3 +1,3 @@
-module super-agent-007
+module 007-super-agent
 
 go 1.22
