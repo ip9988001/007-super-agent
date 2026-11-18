@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"007-super-agent/internal/executor"
 	"007-super-agent/internal/ledger"
@@ -181,6 +182,26 @@ func TestRunNoOutputCountsAsFailure(t *testing.T) {
 	}
 	if res.Status != "done" || res.CompletedSteps != 0 {
 		t.Fatalf("无输出的成功不应计入完成步数，实为 status=%s steps=%d", res.Status, res.CompletedSteps)
+	}
+}
+
+// 时间预算：到点就停下来，不让开放式任务无限烧下去。
+func TestRunTimeBudgetStops(t *testing.T) {
+	ag := newTestAgent(t, stubSeq([]string{
+		`{"action":"tool","tool_id":"test-echo","inputs":["hello"]}`,
+		`{"action":"tool","tool_id":"test-echo","inputs":["world"]}`,
+		`{"action":"tool","tool_id":"test-echo","inputs":["again"]}`,
+		`{"action":"answer","text":"答完了"}`,
+	}))
+	ag.TimeBudget = time.Nanosecond // 几乎立刻到点
+	res, err := ag.Run(context.Background(), "t8", "一个要跑很久的任务", "", "")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	// 到点后停下：不应跑完所有步骤（CompletedSteps 应小于模型想做的轮数）。
+	// 这里第一轮 echo 成功后第二轮就到点了，所以完成步数至多 1。
+	if res.CompletedSteps > 1 {
+		t.Fatalf("时间预算应让任务早停，完成步数实为 %d", res.CompletedSteps)
 	}
 }
 

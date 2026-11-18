@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"007-super-agent/internal/executor"
 	"007-super-agent/internal/ledger"
@@ -38,18 +39,23 @@ type ModelCallFunc func(taskID, frozen, tail string) (reply string, tokensIn, to
 // 能产出成果的任务想跑多少轮就跑多少轮，只有卡住才停。
 // MaxIter 是最后防线（防模型永不交活的极端死循环），设得很高，
 // 正常任务碰不到它；碰到了说明模型出了问题，停下来上报。
+// DefaultTimeBudget 是单任务时间预算（资源护栏，不是能力上限）：
+// 复杂调研 5-10 分钟够用；900 秒给足余量，到点就停下来综合手头成果，
+// 不让一个开放式任务无限烧下去。正常任务 1-3 分钟就完，碰不到它。
 const MaxConsecutiveFailures = 5
 const DefaultMaxIter = 200
+const DefaultTimeBudget = 900 * time.Second
 
 // Agent 是主循环：一次 Run 跑完一个多步任务。
 type Agent struct {
-	Call      ModelCallFunc // 只用 flash（worker 模型），不用 reasoner
-	Reg       *registry.Registry
-	Led       *ledger.Ledger
-	Ex        *executor.Executor
-	DataDir   string // 产物落盘根目录（artifacts/<taskID>/）
-	SessionID string
-	MaxIter   int // 0 时用 DefaultMaxIter（最后防线，不是能力上限）
+	Call       ModelCallFunc // 只用 flash（worker 模型），不用 reasoner
+	Reg        *registry.Registry
+	Led        *ledger.Ledger
+	Ex         *executor.Executor
+	DataDir    string // 产物落盘根目录（artifacts/<taskID>/）
+	SessionID  string
+	MaxIter    int           // 0 时用 DefaultMaxIter（最后防线，不是能力上限）
+	TimeBudget time.Duration // 0 时用 DefaultTimeBudget（时间护栏）
 }
 
 // Action 是模型每轮的决定：调一个工具，或直接交活。
@@ -268,6 +274,11 @@ func (a *Agent) Run(ctx context.Context, taskID, taskText, memSummary, feedback 
 	if maxIter <= 0 {
 		maxIter = DefaultMaxIter
 	}
+	budget := a.TimeBudget
+	if budget <= 0 {
+		budget = DefaultTimeBudget
+	}
+	start := time.Now()
 	artDir := filepath.Join(a.DataDir, "artifacts", taskID)
 	if err := os.MkdirAll(artDir, 0o755); err != nil {
 		return nil, fmt.Errorf("agent: 建产物目录失败: %w", err)
@@ -277,6 +288,11 @@ func (a *Agent) Run(ctx context.Context, taskID, taskText, memSummary, feedback 
 	history := []stepRecord{}
 	completed := 0
 	for iter := 1; iter <= maxIter; iter++ {
+		// 时间护栏：到预算就停下来综合已有成果，不让开放式任务无限烧下去。
+		if time.Since(start) > budget {
+			log.Printf("agent task=%s 到时间预算 %v，停下来综合", taskID, budget)
+			break
+		}
 		// 卡住判定：连续 5 轮失败/无产出就停下来综合已有成果，不再硬撑。
 		// 能产出成果的任务不受步数限制，想跑多少轮就跑多少轮。
 		if iter > 1 && trailingFailures(history) >= MaxConsecutiveFailures {
