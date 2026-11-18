@@ -136,7 +136,7 @@ func TestTier0PrefixHit(t *testing.T) {
 func TestBuildTriagePrompt(t *testing.T) {
 	rg := loadReg(t)
 	p := BuildTriagePrompt(rg, "帮我查一下今天天气怎么样")
-	for _, want := range []string{"DIRECT|TOOL|META|PLAN", `{"route"`, "帮我查一下今天天气怎么样"} {
+	for _, want := range []string{"DIRECT|TOOL|META|AGENT", `{"route"`, "帮我查一下今天天气怎么样"} {
 		if !strings.Contains(p, want) {
 			t.Errorf("prompt missing %q", want)
 		}
@@ -190,11 +190,13 @@ func TestFrozenListDeterministic(t *testing.T) {
 			lines++
 		}
 	}
-	if lines != 48 { // 84 条总账：5 条 available:false 不进清单，
-		// 31 条知识条目（doc/sop/tool/mcp/data）不可执行、也不进清单；
-		// 清单只剩 39 cli + 9 service = 48 条可执行工具
+	if lines != 47 { // 84 条总账：6 条 available:false 不进清单
+		// （bili/tvly/lean-ctx/llmtrim 4 条 cli + link-selftest 1 条
+		// service + playbooks 1 条 doc）；32 条知识条目
+		// （doc/sop/tool/mcp/data）不可执行、也不进清单；
+		// 清单只剩 39 cli + 8 service = 47 条可执行工具
 		// （清单行含 cap-/ext-/skill- 三种前缀，不能只数 "- cap-"）
-		t.Errorf("frozen tool list lines = %d, want 48", lines)
+		t.Errorf("frozen tool list lines = %d, want 47", lines)
 	}
 	// 冻结前缀 + 尾部分开发送：天气问题走 DIRECT（清单里没有天气工具，
 	// 模型不许编 tool_id；这里用桩模拟模型回 DIRECT，验证链路本身）。
@@ -216,7 +218,7 @@ func TestParseTriageReply(t *testing.T) {
 		{`{"route":"DIRECT","tool_id":"","reason":"常识问答"}`, RouteDirect, ""},
 		{`{"route":"META","tool_id":"","reason":"改自身配置"}`, RouteMeta, ""},
 		{`{"route":"TOOL","tool_id":"cap-code-semgrep","reason":"要审计"}`, RouteTool, "cap-code-semgrep"},
-		{`{"route":"PLAN","tool_id":"","reason":"多步任务走规划器"}`, RoutePlan, ""},
+		{`{"route":"AGENT","tool_id":"","reason":"多步任务走主循环"}`, RouteAgent, ""},
 		{"前面多一句废话\n" + `{"route":"DIRECT","tool_id":"","reason":"x"}` + "\n后面也有一句", RouteDirect, ""},
 	}
 	for _, c := range valid {
@@ -231,7 +233,7 @@ func TestParseTriageReply(t *testing.T) {
 		`{"route":"TOOL","tool_id":"no-such-tool","reason":"x"}`,         // tool_id 不存在
 		`{"route":"TOOL","tool_id":"cap-memory-playbooks","reason":"x"}`, // available:false
 		`{"route":"DIRECT","tool_id":"no-such-tool","reason":"x"}`,       // DIRECT 带不存在的 tool_id
-		`{"route":"PLAN","tool_id":"no-such-tool","reason":"x"}`,         // PLAN 带不存在的 tool_id
+		`{"route":"AGENT","tool_id":"no-such-tool","reason":"x"}`,         // AGENT 带不存在的 tool_id
 		`没有 JSON`,          // 无 JSON
 		`{"route":"TOOL",`, // 残缺 JSON
 	}
@@ -397,5 +399,101 @@ func TestResolveToolProbePasses(t *testing.T) {
 	}
 	if rg.NeedsProbe("cap-design-hyperframes") {
 		t.Fatal("probe passed but NeedsProbe still true")
+	}
+}
+
+// writeMiniRegistry（与 registry 包的同名 helper 相同口径）：
+// 建一个最小总账数据目录，满足 Load 的 1:1 校验。
+// 用来测清单过滤，不依赖 step1 真实总账的条目在测试机上装没装。
+type miniRegEntry struct {
+	id    string
+	ep    string
+	ct    string
+	avail bool
+}
+
+func writeMiniRegistry(t *testing.T, ents []miniRegEntry) string {
+	t.Helper()
+	dst := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dst, "registry"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dst, "index", "L3"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	type mini struct {
+		ToolID         string `json:"tool_id"`
+		Category       string `json:"category"`
+		Subcategory    string `json:"subcategory"`
+		CallType       string `json:"call_type"`
+		EntryPoint     string `json:"entry_point"`
+		OutputContract string `json:"output_contract"`
+		SourceFile     string `json:"source_file"`
+		OneLiner       string `json:"one_liner"`
+		Available      bool   `json:"available"`
+	}
+	ms := make([]mini, 0, len(ents))
+	for _, e := range ents {
+		ms = append(ms, mini{
+			ToolID: e.id, Category: "ops", Subcategory: "test",
+			CallType: e.ct, EntryPoint: e.ep,
+			OutputContract: "text", SourceFile: "test.md",
+			OneLiner: "test tool " + e.id, Available: e.avail,
+		})
+		if err := os.WriteFile(filepath.Join(dst, "index", "L3", e.id+".md"), []byte("# "+e.id+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	raw, err := json.Marshal(map[string]any{
+		"version": "test", "total": len(ms), "entries": ms,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dst, "registry", "registry.json"), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return dst
+}
+
+// 选项2：探针失败过的条目不进规划器清单；没探过的照常列。
+func TestCompactToolListExcludesProbeFailed(t *testing.T) {
+	dir := writeMiniRegistry(t, []miniRegEntry{
+		{id: "cap-test-good", ep: "echo", ct: "cli", avail: true},
+		{id: "cap-test-bad", ep: "no-such-cmd-xyz-123", ct: "cli", avail: true},
+		{id: "cap-test-unprobed", ep: "echo", ct: "cli", avail: true},
+	})
+	rg, err := registry.Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	// 探之前：三条都在。
+	list := CompactToolList(rg, nil)
+	for _, id := range []string{"cap-test-good", "cap-test-bad", "cap-test-unprobed"} {
+		if !strings.Contains(list, id) {
+			t.Fatalf("list before probe missing %q:\n%s", id, list)
+		}
+	}
+	// 探坏一条：清单里不再有它，没探过的还在。
+	if err := rg.Probe("cap-test-bad"); err == nil {
+		t.Fatal("Probe(bad): want error, got nil")
+	}
+	list = CompactToolList(rg, nil)
+	if strings.Contains(list, "cap-test-bad") {
+		t.Fatalf("list after probe still contains failed entry:\n%s", list)
+	}
+	for _, id := range []string{"cap-test-good", "cap-test-unprobed"} {
+		if !strings.Contains(list, id) {
+			t.Fatalf("list after probe missing %q:\n%s", id, list)
+		}
+	}
+	// 候选集路径同样过滤；候选全坏时回落到全量过滤后清单（不含坏条）。
+	list = CompactToolList(rg, []string{"cap-test-bad", "cap-test-good"})
+	if strings.Contains(list, "cap-test-bad") || !strings.Contains(list, "cap-test-good") {
+		t.Fatalf("candidate list wrong:\n%s", list)
+	}
+	list = CompactToolList(rg, []string{"cap-test-bad"})
+	if strings.Contains(list, "cap-test-bad") || !strings.Contains(list, "cap-test-good") {
+		t.Fatalf("candidate fallback wrong:\n%s", list)
 	}
 }

@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"007-super-agent/internal/advisor"
+	"007-super-agent/internal/agent"
 	"007-super-agent/internal/backup"
 	"007-super-agent/internal/config"
 	"007-super-agent/internal/executor"
@@ -33,7 +34,6 @@ import (
 	"007-super-agent/internal/ledger"
 	"007-super-agent/internal/llm"
 	"007-super-agent/internal/memory"
-	"007-super-agent/internal/planner"
 	"007-super-agent/internal/registry"
 	"007-super-agent/internal/selfevolve"
 	"007-super-agent/internal/triage"
@@ -62,7 +62,7 @@ type daemon struct {
 	mem       *memory.Store
 	ex        *executor.Executor
 	wd        *watchdog.Watchdog
-	pl        *planner.Planner     // 第 21 步：多步骤规划器；nil 表示未接线（无模型调用）
+	ag        *agent.Agent         // 主循环（对齐二号 Step 1+Step 4）；nil 表示未接线（无模型调用）
 	modelCall triage.ModelCallFunc // Tier-1 模型调用（llm 客户端）；nil 时 Tier-1 报错
 	session   string
 	shadow    bool
@@ -96,10 +96,10 @@ func (d *daemon) handleInner(env gateway.Envelope) (route, toolID, status string
 		log.Printf("triage task=%s: %v", env.TaskID, err)
 		return "ERROR", "", "triage_error"
 	}
-	// 第 21 步：PLAN 去向走规划器（拆步 → 核验 → 按步执行），
+	// AGENT 去向走主循环（对齐二号：主模型逐轮调工具，看到结果再决定下一步），
 	// 不再只挑一个工具；单步路径行为不变。
-	if dec.Route == triage.RoutePlan {
-		return string(dec.Route), "", d.runPlan(env)
+	if dec.Route == triage.RouteAgent {
+		return string(dec.Route), "", d.runAgent(env)
 	}
 	if dec.Route != triage.RouteTool {
 		log.Printf("task=%s route=%s tier=%d (no tool to run)", env.TaskID, dec.Route, dec.Tier)
@@ -199,43 +199,37 @@ func (d *daemon) memorySummary(text string) string {
 	return b.String()
 }
 
-// runPlan 是 PLAN 去向的真执行：规划 → 核验 → 按步跑 → 综合 → 交活前审。
-// 影子模式只出规划+核验结论：记一行 shadow 回执，不执行、不综合。
+// runAgent 是 AGENT 去向的真执行：主循环逐轮调工具、看到结果再决定下一步，
+// 最后交活前审。影子模式只做一次决定、记一行 shadow 回执，不执行。
 // 返回执行结果状态（供 handle 记 L1）。
-func (d *daemon) runPlan(env gateway.Envelope) string {
-	if d.pl == nil {
-		log.Printf("task=%s PLAN but planner not wired (no llm client)", env.TaskID)
-		return "planner_unavailable"
+func (d *daemon) runAgent(env gateway.Envelope) string {
+	if d.ag == nil {
+		log.Printf("task=%s AGENT but agent not wired (no llm client)", env.TaskID)
+		return "agent_unavailable"
 	}
 	memSummary := d.memorySummary(env.Text)
-	plan, ver, err := d.pl.PlanAndVerify(env.TaskID, env.Text, memSummary)
-	if err != nil {
-		log.Printf("task=%s plan failed: %v", env.TaskID, err)
-		return "plan_error"
-	}
-	log.Printf("task=%s plan=%s steps=%d verdict=%s rounds=%d", env.TaskID, plan.PlanID, len(plan.Steps), ver.Verdict, plan.Rounds)
 	if d.shadow {
 		if _, rerr := d.led.RecordExecution(ledger.ExecutionRecord{
-			SessionID: d.session, TaskID: env.TaskID, ToolID: "planner",
-			Command:  fmt.Sprintf("shadow plan %s (%d steps, verdict=%s)", plan.PlanID, len(plan.Steps), ver.Verdict),
+			SessionID: d.session, TaskID: env.TaskID, ToolID: "agent",
+			Command:  "shadow agent loop (no execution)",
 			ExitCode: 0, Status: "shadow", AdvisorVerdict: string(executor.VerdictNote),
-			AdvisorNote: "影子模式：只出规划+核验结论，不执行",
+			AdvisorNote: "影子模式：只做决定、不执行",
 		}); rerr != nil {
-			log.Printf("shadow plan record task=%s: %v", env.TaskID, rerr)
+			log.Printf("shadow agent record task=%s: %v", env.TaskID, rerr)
 		}
-		return "shadow_plan"
+		return "shadow_agent"
 	}
-	res, err := d.pl.RunPlan(plan, env.Text, memSummary)
+	res, err := d.ag.Run(context.Background(), env.TaskID, env.Text, memSummary)
 	if err != nil {
-		log.Printf("task=%s run plan %s: %v", env.TaskID, plan.PlanID, err)
-		return "plan_run_error"
+		log.Printf("task=%s agent run: %v", env.TaskID, err)
+		return "agent_error"
 	}
-	// 交活前审（触发点 ①）：Draft 为综合回复。HALT 时不交付，原因已记账。
+	// 交活前审（触发点 ①）：Draft 为最终回复。HALT 时不交付，原因已记账。
 	if d.ex.Advisor != nil {
 		rres, rerr := d.ex.ReviewDelivery(executor.Task{
-			TaskID: env.TaskID, SessionID: d.session, ToolID: "planner",
-			Text: env.Text, Command: "plan " + plan.PlanID, Draft: res.ReplyDraft,
-			WorkDir: d.pl.WorkDir(env.TaskID),
+			TaskID: env.TaskID, SessionID: d.session, ToolID: "agent",
+			Text: env.Text, Command: "agent " + env.TaskID, Draft: res.ReplyDraft,
+			WorkDir: d.ag.WorkDir(env.TaskID),
 		})
 		if rerr != nil && !errors.Is(rerr, executor.ErrAdvisorHalt) && !errors.Is(rerr, executor.ErrAdvisorHaltFinal) {
 			log.Printf("task=%s delivery review: %v", env.TaskID, rerr)
@@ -244,7 +238,7 @@ func (d *daemon) runPlan(env gateway.Envelope) string {
 			return "delivery_halt"
 		}
 	}
-	log.Printf("task=%s plan=%s status=%s steps=%d/%d skipped=%v", env.TaskID, plan.PlanID, res.Status, res.CompletedSteps, len(plan.Steps), res.SkippedSteps)
+	log.Printf("task=%s agent status=%s steps=%d", env.TaskID, res.Status, res.CompletedSteps)
 	return res.Status
 }
 
@@ -316,6 +310,12 @@ func main() {
 	} else {
 		log.Printf("watchdog check: %d checked, %d ok, %d broken, %d skipped", res.Checked, res.OK, len(res.Broken), res.Skipped)
 	}
+	// 启动探针：对主总账的全部可用可执行条目跑一遍存在性探针，
+	// 结果记进本进程覆盖层——失败的条目直接不进主循环清单，
+	// 模型没机会挑一个本机不存在的工具（陌生机器拉取部署时，
+	// 缺种子的 11 条入口会在这里被剔掉，而不是等模型挑中了才失败）。
+	checked, ok, failed := reg.ProbeAll()
+	log.Printf("registry probe: %d checked, %d ok, %d failed (failed excluded from agent list)", checked, ok, failed)
 	if sv, err := wd.DailySavings(); err != nil {
 		log.Printf("watchdog savings: %v", err)
 	} else {
@@ -353,16 +353,11 @@ func main() {
 			adv.Ledger = led // 第 13 步：监工调用的费用进 expense_ledger
 			log.Printf("advisor ready: model=%s (key found, value never logged)", cfg.AdvisorModel)
 		}
-		// 规划器接线（第 21 步）：规划走 worker 模型（flash），核验走
-		// reasoner 模型（cfg.AdvisorModel，与监工同模型、共用同一把 key，
-		// 不另配密钥）。核验温度 0.1，要确定性 JSON；影子模式也接线，
-		// 只出规划+核验结论，不执行。
-		vc := llm.New(cfg.AdvisorModel, apiKey)
-		vc.Ledger = led
-		vc.SessionID = d.session
-		vc.Temperature = 0.1
-		d.pl = planner.New(lc.CallTask, vc.CallTask, reg, led, ex, dataDir, d.session, shadow)
-		log.Printf("planner ready: worker=%s verifier=%s shadow=%v", cfg.WorkerModel, cfg.AdvisorModel, shadow)
+		// 主循环接线（对齐二号 Step 1+Step 4）：只用 worker 模型（flash）逐轮
+		// 决定调哪个工具，不再另配核验模型（reasoner 已摘）；影子模式也接线，
+		// 只做决定、不执行。
+		d.ag = agent.New(lc.CallTask, reg, led, ex, dataDir, d.session)
+		log.Printf("agent ready: worker=%s shadow=%v", cfg.WorkerModel, shadow)
 	}
 	gw := gateway.New(cfg, led, d.handle)
 	gw.SetSession(d.session)
