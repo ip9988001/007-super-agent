@@ -25,7 +25,7 @@ func miniRegistry(t *testing.T) *registry.Registry {
 		{"cap-ops-echo", "echo", "exit 0"},
 	}
 	var ents strings.Builder
-	ents.WriteString(`{"version":"v1.1-test","generated":"2026-11-18","total":4,"entries":[`)
+	ents.WriteString(`{"version":"v1.1-test","generated":"2026-11-18","total":4,"categories":[{"id":"fetch","name":"Fetch","description":"Fetch tools for tests."},{"id":"code","name":"Code","description":"Code tools for tests."},{"id":"seo","name":"SEO","description":"SEO tools for tests."},{"id":"design","name":"Design","description":"Design tools for tests."},{"id":"security","name":"Security","description":"Security tools for tests."},{"id":"runtime","name":"Runtime","description":"Runtime tools for tests."},{"id":"media","name":"Media","description":"Media tools for tests."},{"id":"ops","name":"Operations","description":"Operations tools for tests. Use this category for shell commands and test tools."},{"id":"memory","name":"Memory","description":"Memory tools for tests."}],"subcategories":[{"category":"ops","id":"shell","description":"Shell commands and test tools. Use echo and true/false here."}],"entries":[`)
 	for i, e := range entries {
 		if i > 0 {
 			ents.WriteString(",")
@@ -271,5 +271,55 @@ func TestRunMaxIterationsSynthesizesReport(t *testing.T) {
 	}
 	if b, err := os.ReadFile(filepath.Join(ag.DataDir, "artifacts", "t5", "reply.md")); err != nil || !strings.Contains(string(b), "综合报告") {
 		t.Fatalf("artifacts/t5/reply.md 应含综合报告：%v %q", err, string(b))
+	}
+}
+
+// 三层懒加载：expand 导航后调工具再交活；expand 本身不算干活，
+// 但记为成功步骤（导航是进展，不触发卡住判定）。
+func TestRunExpandThenToolThenAnswer(t *testing.T) {
+	ag := newTestAgent(t, stubSeq([]string{
+		`{"action":"expand","category":"ops"}`,
+		`{"action":"expand","category":"ops","subcategory":"shell"}`,
+		`{"action":"tool","tool_id":"test-echo","inputs":["hello"]}`,
+		`{"action":"answer","text":"echo 回来了"}`,
+	}))
+	res, err := ag.Run(context.Background(), "t9", "跑个 echo", "", "")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Status != "done" || res.CompletedSteps != 1 {
+		t.Fatalf("Status=%s CompletedSteps=%d, want done/1", res.Status, res.CompletedSteps)
+	}
+	if res.ReplyDraft != "echo 回来了" {
+		t.Fatalf("ReplyDraft=%q", res.ReplyDraft)
+	}
+}
+
+// expand 未知大类记为 expand_error，模型换招后仍能继续。
+func TestRunExpandUnknownCategoryRecovers(t *testing.T) {
+	ag := newTestAgent(t, stubSeq([]string{
+		`{"action":"expand","category":"nope"}`,
+		`{"action":"tool","tool_id":"test-echo","inputs":["hi"]}`,
+		`{"action":"answer","text":"好了"}`,
+	}))
+	res, err := ag.Run(context.Background(), "t10", "跑个 echo", "", "")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Status != "done" {
+		t.Fatalf("Status=%s, want done", res.Status)
+	}
+}
+
+// parseAction 接受 expand，缺 category 报错。
+func TestParseActionExpand(t *testing.T) {
+	if a, err := parseAction(`{"action":"expand","category":"ops"}`); err != nil || a.Category != "ops" {
+		t.Fatalf("expand 解析失败: %v %+v", err, a)
+	}
+	if a, err := parseAction(`{"action":"expand","category":"ops","subcategory":"shell"}`); err != nil || a.Subcategory != "shell" {
+		t.Fatalf("expand 子类解析失败: %v %+v", err, a)
+	}
+	if _, err := parseAction(`{"action":"expand"}`); err == nil {
+		t.Fatal("expand 缺 category 应报错")
 	}
 }

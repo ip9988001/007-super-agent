@@ -2,6 +2,7 @@ package registry
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -75,10 +76,10 @@ func TestLoad84Entries(t *testing.T) {
 	if got := rg.Count(); got != 84 {
 		t.Fatalf("Count = %d, want 84", got)
 	}
-	if got := len(Categories()); got != 6 {
-		t.Fatalf("Categories = %d, want 6", got)
+	if got := len(Categories()); got != 9 {
+		t.Fatalf("Categories = %d, want 9", got)
 	}
-	want := map[string]int{"fetch": 13, "code": 8, "seo": 7, "design": 8, "ops": 34, "memory": 14}
+	want := map[string]int{"fetch": 13, "code": 8, "seo": 7, "design": 8, "security": 5, "runtime": 7, "media": 6, "ops": 16, "memory": 14}
 	for cat, n := range want {
 		if got := len(rg.EntriesByCategory(cat)); got != n {
 			t.Errorf("category %s = %d entries, want %d", cat, got, n)
@@ -86,8 +87,8 @@ func TestLoad84Entries(t *testing.T) {
 	}
 }
 
-// 2. L1 返回 6 类。
-func TestL1SixCategories(t *testing.T) {
+// 2. L1 返回 9 类（v1.7：ops 拆成 security/runtime/media/ops）。
+func TestL1NineCategories(t *testing.T) {
 	rg, err := Load(fixture(t))
 	if err != nil {
 		t.Fatal(err)
@@ -96,7 +97,7 @@ func TestL1SixCategories(t *testing.T) {
 	if err != nil {
 		t.Fatalf("L1: %v", err)
 	}
-	for _, cat := range []string{"取数与抓取", "代码与审计", "SEO与内容", "设计与UI", "系统与运维", "记忆与知识"} {
+	for _, cat := range []string{"Fetch & Retrieval", "Code & Audit", "SEO & Content", "Design & UI", "Security Scanning", "Language Runtimes", "Documents & Media", "Operations", "Memory & Knowledge"} {
 		if !strings.Contains(l1, cat) {
 			t.Errorf("L1 missing category %q", cat)
 		}
@@ -106,7 +107,7 @@ func TestL1SixCategories(t *testing.T) {
 	}
 }
 
-// 3. L2 读一份（seo 单份 10 行）；ops 拆成两份，见 TestL2SplitOps。
+// 3. L2 读一份（seo 单份 10 行）；ops 在 v1.7 只剩 16 条，单份，见 TestL2OpsSingleFile。
 func TestL2OneCategory(t *testing.T) {
 	rg, err := Load(fixture(t))
 	if err != nil {
@@ -364,6 +365,14 @@ func TestProbeEntryByCallType(t *testing.T) {
 	if err := ProbeEntry(Entry{CallType: "service", EntryPoint: filepath.Join(tmp, "nope.sh")}); err == nil {
 		t.Fatal("ProbeEntry(service, missing file) should fail")
 	}
+	// service：文件在但不可执行也要失败（执行器直接 exec，没 +x 跑不起来）。
+	noexec := filepath.Join(tmp, "noexec.sh")
+	if err := os.WriteFile(noexec, []byte("#!/bin/sh\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := ProbeEntry(Entry{CallType: "service", EntryPoint: noexec}); err == nil {
+		t.Fatal("ProbeEntry(service, non-executable file) should fail")
+	}
 	// service 的 entry_point 是命令名也不查 PATH：只当文件查。
 	if err := ProbeEntry(Entry{CallType: "service", EntryPoint: "echo"}); err == nil {
 		t.Fatal("ProbeEntry(service, bare command) should fail (file lookup only)")
@@ -377,10 +386,10 @@ func TestProbeEntryByCallType(t *testing.T) {
 	}
 }
 
-// TestL2SplitOps 是第 19 步第 5 批的 L2 拆分：ops 类 34 条拆成
-// ops.md（25 行）+ ops-2.md（15 行），L2("ops") 拼后两份都有，
-// 且每份都不超 25 行上限；其余类仍是单份。
-func TestL2SplitOps(t *testing.T) {
+// TestL2OpsSingleFile 是 v1.7 重新分类后的 ops：34 条拆走 18 条
+//（security 5、runtime 7、media 6）后剩 16 条，一份 ops.md 放得下
+//（3 行头 + 16 条 = 19 行），不再拆 ops-2.md；新三类各有单份 L2。
+func TestL2OpsSingleFile(t *testing.T) {
 	rg, err := Load(fixture(t))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -389,13 +398,29 @@ func TestL2SplitOps(t *testing.T) {
 	if err != nil {
 		t.Fatalf("L2(ops): %v", err)
 	}
-	for _, want := range []string{"cap-ops-ffmpeg", "cap-ops-tesseract", "cap-ops-script-totp", "cap-ops-script-chrome-nosandbox"} {
+	for _, want := range []string{"cap-ops-docker-init", "cap-ops-gh-token", "cap-ops-script-totp", "cap-ops-script-chrome-nosandbox"} {
 		if !strings.Contains(l2, want) {
 			t.Fatalf("L2(ops) missing %q", want)
 		}
 	}
-	if n := countLines(l2); n != 40 {
-		t.Fatalf("L2(ops) lines = %d, want 40 (25+15)", n)
+	// 拆走的工具不再属于 ops。
+	for _, gone := range []string{"cap-ops-ffmpeg", "cap-ops-tesseract", "cap-ops-bandit", "cap-ops-python"} {
+		if strings.Contains(l2, gone) {
+			t.Fatalf("L2(ops) should not contain moved tool %q", gone)
+		}
+	}
+	if n := countLines(l2); n != 19 {
+		t.Fatalf("L2(ops) lines = %d, want 19 (3+16)", n)
+	}
+	// 新三类各有单份 L2，且包含各自的工具。
+	for cat, tool := range map[string]string{"security": "cap-ops-bandit", "runtime": "cap-ops-python", "media": "cap-ops-ffmpeg"} {
+		l2cat, err := rg.L2(cat)
+		if err != nil {
+			t.Fatalf("L2(%s): %v", cat, err)
+		}
+		if !strings.Contains(l2cat, tool) {
+			t.Fatalf("L2(%s) missing %q", cat, tool)
+		}
 	}
 	l2seo, err := rg.L2("seo")
 	if err != nil {
@@ -482,5 +507,117 @@ func TestUnmarkVerified(t *testing.T) {
 	rg.UnmarkVerified(tool)
 	if !rg.NeedsProbe(tool) {
 		t.Fatal("NeedsProbe after UnmarkVerified = false, want true")
+	}
+}
+
+// writeMiniRegistry 建一个最小总账数据目录：entries 只给 tool_id /
+// entry_point / call_type / available，其余必填字段填占位值；
+// 并给每条建一个空 L3 文件，满足 Load 的 1:1 校验。
+// 用来测探针记录（Probe/ProbeFailed/ProbeAll），不依赖 step1 的
+// 真实总账——真实总账的条目在测试机上有没有装好是不确定的。
+type miniEntry struct {
+	id    string
+	ep    string
+	ct    string
+	avail bool
+}
+
+func writeMiniRegistry(t *testing.T, ents []miniEntry) string {
+	t.Helper()
+	dst := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dst, "registry"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dst, "index", "L3"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	type mini struct {
+		ToolID         string `json:"tool_id"`
+		Category       string `json:"category"`
+		Subcategory    string `json:"subcategory"`
+		CallType       string `json:"call_type"`
+		EntryPoint     string `json:"entry_point"`
+		OutputContract string `json:"output_contract"`
+		SourceFile     string `json:"source_file"`
+		OneLiner       string `json:"one_liner"`
+		Available      bool   `json:"available"`
+	}
+	ms := make([]mini, 0, len(ents))
+	for _, e := range ents {
+		ms = append(ms, mini{
+			ToolID: e.id, Category: "ops", Subcategory: "test",
+			CallType: e.ct, EntryPoint: e.ep,
+			OutputContract: "text", SourceFile: "test.md",
+			OneLiner: "test tool " + e.id, Available: e.avail,
+		})
+		if err := os.WriteFile(filepath.Join(dst, "index", "L3", e.id+".md"), []byte("# "+e.id+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	raw, err := json.Marshal(map[string]any{
+		"version": "test", "total": len(ms), "entries": ms,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dst, "registry", "registry.json"), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return dst
+}
+
+// 选项2：Probe 失败要记下来（probeFailed），通过要清掉；
+// ProbeAll 只检可用可执行条目，返回已检/通过/失败数。
+func TestProbeRecordsFailureAndProbeAll(t *testing.T) {
+	dir := writeMiniRegistry(t, []miniEntry{
+		{id: "cap-test-good", ep: "echo", ct: "cli", avail: true},
+		{id: "cap-test-bad", ep: "no-such-cmd-xyz-123", ct: "cli", avail: true},
+		{id: "cap-test-off", ep: "echo", ct: "cli", avail: false},
+	})
+	rg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	// 不存在的工具：探针不记失败，只报找不到。
+	if err := rg.Probe("cap-test-nope"); err == nil {
+		t.Fatal("Probe(missing tool): want error, got nil")
+	}
+	if rg.ProbeFailed("cap-test-nope") {
+		t.Fatal("ProbeFailed(missing tool) = true, want false")
+	}
+	// 好的：通过，不记失败。
+	if err := rg.Probe("cap-test-good"); err != nil {
+		t.Fatalf("Probe(good): %v", err)
+	}
+	if rg.ProbeFailed("cap-test-good") {
+		t.Fatal("ProbeFailed(good) = true, want false")
+	}
+	if rg.NeedsProbe("cap-test-good") {
+		t.Fatal("NeedsProbe(good) after Probe = true, want false")
+	}
+	// 坏的：失败，记下来。
+	if err := rg.Probe("cap-test-bad"); err == nil {
+		t.Fatal("Probe(bad): want error, got nil")
+	}
+	if !rg.ProbeFailed("cap-test-bad") {
+		t.Fatal("ProbeFailed(bad) = false, want true")
+	}
+	if rg.ProbeFailureReason("cap-test-bad") == "" {
+		t.Fatal("ProbeFailureReason(bad) empty, want a reason")
+	}
+	// ProbeAll：只检可用可执行（good、bad），off 不进。
+	checked, ok, failed := rg.ProbeAll()
+	if checked != 2 || ok != 1 || failed != 1 {
+		t.Fatalf("ProbeAll = %d/%d/%d, want 2/1/1", checked, ok, failed)
+	}
+	// 入口修好后重探通过，失败记录清掉。
+	if err := rg.ApplyEntryPointFix("cap-test-bad", "echo"); err != nil {
+		t.Fatalf("ApplyEntryPointFix(bad -> echo): %v", err)
+	}
+	if err := rg.Probe("cap-test-bad"); err != nil {
+		t.Fatalf("Probe(bad after fix): %v", err)
+	}
+	if rg.ProbeFailed("cap-test-bad") {
+		t.Fatal("ProbeFailed(bad after fix) = true, want false")
 	}
 }

@@ -195,7 +195,7 @@ func CompactToolList(reg *registry.Registry, candidates []string) string {
 			if !ok || !e.Available || !e.Executable() || reg.ProbeFailed(id) {
 				continue
 			}
-			fmt.Fprintf(&b, "- %s: %s\n", e.ToolID, truncateRunes(e.OneLiner, 80))
+			fmt.Fprintf(&b, "- %s: %s\n", e.ToolID, truncateRunes(e.OneLiner, 200))
 			listed++
 		}
 		if listed > 0 {
@@ -208,7 +208,7 @@ func CompactToolList(reg *registry.Registry, candidates []string) string {
 			if !e.Available || !e.Executable() || reg.ProbeFailed(e.ToolID) {
 				continue
 			}
-			fmt.Fprintf(&b, "- %s: %s\n", e.ToolID, truncateRunes(e.OneLiner, 80))
+			fmt.Fprintf(&b, "- %s: %s\n", e.ToolID, truncateRunes(e.OneLiner, 200))
 		}
 	}
 	return b.String()

@@ -41,11 +41,14 @@ var (
 )
 
 // categoryOrder 是第 1 步定死的 6 类（与 index/L2/ 下 6 份文件一一对应）。
-var categoryOrder = []string{"fetch", "code", "seo", "design", "ops", "memory"}
+// 2026-11-18 重新分类 v1.7：ops 拆成 security/runtime/media/ops，
+// 大类从 6 个变 9 个；L2 下新增 security.md、runtime.md、media.md。
+var categoryOrder = []string{"fetch", "code", "seo", "design", "security", "runtime", "media", "ops", "memory"}
 
 var validCategory = map[string]bool{
 	"fetch": true, "code": true, "seo": true,
-	"design": true, "ops": true, "memory": true,
+	"design": true, "security": true, "runtime": true,
+	"media": true, "ops": true, "memory": true,
 }
 
 // StatusTriad 是条目状态三联：装了没有 / 跑得起来没有 / 实测验证过没有。
@@ -76,10 +79,29 @@ type Entry struct {
 }
 
 type registryFile struct {
-	Version   string  `json:"version"`
-	Generated string  `json:"generated"`
-	Total     int     `json:"total"`
-	Entries   []Entry `json:"entries"`
+	Version       string           `json:"version"`
+	Generated     string           `json:"generated"`
+	Total         int              `json:"total"`
+	Entries       []Entry          `json:"entries"`
+	Categories    []CategoryMeta   `json:"categories"`
+	Subcategories []SubcategoryMeta `json:"subcategories"`
+}
+
+// CategoryMeta 是一级大类的元数据（v1.7 重新分类新增）：
+// id 是 slug，name 是展示名，description 是 200-400 词的英文说明，
+// 懒加载第一级只显示其首句摘要，展开后才显示全文。
+type CategoryMeta struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+}
+
+// SubcategoryMeta 是二级子类的元数据（v1.7 新增）：
+// category 是所属大类，id 是子类 slug，description 是 100-200 词的英文说明。
+type SubcategoryMeta struct {
+	Category    string `json:"category"`
+	ID          string `json:"id"`
+	Description string `json:"description"`
 }
 
 // Option 是 Load 的可选配置。
@@ -98,9 +120,10 @@ func WithSession(sessionID, taskID string) Option {
 
 // Registry 是加载后的总账 + 三级索引服务。读操作无锁；
 // 加载后内容不可变，调用方只读。唯一的例外是探针标记：
-// verifiedOverride 只记“本进程内已探针通过”的工具（不写回 registry.json，
-// registry.json 是第 1 步的真相源，运行时绝不重写），由 mu 保护。
-// 第 20 步：entryPointOverride 是同一口径的第二层覆盖——
+// verifiedOverride 只记“本进程内已探针通过”的工具，probeFailed 只记
+// “本进程内已探针失败”的工具（tool_id → 失败原因），都不写回
+// registry.json，registry.json 是第 1 步的真相源，运行时绝不重写，
+// 由 mu 保护。第 20 步：entryPointOverride 是同一口径的第二层覆盖——
 // 自进化自动应用的 entry_point 修正只活在内存里，重启即失效，
 // 永久修正仍须由人写进 registry.json；存入前必须先过探针。
 type Registry struct {
@@ -108,12 +131,15 @@ type Registry struct {
 	entries   []Entry
 	byID      map[string]*Entry
 	byCat     map[string][]*Entry
+	catMeta   []CategoryMeta
+	subMeta   []SubcategoryMeta
 	metrics   MetricsRecorder
 	sessionID string
 	taskID    string
 
 	mu                 sync.RWMutex
 	verifiedOverride   map[string]bool
+	probeFailed        map[string]string
 	entryPointOverride map[string]string
 }
 
@@ -138,6 +164,8 @@ func Load(dataDir string, opts ...Option) (*Registry, error) {
 			ErrInvalidRegistry, f.Total, len(f.Entries))
 	}
 	rg.entries = f.Entries
+	rg.catMeta = f.Categories
+	rg.subMeta = f.Subcategories
 	rg.byID = make(map[string]*Entry, len(f.Entries))
 	rg.byCat = make(map[string][]*Entry)
 	for i := range rg.entries {
@@ -334,7 +362,9 @@ func (rg *Registry) EntryPointOverrides() map[string]string {
 // Probe 对一条工具跑预检探针（只做存在性检查，不真跑命令）：
 // 按 call_type 分流（第 19 步第 5 批）：cli 查命令/路径、service 查
 // 脚本文件、doc/sop/tool/mcp/data 不探针（只记知识，不可执行）。
-// 通过则标记本进程内已验证并返回 nil；失败返回原因，不标记。
+// 通过则标记本进程内已验证并返回 nil；失败返回原因，并记一条
+// probeFailed（调用方据此把该条从规划器清单里拿掉，模型没机会
+// 再挑一个不存在的工具）；下一次探针通过会清掉这条失败记录。
 // 与 watchdog.DefaultProbe 同一口径，探针逻辑的唯一实现放在这里，
 // watchdog.DefaultProbe 只是委托（防两处口径漂移）。
 func (rg *Registry) Probe(toolID string) error {
@@ -348,17 +378,66 @@ func (rg *Registry) Probe(toolID string) error {
 	probeCopy := *e
 	probeCopy.EntryPoint = ep
 	if err := ProbeEntry(probeCopy); err != nil {
+		rg.mu.Lock()
+		if rg.probeFailed == nil {
+			rg.probeFailed = map[string]string{}
+		}
+		rg.probeFailed[toolID] = err.Error()
+		delete(rg.verifiedOverride, toolID)
+		rg.mu.Unlock()
 		return err
 	}
+	rg.mu.Lock()
+	delete(rg.probeFailed, toolID)
+	rg.mu.Unlock()
 	rg.MarkVerified(toolID)
 	return nil
+}
+
+// ProbeFailed 判断一条工具是否在本进程内已有探针失败记录。
+// 没探过的不算失败——探针没跑 ≠ 坏，清单里照常列它；只有探过且
+// 失败的才从规划器清单里拿掉。
+func (rg *Registry) ProbeFailed(toolID string) bool {
+	rg.mu.RLock()
+	defer rg.mu.RUnlock()
+	_, ok := rg.probeFailed[toolID]
+	return ok
+}
+
+// ProbeFailureReason 取一条工具的探针失败原因（没失败返回空串）。
+func (rg *Registry) ProbeFailureReason(toolID string) string {
+	rg.mu.RLock()
+	defer rg.mu.RUnlock()
+	return rg.probeFailed[toolID]
+}
+
+// ProbeAll 对全部可用可执行条目跑一遍探针（只做存在性检查，不真跑
+// 命令），结果记进本进程覆盖层：通过的标已验证，失败的记 probeFailed。
+// 启动时调一次，让规划器清单一开始就是干净的；重建时也可复用。
+// 返回（已检数，通过数，失败数）。
+func (rg *Registry) ProbeAll() (checked, ok, failed int) {
+	for _, cat := range categoryOrder {
+		for _, e := range rg.byCat[cat] {
+			if !e.Available || !e.Executable() {
+				continue
+			}
+			checked++
+			if err := rg.Probe(e.ToolID); err != nil {
+				failed++
+			} else {
+				ok++
+			}
+		}
+	}
+	return checked, ok, failed
 }
 
 // ProbeEntry 对一条总账条目做存在性探针（不真跑命令），按 call_type 分流：
 //   - cli：entry_point 首词是命令（PATH 里找）或路径（文件在位）；
 //     "python3 -c ..." 形式跑一次只读 import 检查（Python API 类工具，
 //     如 camoufox，没有 CLI，LookPath 只能验到 python3 本身）。
-//   - service：entry_point 就是脚本路径（相对部署根目录），只查文件在位。
+//   - service：entry_point 就是脚本路径（相对部署根目录），查文件在位
+//     且可执行（缺 +x 也失败——执行器直接 exec，没 +x 跑不起来）。
 //   - doc/sop/tool/mcp/data：知识条目，不探针（只记知识，不可执行）。
 //
 // 未知 call_type 按 cli 处理。空 entry_point 一律失败。
@@ -374,8 +453,15 @@ func ProbeEntry(e Entry) error {
 		return nil
 	case "service":
 		first := strings.Fields(ep)[0]
-		if _, err := os.Stat(first); err != nil {
+		info, err := os.Stat(first)
+		if err != nil {
 			return fmt.Errorf("registry probe: 脚本 %q 不存在: %v", first, err)
+		}
+		// 服务条目是直接跑的脚本：文件必须可执行，否则执行器 exec 会报
+		// 权限错误。2026-11-18 核查：totp.js/link-selftest.cjs 只查在位
+		// 就放过，实际跑不起来——在位不够，还得能跑。
+		if info.Mode()&0111 == 0 {
+			return fmt.Errorf("registry probe: 脚本 %q 不可执行（缺 +x）", first)
 		}
 		return nil
 	default: // cli 与未知类型
@@ -512,4 +598,61 @@ func Categories() []string {
 	out := make([]string, len(categoryOrder))
 	copy(out, categoryOrder)
 	return out
+}
+
+// CategoryMetas 返回一级大类元数据（按 categoryOrder 顺序）。
+// 注册表里没有 categories 字段时（旧版），返回只有 id 的空描述条目。
+func (rg *Registry) CategoryMetas() []CategoryMeta {
+	if len(rg.catMeta) > 0 {
+		return rg.catMeta
+	}
+	out := make([]CategoryMeta, 0, len(categoryOrder))
+	for _, id := range categoryOrder {
+		out = append(out, CategoryMeta{ID: id, Name: id})
+	}
+	return out
+}
+
+// CategoryDescription 取某大类的全文说明；没有返回空串。
+func (rg *Registry) CategoryDescription(id string) string {
+	for _, c := range rg.catMeta {
+		if c.ID == id {
+			return c.Description
+		}
+	}
+	return ""
+}
+
+// SubcategoriesOf 返回某大类下的子类元数据（注册表里的顺序）。
+func (rg *Registry) SubcategoriesOf(category string) []SubcategoryMeta {
+	var out []SubcategoryMeta
+	for _, s := range rg.subMeta {
+		if s.Category == category {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// SubcategoryDescription 取某子类的全文说明；没有返回空串。
+func (rg *Registry) SubcategoryDescription(category, id string) string {
+	for _, s := range rg.subMeta {
+		if s.Category == category && s.ID == id {
+			return s.Description
+		}
+	}
+	return ""
+}
+
+// FirstSentence 取一段描述的首句（懒加载上一级只显示首句摘要）：
+// 找到第一个句号后空格就断，没有就截到 120 字符。
+func FirstSentence(s string) string {
+	if i := strings.Index(s, ". "); i >= 0 && i < 200 {
+		return s[:i+1]
+	}
+	r := []rune(s)
+	if len(r) > 120 {
+		return string(r[:120]) + "…"
+	}
+	return s
 }

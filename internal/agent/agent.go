@@ -60,10 +60,12 @@ type Agent struct {
 
 // Action 是模型每轮的决定：调一个工具，或直接交活。
 type Action struct {
-	Action string   `json:"action"` // "tool" 或 "answer"
-	ToolID string   `json:"tool_id,omitempty"`
-	Inputs []string `json:"inputs,omitempty"`
-	Text   string   `json:"text,omitempty"`
+	Action      string   `json:"action"` // "tool"、"answer" 或 "expand"（三层懒加载导航）
+	ToolID      string   `json:"tool_id,omitempty"`
+	Inputs      []string `json:"inputs,omitempty"`
+	Text        string   `json:"text,omitempty"`
+	Category    string   `json:"category,omitempty"`    // expand 用：一级大类
+	Subcategory string   `json:"subcategory,omitempty"` // expand 用：二级子类
 }
 
 // stepRecord 是一轮工具调用及其结果，喂给下一轮做决定。
@@ -86,14 +88,22 @@ type RunResult struct {
 // agentPromptHead 是主循环的冻结提示词（放 A 区，内容固定才能命中缓存）。
 // 对齐二号 Step 1（判任务 + 按需检索，记忆摘要已在尾巴里）与 Step 4（执行）。
 const agentPromptHead = `你是 007 超级 Agent。按二号的办法做事：先看任务，再一步一步调工具，看到结果再决定下一步。不要一次规划全部步骤。
-只输出一个 JSON 对象，不要任何解释、不要 markdown 代码围栏。对象格式二选一：
+只输出一个 JSON 对象，不要任何解释、不要 markdown 代码围栏。对象格式三选一：
+{"action":"expand","category":"fetch"}
+{"action":"expand","category":"fetch","subcategory":"browser"}
 {"action":"tool","tool_id":"cap-fetch-curl-jq","inputs":["-sS","-L","https://example.com"]}
 {"action":"answer","text":"……（任务的最终回复，直接写给用户）"}
+工具是三层懒加载，不是一次全摊开：
+- 第一级（下面只列 9 个大类）：先定大类。不知道用哪个大类，就挑最可能的一个展开看看。
+- 第二级：expand 某大类后，看到它下面的子类（每个一句话说明）与该大类的完整说明，再挑一个子类展开。
+- 第三级：expand 某子类后，看到它下面的工具（每个有完整英文描述），再挑一个工具调。
+- 展开（expand）只是导航，不算干活、不花钱；调工具（tool）才真正干活。展开后看到的列表会出现在“已跑步骤”里，接着挑就行。
+- 已经知道 tool_id 时不用展开，直接调工具。
 规则：
 - 记忆优先：如果下面“相关记忆摘要”里已经有这道题的答案或关键结论（比如 wiki 里有现成的逆向方案、踩过的坑），优先用它，只补必要的验证，不要从零重新推导。记忆里有的结论直接引用，不用再去现查；
 - 分析/调研类任务：先调查，再把结论写成一个交付文件（用写文件工具或 python 写到工作目录的 report.md），最后用 action=answer 给出摘要并说明文件在哪。不要只在心里分析、只在对话里说，必须落盘成文，否则等于零交付；
 - 任务做完了就 action=answer，把结果写进 text，不要再调工具；不确定做没做完就再调一个工具确认，不要猜；
-- 一步只调一个工具；tool_id 只能从下面可用工具清单里挑，清单外的不许编；不知道调哪个就先调一个最可能有用的，看结果再说；
+- 一步只调一个工具；tool_id 只能从展开后看到的工具清单里挑，清单外的不许编；不知道调哪个就先展开最可能的大类看看，不要猜 tool_id；
 - inputs 的每个字符串就是命令行上的一个参数（argv 的一个元素），执行时直接拼在工具名后面、不经过 shell：不要写 shell 语法——不要写管道 |、重定向 > >>、分号 ;、&&、$变量、for 循环、反引号，也不要在 inputs 里再写一遍工具名；需要落盘文件时，把绝对路径当参数传给工具（比如 --out /绝对路径/文件），不要写重定向；路径直接写绝对路径，不要用 $变量缩写；
 - 不确定的命令先跑 --help 确认用法，不要编参数（比如 playwright screenshot 没有 --out 这个选项，编了会直接报错）；
 - 抓网页 HTML 时要带全套浏览器请求头（Accept、Accept-Language、Sec-Fetch-* 等），只带 User-Agent 常被回 40 字节空壳或验证页；拿到验证页（Cloudflare Turnstile、验证码、challenge）或空壳时，换反检测工具再抓——camoufox（反检测浏览器）或 scrapling 的 stealthy_fetch（TLS 指纹伪装），不要在空壳上反复试普通抓取；
@@ -127,13 +137,79 @@ func parseAction(reply string) (Action, error) {
 	if err := json.Unmarshal([]byte(extractJSON(reply)), &a); err != nil {
 		return a, fmt.Errorf("agent: 决定非法 JSON: %w", err)
 	}
-	if a.Action != "tool" && a.Action != "answer" {
+	if a.Action != "tool" && a.Action != "answer" && a.Action != "expand" {
 		return a, fmt.Errorf("agent: 未知 action %q", a.Action)
 	}
 	if a.Action == "tool" && a.ToolID == "" {
 		return a, fmt.Errorf("agent: tool 决定缺 tool_id")
 	}
+	if a.Action == "expand" && a.Category == "" {
+		return a, fmt.Errorf("agent: expand 决定缺 category")
+	}
 	return a, nil
+}
+
+// categoryList 是懒加载第一级：9 个大类，每类只给首句摘要。
+// 模型先定大类，再 expand 展开。
+func (a *Agent) categoryList() string {
+	var b strings.Builder
+	b.WriteString("工具大类（9 个，先挑一个展开看子类）：\n")
+	for _, c := range a.Reg.CategoryMetas() {
+		desc := registry.FirstSentence(c.Description)
+		if desc == "" {
+			desc = c.Name
+		}
+		fmt.Fprintf(&b, "- %s: %s\n", c.ID, desc)
+	}
+	return b.String()
+}
+
+// subcategoryList 是懒加载第二级：某大类的全文说明 + 它的子类（每类首句摘要）。
+func (a *Agent) subcategoryList(category string) (string, error) {
+	desc := a.Reg.CategoryDescription(category)
+	if desc == "" {
+		return "", fmt.Errorf("agent: 未知大类 %q", category)
+	}
+	subs := a.Reg.SubcategoriesOf(category)
+	if len(subs) == 0 {
+		return "", fmt.Errorf("agent: 大类 %q 下没有子类", category)
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "大类 %s 说明：\n%s\n子类（挑一个展开看工具）：\n", category, desc)
+	for _, s := range subs {
+		d := registry.FirstSentence(s.Description)
+		if d == "" {
+			d = s.ID
+		}
+		fmt.Fprintf(&b, "- %s: %s\n", s.ID, d)
+	}
+	return b.String(), nil
+}
+
+// toolList 是懒加载第三级：某子类的全文说明 + 它的工具（完整英文描述）。
+// 只列可调的（available 且可执行且探针未失败），与 CompactToolList 同一口径。
+func (a *Agent) toolList(category, subcategory string) (string, error) {
+	desc := a.Reg.SubcategoryDescription(category, subcategory)
+	if desc == "" {
+		return "", fmt.Errorf("agent: 未知子类 %q/%q", category, subcategory)
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "子类 %s/%s 说明：\n%s\n工具（挑一个调）：\n", category, subcategory, desc)
+	listed := 0
+	for _, e := range a.Reg.EntriesByCategory(category) {
+		if e.Subcategory != subcategory {
+			continue
+		}
+		if !e.Available || !e.Executable() || a.Reg.ProbeFailed(e.ToolID) {
+			continue
+		}
+		fmt.Fprintf(&b, "- %s: %s\n", e.ToolID, e.OneLiner)
+		listed++
+	}
+	if listed == 0 {
+		return "", fmt.Errorf("agent: 子类 %q/%q 下没有可用工具", category, subcategory)
+	}
+	return b.String(), nil
 }
 
 // buildTail 拼当轮尾巴：任务 + 记忆摘要 + 监工反馈（如有） + 已跑步骤的结果。
@@ -283,8 +359,7 @@ func (a *Agent) Run(ctx context.Context, taskID, taskText, memSummary, feedback 
 	if err := os.MkdirAll(artDir, 0o755); err != nil {
 		return nil, fmt.Errorf("agent: 建产物目录失败: %w", err)
 	}
-	frozen := agentPromptHead + "可用工具清单（只许从中挑 tool_id，清单外的一律非法）：\n" +
-		triage.CompactToolList(a.Reg, nil)
+	frozen := agentPromptHead + a.categoryList()
 	history := []stepRecord{}
 	completed := 0
 	for iter := 1; iter <= maxIter; iter++ {
@@ -335,6 +410,26 @@ func (a *Agent) Run(ctx context.Context, taskID, taskText, memSummary, feedback 
 				return nil, fmt.Errorf("agent: 写 reply.md 失败: %w", err)
 			}
 			return &RunResult{ReplyDraft: act.Text, Status: "done", CompletedSteps: completed}, nil
+		}
+		if act.Action == "expand" {
+			// 懒加载导航：只展开分类，不算干活、不走监工、不记账。
+			// 展开成功记为 success（导航是进展，不是失败），这样连续失败
+			// 计数不会把“一直在找工具”误判成卡住；时间预算与 200 步
+			// 最后防线仍兜底无限展开。
+			var listing string
+			var err error
+			if act.Subcategory == "" {
+				listing, err = a.subcategoryList(act.Category)
+			} else {
+				listing, err = a.toolList(act.Category, act.Subcategory)
+			}
+			if err != nil {
+				log.Printf("agent task=%s iter=%d expand %s/%s: %v", taskID, iter, act.Category, act.Subcategory, err)
+				history = append(history, stepRecord{ToolID: "expand", Inputs: []string{act.Category, act.Subcategory}, ExitCode: -1, Status: "expand_error", Output: "展开失败：" + err.Error()})
+				continue
+			}
+			history = append(history, stepRecord{ToolID: "expand", Inputs: []string{act.Category, act.Subcategory}, ExitCode: 0, Status: "success", Output: listing})
+			continue
 		}
 		// 调工具：先过代码层可调用性，再拼参数，再执行。
 		if _, _, err := triage.ResolveTool(a.Reg, act.ToolID); err != nil {
