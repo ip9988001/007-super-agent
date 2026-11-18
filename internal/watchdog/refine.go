@@ -159,5 +159,8 @@ func (w *Watchdog) RefineLoop(ctx context.Context, mem *memory.Store, dataDir st
 		}
 		// 第 15 步：精炼成功后调记忆备份钩子（失败只记日志，不阻塞循环）。
 		w.afterRefine(ctx, yesterday)
+		// 第 22 步：精炼成功后后台跑语义索引增量重建（只嵌新增/改动
+		// 过的文档，日常只有几篇；跑在后台，不阻塞精炼循环）。
+		w.afterRefineSemantic(ctx)
 	}
 }

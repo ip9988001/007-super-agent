@@ -458,3 +458,44 @@ func TestShouldBackup(t *testing.T) {
 		t.Fatal("already backed up today should not backup")
 	}
 }
+
+// TestSemanticHookRunsAfterRefine 是第 22 步的钩子：精炼成功后后台跑
+// 语义索引增量重建；钩子为 nil 时不跑；钩子失败只记日志、不阻塞。
+func TestSemanticHookRunsAfterRefine(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "ledger.db")
+	l, err := ledger.Open(dbPath)
+	if err != nil {
+		t.Fatalf("ledger.Open: %v", err)
+	}
+	defer ledger.Close(l)
+
+	w := New(l, dbPath, nil)
+
+	// 钩子为 nil 时不跑、不 panic。
+	w.afterRefineSemantic(context.Background())
+
+	// 钩子被调一次，且跑在后台（afterRefineSemantic 立即返回）。
+	done := make(chan struct{})
+	w.SetSemanticHook(func(ctx context.Context) error {
+		close(done)
+		return nil
+	})
+	start := time.Now()
+	w.afterRefineSemantic(context.Background())
+	if time.Since(start) > time.Second {
+		t.Fatalf("afterRefineSemantic 阻塞超过 1s，应后台跑")
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("semantic hook 5s 内没被调到")
+	}
+
+	// 钩子失败也不 panic、不阻塞。
+	w.SetSemanticHook(func(ctx context.Context) error {
+		return errors.New("rebuild boom")
+	})
+	w.afterRefineSemantic(context.Background())
+	time.Sleep(100 * time.Millisecond)
+}

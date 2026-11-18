@@ -261,6 +261,13 @@ func main() {
 	listenFlag := flag.String("listen", "", "监听地址（覆盖配置）")
 	flag.Parse()
 
+	// 子命令：index-memory —— 重建语义向量索引后退出，不启动守护进程。
+	// 用法：super-agent index-memory [--data-dir DIR]
+	if flag.NArg() > 0 && flag.Arg(0) == "index-memory" {
+		runIndexMemory(*dataDirFlag)
+		return
+	}
+
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("config: %v", err)
@@ -308,6 +315,22 @@ func main() {
 	} else {
 		log.Printf("memory ready: pruned %d expired L1 files", n)
 	}
+	// 语义检索：本地 Ollama embedding（qwen3-embedding:0.6b），向量库在
+	// data/memory/vectors.db。Ollama 或向量库不可用时只记日志、继续跑，
+	// Recall 降级只用词法。第 22 步：索引自动增量重建——每天 04:00
+	// 精炼成功后后台重建（只嵌新增/改动过的文档）；启动时索引为空
+	// 也后台补建一次，不再需要手动跑 index-memory。
+	var sem *memory.Service
+	if s, err := memory.OpenSemantic(
+		filepath.Join(dataDir, "memory", "vectors.db"),
+		memory.SemanticDefaultURL, memory.SemanticDefaultModel); err != nil {
+		log.Printf("semantic disabled: %v", err)
+	} else {
+		sem = s
+		mem.WithSemantic(sem.Search)
+		log.Printf("semantic ready: model=%s docs=%d dim=%d", sem.Model(), sem.Count(), sem.Dim())
+		defer sem.Close()
+	}
 
 	ex := &executor.Executor{Ledger: led}
 	if shadow {
@@ -318,6 +341,28 @@ func main() {
 	}
 
 	wd := watchdog.New(led, dbPath, nil)
+	// 第 22 步：语义索引自动增量重建。精炼成功后由 RefineLoop 经
+	// afterRefineSemantic 后台触发；启动时索引为空也在后台补建一次。
+	// 重建是增量的（只嵌新增/改动过的文档），日常只有几篇，几秒完成。
+	if sem != nil {
+		memRoot := filepath.Join(dataDir, "memory")
+		rebuild := func() {
+			n, err := sem.Rebuild(memRoot)
+			if err != nil {
+				log.Printf("semantic auto-rebuild: %v", err)
+				return
+			}
+			log.Printf("semantic auto-rebuild: 本次向量化 %d 篇，库内共 %d 篇", n, sem.Count())
+		}
+		wd.SetSemanticHook(func(ctx context.Context) error {
+			rebuild()
+			return nil
+		})
+		if sem.Count() == 0 {
+			log.Printf("semantic auto-rebuild: 索引为空，启动后后台补建")
+			go rebuild()
+		}
+	}
 	if res, err := wd.CheckRegistry(dataDir); err != nil {
 		log.Printf("watchdog check: %v", err)
 	} else {
@@ -451,4 +496,33 @@ func main() {
 	_ = srv.Close()
 	gw.Stop()
 	log.Printf("stopped")
+}
+
+// runIndexMemory 是 `super-agent index-memory` 子命令：重建 data/memory/
+// 下的语义向量索引（vectors.db），只对新增/改动过的文档重新向量化。
+// dataDir 为空时用配置的默认数据目录。
+func runIndexMemory(dataDirFlag string) {
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatalf("config: %v", err)
+	}
+	if dataDirFlag != "" {
+		cfg.DataDir = dataDirFlag
+	}
+	dataDir := cfg.ResolveDataDir()
+	memRoot := filepath.Join(dataDir, "memory")
+	sem, err := memory.OpenSemantic(
+		filepath.Join(memRoot, "vectors.db"),
+		memory.SemanticDefaultURL, memory.SemanticDefaultModel)
+	if err != nil {
+		log.Fatalf("semantic open: %v", err)
+	}
+	defer sem.Close()
+	start := time.Now()
+	n, err := sem.Rebuild(memRoot)
+	if err != nil {
+		log.Fatalf("index-memory: %v", err)
+	}
+	log.Printf("index-memory done: 本次向量化 %d 篇，库内共 %d 篇，模型 %s，用时 %v",
+		n, sem.Count(), sem.Model(), time.Since(start).Round(time.Second))
 }

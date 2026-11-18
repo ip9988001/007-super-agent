@@ -19,6 +19,17 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	// 语义：memoryDir 下有 vectors.db 时接上（Ollama 须在跑）。接不上
+	// 只记一行、继续跑词法，Recall 本身不报错。
+	if sem, err := memory.OpenSemantic(
+		os.Args[1]+"/vectors.db",
+		memory.SemanticDefaultURL, memory.SemanticDefaultModel); err != nil {
+		fmt.Printf("semantic: 不可用（%v），只跑词法\n", err)
+	} else {
+		defer sem.Close()
+		st.WithSemantic(sem.Search)
+		fmt.Printf("semantic: model=%s docs=%d dim=%d\n", sem.Model(), sem.Count(), sem.Dim())
+	}
 	q := strings.Join(os.Args[2:], " ")
 	res, err := st.Recall(q)
 	fmt.Printf("query=%q err=%v hits=%d\n", q, err, len(res))

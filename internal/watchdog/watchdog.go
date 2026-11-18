@@ -52,11 +52,34 @@ type Watchdog struct {
 	// backupHook 是精炼成功后调的记忆备份钩子（第 15 步）；为 nil 时不跑。
 	// 由 main.go 接线；钩子失败只记日志，不影响精炼标记与主循环。
 	backupHook func(ctx context.Context, date string) error
+	// semanticHook 是精炼成功后调的语义索引增量重建钩子（第 22 步）；
+	// 为 nil 时不跑。由 main.go 接线；跑在后台 goroutine 里，不阻塞
+	// 精炼循环；失败只记日志。重建只嵌新增/改动过的文档，日常只有
+	// 几篇，几秒完成。
+	semanticHook func(ctx context.Context) error
 }
 
 // SetBackupHook 接入精炼成功后的记忆备份钩子（第 15 步）。
 func (w *Watchdog) SetBackupHook(fn func(ctx context.Context, date string) error) {
 	w.backupHook = fn
+}
+
+// SetSemanticHook 接入精炼成功后的语义索引增量重建钩子（第 22 步）。
+func (w *Watchdog) SetSemanticHook(fn func(ctx context.Context) error) {
+	w.semanticHook = fn
+}
+
+// afterRefineSemantic 在精炼成功后后台跑语义索引增量重建；钩子失败
+// 只记日志，不报错、不阻塞。跑在后台 goroutine 里，精炼循环不等它。
+func (w *Watchdog) afterRefineSemantic(ctx context.Context) {
+	if w.semanticHook == nil {
+		return
+	}
+	go func() {
+		if err := w.semanticHook(ctx); err != nil {
+			log.Printf("refine loop: 语义索引增量重建失败（只记日志，不影响精炼）: %v", err)
+		}
+	}()
 }
 
 // afterRefine 在精炼成功后调备份钩子；钩子失败只记日志，不报错、不阻塞。
