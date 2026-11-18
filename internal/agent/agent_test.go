@@ -184,6 +184,30 @@ func TestRunNoOutputCountsAsFailure(t *testing.T) {
 	}
 }
 
+// 连续 5 轮失败就卡住停下，不再硬撑；且不受 20 步旧上限影响。
+func TestRunStuckAfterConsecutiveFailures(t *testing.T) {
+	// 每次都调 test-false（exit 1），模型一直不交活。
+	// 5 次失败后应停下，而不是跑满 MaxIter。
+	replies := []string{}
+	for i := 0; i < 10; i++ {
+		replies = append(replies, `{"action":"tool","tool_id":"test-false","inputs":[]}`)
+	}
+	ag := newTestAgent(t, stubSeq(replies))
+	ag.MaxIter = 200
+	res, err := ag.Run(context.Background(), "t7", "一直失败的任务", "", "")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	// 5 次失败后停下，CompletedSteps 应为 0（全失败），且不应跑满 200 轮。
+	if res.CompletedSteps != 0 {
+		t.Fatalf("全失败任务完成步数应为 0，实为 %d", res.CompletedSteps)
+	}
+	// 回复应为步骤汇总（无报告可综合，因为没用过调查类工具）。
+	if !strings.Contains(res.ReplyDraft, "任务未完成") {
+		t.Fatalf("卡住后应回步骤汇总，实为 %q", res.ReplyDraft)
+	}
+}
+
 // 两次都不是合法 JSON 时，把原话当答案收下（不丢掉已调查的成果），交给监工去审。
 func TestRunNonJSONTreatedAsAnswer(t *testing.T) {
 	ag := newTestAgent(t, stubSeq([]string{

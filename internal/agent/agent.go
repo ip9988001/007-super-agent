@@ -33,9 +33,13 @@ import (
 // 冻结提示词（A 区，可命中缓存）+ 当轮尾巴，返回模型原话与 token 数。
 type ModelCallFunc func(taskID, frozen, tail string) (reply string, tokensIn, tokensOut int64, err error)
 
-// DefaultMaxIter 是单任务最多调工具轮数：防模型死循环。
-// 正常任务 3-8 轮够用；20 轮是熔断，不是目标。
-const DefaultMaxIter = 20
+// MaxConsecutiveFailures 是“卡住”判定：连续多少轮工具调用失败或无产出，
+// 就认定模型卡住了、停下来综合已有成果。不是步数上限——
+// 能产出成果的任务想跑多少轮就跑多少轮，只有卡住才停。
+// MaxIter 是最后防线（防模型永不交活的极端死循环），设得很高，
+// 正常任务碰不到它；碰到了说明模型出了问题，停下来上报。
+const MaxConsecutiveFailures = 5
+const DefaultMaxIter = 200
 
 // Agent 是主循环：一次 Run 跑完一个多步任务。
 type Agent struct {
@@ -45,7 +49,7 @@ type Agent struct {
 	Ex        *executor.Executor
 	DataDir   string // 产物落盘根目录（artifacts/<taskID>/）
 	SessionID string
-	MaxIter   int // 0 时用 DefaultMaxIter
+	MaxIter   int // 0 时用 DefaultMaxIter（最后防线，不是能力上限）
 }
 
 // Action 是模型每轮的决定：调一个工具，或直接交活。
@@ -184,6 +188,19 @@ func (a *Agent) needsReport(taskID string, history []stepRecord) bool {
 	return false
 }
 
+// trailingFailures 返回 history 末尾连续失败的步数：
+// 成功且有产出的步骤会打断连续计数；失败、无产出、被监工叫停都算失败。
+func trailingFailures(history []stepRecord) int {
+	n := 0
+	for i := len(history) - 1; i >= 0; i-- {
+		if history[i].Status == "success" && !history[i].NoOutput {
+			break
+		}
+		n++
+	}
+	return n
+}
+
 // synthesize 根据调查记录写一份分析报告，落盘到工作目录 report.md，
 // 同时作为 reply.md 返回。只调一次模型，失败则返回错误。
 func (a *Agent) synthesize(ctx context.Context, taskID, taskText, memSummary string, history []stepRecord, artDir string) (string, error) {
@@ -260,6 +277,12 @@ func (a *Agent) Run(ctx context.Context, taskID, taskText, memSummary, feedback 
 	history := []stepRecord{}
 	completed := 0
 	for iter := 1; iter <= maxIter; iter++ {
+		// 卡住判定：连续 5 轮失败/无产出就停下来综合已有成果，不再硬撑。
+		// 能产出成果的任务不受步数限制，想跑多少轮就跑多少轮。
+		if iter > 1 && trailingFailures(history) >= MaxConsecutiveFailures {
+			log.Printf("agent task=%s 卡住：连续 %d 轮失败，停下来综合", taskID, MaxConsecutiveFailures)
+			break
+		}
 		reply, _, _, err := a.Call(taskID, frozen, buildTail(taskText, memSummary, feedback, history))
 		if err != nil {
 			return nil, fmt.Errorf("agent: 第 %d 轮模型调用失败: %w", iter, err)
@@ -366,18 +389,19 @@ func (a *Agent) Run(ctx context.Context, taskID, taskText, memSummary, feedback 
 		})
 		log.Printf("agent task=%s iter=%d %s exit=%d status=%s", taskID, iter, act.ToolID, res.ExitCode, status)
 	}
-	// 熔断：到轮数上限还没交活。先看调查后是否缺交付报告：缺就综合一份，
-	// 综合出来算交付完成；综合失败或本来就不需要报告，才回步骤汇总。
+	// 停下：要么卡住（连续失败），要么碰到最后防线。先看调查后是否缺交付报告：
+	// 缺就综合一份，综合出来算交付完成；综合失败或本来就不需要报告，
+	// 才回步骤汇总。
 	if a.needsReport(taskID, history) {
 		report, serr := a.synthesize(ctx, taskID, taskText, memSummary, history, artDir)
 		if serr == nil {
-			log.Printf("agent task=%s 熔断后综合出报告", taskID)
+			log.Printf("agent task=%s 停下后综合出报告", taskID)
 			return &RunResult{ReplyDraft: report, Status: "done", CompletedSteps: completed}, nil
 		}
 		log.Printf("agent task=%s synthesize: %v", taskID, serr)
 	}
 	var b strings.Builder
-	b.WriteString("任务未在轮数上限内完成，已跑步骤如下：\n")
+	b.WriteString("任务未完成，已跑步骤如下：\n")
 	for i, s := range history {
 		fmt.Fprintf(&b, "%d. %s → exit=%d status=%s\n", i+1, s.ToolID, s.ExitCode, s.Status)
 	}
