@@ -200,8 +200,9 @@ func (d *daemon) memorySummary(text string) string {
 }
 
 // runAgent 是 AGENT 去向的真执行：主循环逐轮调工具、看到结果再决定下一步，
-// 最后交活前审。影子模式只做一次决定、记一行 shadow 回执，不执行。
-// 返回执行结果状态（供 handle 记 L1）。
+// 最后交活前审。监工 HALT 时把打回意见喂回主循环再跑一轮（最多 2 次重跑，
+// 与监工的 HALT 上限对齐），让它照着改；影子模式只做一次决定、记一行 shadow
+// 回执，不执行。返回执行结果状态（供 handle 记 L1）。
 func (d *daemon) runAgent(env gateway.Envelope) string {
 	if d.ag == nil {
 		log.Printf("task=%s AGENT but agent not wired (no llm client)", env.TaskID)
@@ -219,13 +220,19 @@ func (d *daemon) runAgent(env gateway.Envelope) string {
 		}
 		return "shadow_agent"
 	}
-	res, err := d.ag.Run(context.Background(), env.TaskID, env.Text, memSummary)
-	if err != nil {
-		log.Printf("task=%s agent run: %v", env.TaskID, err)
-		return "agent_error"
-	}
-	// 交活前审（触发点 ①）：Draft 为最终回复。HALT 时不交付，原因已记账。
-	if d.ex.Advisor != nil {
+	feedback := ""
+	for attempt := 0; attempt <= 2; attempt++ {
+		res, err := d.ag.Run(context.Background(), env.TaskID, env.Text, memSummary, feedback)
+		if err != nil {
+			log.Printf("task=%s agent run: %v", env.TaskID, err)
+			return "agent_error"
+		}
+		// 交活前审（触发点 ①）：Draft 为最终回复。HALT 时不交付，原因已记账；
+		// 还有重跑次数就把打回意见喂回去再跑一轮，没次数了才停下上报。
+		if d.ex.Advisor == nil {
+			log.Printf("task=%s agent status=%s steps=%d (no advisor)", env.TaskID, res.Status, res.CompletedSteps)
+			return res.Status
+		}
 		rres, rerr := d.ex.ReviewDelivery(executor.Task{
 			TaskID: env.TaskID, SessionID: d.session, ToolID: "agent",
 			Text: env.Text, Command: "agent " + env.TaskID, Draft: res.ReplyDraft,
@@ -233,13 +240,19 @@ func (d *daemon) runAgent(env gateway.Envelope) string {
 		})
 		if rerr != nil && !errors.Is(rerr, executor.ErrAdvisorHalt) && !errors.Is(rerr, executor.ErrAdvisorHaltFinal) {
 			log.Printf("task=%s delivery review: %v", env.TaskID, rerr)
-		} else if rres.Verdict == executor.VerdictHalt {
-			log.Printf("task=%s delivery HALT (retry=%d): %s", env.TaskID, rres.RetryCount, rres.Note)
+			return res.Status
+		}
+		if rres.Verdict != executor.VerdictHalt {
+			log.Printf("task=%s agent status=%s steps=%d attempts=%d", env.TaskID, res.Status, res.CompletedSteps, attempt+1)
+			return res.Status
+		}
+		log.Printf("task=%s delivery HALT (retry=%d): %s", env.TaskID, rres.RetryCount, rres.Note)
+		if attempt >= 2 || errors.Is(rerr, executor.ErrAdvisorHaltFinal) {
 			return "delivery_halt"
 		}
+		feedback = rres.Note
 	}
-	log.Printf("task=%s agent status=%s steps=%d", env.TaskID, res.Status, res.CompletedSteps)
-	return res.Status
+	return "delivery_halt"
 }
 
 func main() {

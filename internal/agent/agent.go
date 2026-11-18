@@ -80,12 +80,14 @@ const agentPromptHead = `你是 007 超级 Agent。按二号的办法做事：�
 {"action":"tool","tool_id":"cap-fetch-curl-jq","inputs":["-sS","-L","https://example.com"]}
 {"action":"answer","text":"……（任务的最终回复，直接写给用户）"}
 规则：
+- 记忆优先：如果下面“相关记忆摘要”里已经有这道题的答案或关键结论（比如 wiki 里有现成的逆向方案、踩过的坑），优先用它，只补必要的验证，不要从零重新推导。记忆里有的结论直接引用，不用再去现查；
+- 分析/调研类任务：先调查，再把结论写成一个交付文件（用写文件工具或 python 写到工作目录的 report.md），最后用 action=answer 给出摘要并说明文件在哪。不要只在心里分析、只在对话里说，必须落盘成文，否则等于零交付；
 - 任务做完了就 action=answer，把结果写进 text，不要再调工具；不确定做没做完就再调一个工具确认，不要猜；
 - 一步只调一个工具；tool_id 只能从下面可用工具清单里挑，清单外的不许编；不知道调哪个就先调一个最可能有用的，看结果再说；
 - inputs 的每个字符串就是命令行上的一个参数（argv 的一个元素），执行时直接拼在工具名后面、不经过 shell：不要写 shell 语法——不要写管道 |、重定向 > >>、分号 ;、&&、$变量、for 循环、反引号，也不要在 inputs 里再写一遍工具名；需要落盘文件时，把绝对路径当参数传给工具（比如 --out /绝对路径/文件），不要写重定向；路径直接写绝对路径，不要用 $变量缩写；
 - 不确定的命令先跑 --help 确认用法，不要编参数（比如 playwright screenshot 没有 --out 这个选项，编了会直接报错）；
 - 抓网页 HTML 时要带全套浏览器请求头（Accept、Accept-Language、Sec-Fetch-* 等），只带 User-Agent 常被回 40 字节空壳或验证页；拿到验证页（Cloudflare Turnstile、验证码、challenge）或空壳时，换反检测工具再抓——camoufox（反检测浏览器）或 scrapling 的 stealthy_fetch（TLS 指纹伪装），不要在空壳上反复试普通抓取；
-- 工具返回失败（exit 非 0、无输出、参数报错）时，先看错误信息换个招再试，不要原样重发同一条命令；同一工具连续失败两次就换别的工具；
+- 工具返回失败（exit 非 0、无输出、参数报错）时，先看错误信息换个招再试，不要原样重发同一条命令；同一工具连续失败两次就换别的工具；同一条命令失败了就不要再发一模一样的；
 - 引用历史结论、经验、教训时，只引用下面“相关记忆摘要”里有的，不在其中的不要编造。
 `
 
@@ -124,14 +126,19 @@ func parseAction(reply string) (Action, error) {
 	return a, nil
 }
 
-// buildTail 拼当轮尾巴：任务 + 记忆摘要 + 已跑步骤的结果。
-func buildTail(taskText, memSummary string, history []stepRecord) string {
+// buildTail 拼当轮尾巴：任务 + 记忆摘要 + 监工反馈（如有） + 已跑步骤的结果。
+func buildTail(taskText, memSummary, feedback string, history []stepRecord) string {
 	var b strings.Builder
 	b.WriteString("任务：")
 	b.WriteString(taskText)
 	b.WriteString("\n")
 	if memSummary != "" {
 		b.WriteString(memSummary)
+		b.WriteString("\n")
+	}
+	if feedback != "" {
+		b.WriteString("监工上一轮的打回意见（必须照着改，不要重复同样的错误）：\n")
+		b.WriteString(feedback)
 		b.WriteString("\n")
 	}
 	if len(history) > 0 {
@@ -150,9 +157,96 @@ func buildTail(taskText, memSummary string, history []stepRecord) string {
 	return b.String()
 }
 
+// synthesizePromptHead 是综合撰稿的冻结提示词：只写结论和分析，不写执行日志。
+const synthesizePromptHead = `你是 007 的综合撰稿人。根据下面的调查记录，写一份结构化的分析报告，直接输出报告全文（markdown），不要任何解释、不要代码围栏。
+要求：
+- 只写调查记录里有的结论和证据，不要编造；没有证据的写“未验证/推测”，不要写成事实；
+- 报告结构：开头一段 200 字以内摘要；然后功能清单（逐项列出，每项注明证据来源）；然后实现原理（逐项说明）；然后复刻方案（模块划分、关键接口、技术选型、难点）；最后未验证的假设与下一步；
+- 不要写执行日志、不要罗列步骤、不要贴大段原始 HTML，只写结论和分析。
+`
+
+// needsReport 判调查后是否还缺一份交付报告：
+// 用过抓取/分析类工具且工作目录里还没有 report.md，就缺。
+func (a *Agent) needsReport(taskID string, history []stepRecord) bool {
+	if _, err := os.Stat(filepath.Join(a.WorkDir(taskID), "report.md")); err == nil {
+		return false
+	}
+	for _, s := range history {
+		if s.Status != "success" {
+			continue
+		}
+		for _, p := range []string{"cap-fetch-", "cap-ops-", "cap-code-", "cap-design-", "cap-seo-", "cap-graph-", "cap-rea-"} {
+			if strings.HasPrefix(s.ToolID, p) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// synthesize 根据调查记录写一份分析报告，落盘到工作目录 report.md，
+// 同时作为 reply.md 返回。只调一次模型，失败则返回错误。
+func (a *Agent) synthesize(ctx context.Context, taskID, taskText, memSummary string, history []stepRecord, artDir string) (string, error) {
+	var b strings.Builder
+	b.WriteString("任务：")
+	b.WriteString(taskText)
+	b.WriteString("\n")
+	if memSummary != "" {
+		b.WriteString(memSummary)
+		b.WriteString("\n")
+	}
+	b.WriteString("调查记录（只含成功的步骤，按顺序）：\n")
+	total := 0
+	for i, s := range history {
+		if s.Status != "success" {
+			continue
+		}
+		// 优先读该步的全文产物（比 500 字摘要完整）。
+		full := ""
+		if data, err := os.ReadFile(filepath.Join(artDir, fmt.Sprintf("step-%d.txt", i+1))); err == nil {
+			full = string(data)
+		}
+		if full == "" {
+			full = s.Output
+		}
+		if len([]rune(full)) > 2000 {
+			full = string([]rune(full)[:2000])
+		}
+		fmt.Fprintf(&b, "【步骤 %d】%s %v\n%s\n", i+1, s.ToolID, s.Inputs, full)
+		total += len([]rune(full))
+		if total > 12000 {
+			break
+		}
+	}
+	reply, _, _, err := a.Call(taskID, synthesizePromptHead, b.String())
+	if err != nil {
+		return "", fmt.Errorf("agent: 综合调用失败: %w", err)
+	}
+	// 综合输出是 markdown 全文，直接用原文；只去掉模型可能包的围栏。
+	report := strings.TrimSpace(reply)
+	if strings.HasPrefix(report, "```") {
+		report = strings.TrimPrefix(report, "```markdown")
+		report = strings.TrimPrefix(report, "```")
+		report = strings.TrimSuffix(strings.TrimSpace(report), "```")
+		report = strings.TrimSpace(report)
+	}
+	wd := a.WorkDir(taskID)
+	if err := os.MkdirAll(wd, 0o755); err != nil {
+		return "", fmt.Errorf("agent: 建工作目录失败: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(wd, "report.md"), []byte(report), 0o600); err != nil {
+		return "", fmt.Errorf("agent: 写 report.md 失败: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(artDir, "reply.md"), []byte(report), 0o600); err != nil {
+		return "", fmt.Errorf("agent: 写 reply.md 失败: %w", err)
+	}
+	return report, nil
+}
+
 // Run 跑完一个多步任务：主模型逐轮决定调工具或交活。
-// memSummary 是 Recall 前 3 条（可为空）；taskText 是任务原话。
-func (a *Agent) Run(ctx context.Context, taskID, taskText, memSummary string) (*RunResult, error) {
+// memSummary 是 Recall 前 3 条（可为空）；taskText 是任务原话；
+// feedback 是监工上一轮打回的意见（重跑时才有，第一次为空）。
+func (a *Agent) Run(ctx context.Context, taskID, taskText, memSummary, feedback string) (*RunResult, error) {
 	maxIter := a.MaxIter
 	if maxIter <= 0 {
 		maxIter = DefaultMaxIter
@@ -166,23 +260,38 @@ func (a *Agent) Run(ctx context.Context, taskID, taskText, memSummary string) (*
 	history := []stepRecord{}
 	completed := 0
 	for iter := 1; iter <= maxIter; iter++ {
-		reply, _, _, err := a.Call(taskID, frozen, buildTail(taskText, memSummary, history))
+		reply, _, _, err := a.Call(taskID, frozen, buildTail(taskText, memSummary, feedback, history))
 		if err != nil {
 			return nil, fmt.Errorf("agent: 第 %d 轮模型调用失败: %w", iter, err)
 		}
 		act, perr := parseAction(reply)
 		if perr != nil {
 			// 坏 JSON 重试一次：把“只返回 JSON”追加进尾巴再调。
-			retry, _, _, rerr := a.Call(taskID, frozen, buildTail(taskText, memSummary, history)+"\n注意：上一轮回复不是合法 JSON，只返回 JSON 对象，不要加任何解释文字。")
+			retry, _, _, rerr := a.Call(taskID, frozen, buildTail(taskText, memSummary, feedback, history)+"\n注意：上一轮回复不是合法 JSON，只返回 JSON 对象，不要加任何解释文字。")
 			if rerr != nil {
 				return nil, fmt.Errorf("agent: 第 %d 轮模型调用失败: %w", iter, rerr)
 			}
 			act, perr = parseAction(retry)
 			if perr != nil {
-				return nil, fmt.Errorf("agent: 第 %d 轮决定非法: %w", iter, perr)
+				// 两次都不是合法 JSON：模型明显在直接输出答案（而非调工具），
+				// 把重试的原话当答案收下，交给监工去审，而不是直接报错、
+				// 丢掉已经调查到的成果。空串才算真失败。
+				if strings.TrimSpace(retry) == "" {
+					return nil, fmt.Errorf("agent: 第 %d 轮决定非法: %w", iter, perr)
+				}
+				act = Action{Action: "answer", Text: strings.TrimSpace(retry)}
 			}
 		}
 		if act.Action == "answer" {
+			// 调查类任务：光一句短答不算交付，没有 report.md 就先综合一份。
+			if a.needsReport(taskID, history) {
+				report, serr := a.synthesize(ctx, taskID, taskText, memSummary, history, artDir)
+				if serr != nil {
+					log.Printf("agent task=%s synthesize: %v", taskID, serr)
+				} else {
+					return &RunResult{ReplyDraft: report, Status: "done", CompletedSteps: completed}, nil
+				}
+			}
 			if err := os.WriteFile(filepath.Join(artDir, "reply.md"), []byte(act.Text), 0o600); err != nil {
 				return nil, fmt.Errorf("agent: 写 reply.md 失败: %w", err)
 			}
@@ -257,13 +366,25 @@ func (a *Agent) Run(ctx context.Context, taskID, taskText, memSummary string) (*
 		})
 		log.Printf("agent task=%s iter=%d %s exit=%d status=%s", taskID, iter, act.ToolID, res.ExitCode, status)
 	}
-	// 熔断：到轮数上限还没交活，如实汇总已跑步骤，不编结论。
+	// 熔断：到轮数上限还没交活。先看调查后是否缺交付报告：缺就综合一份，
+	// 综合出来算交付完成；综合失败或本来就不需要报告，才回步骤汇总。
+	if a.needsReport(taskID, history) {
+		report, serr := a.synthesize(ctx, taskID, taskText, memSummary, history, artDir)
+		if serr == nil {
+			log.Printf("agent task=%s 熔断后综合出报告", taskID)
+			return &RunResult{ReplyDraft: report, Status: "done", CompletedSteps: completed}, nil
+		}
+		log.Printf("agent task=%s synthesize: %v", taskID, serr)
+	}
 	var b strings.Builder
 	b.WriteString("任务未在轮数上限内完成，已跑步骤如下：\n")
 	for i, s := range history {
 		fmt.Fprintf(&b, "%d. %s → exit=%d status=%s\n", i+1, s.ToolID, s.ExitCode, s.Status)
 	}
 	b.WriteString("请根据以上结果继续处理，或告诉用户还差什么。")
+	if err := os.WriteFile(filepath.Join(artDir, "reply.md"), []byte(b.String()), 0o600); err != nil {
+		log.Printf("agent task=%s 写 reply.md 失败: %v", taskID, err)
+	}
 	return &RunResult{ReplyDraft: b.String(), Status: "max_iterations", CompletedSteps: completed}, nil
 }
 

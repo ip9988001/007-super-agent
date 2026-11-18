@@ -21,9 +21,10 @@ func miniRegistry(t *testing.T) *registry.Registry {
 		{"test-echo", "echo", "exit 0"},
 		{"test-true", "true", "exit 0"},
 		{"test-false", "false", "exit 1"},
+		{"cap-ops-echo", "echo", "exit 0"},
 	}
 	var ents strings.Builder
-	ents.WriteString(`{"version":"v1.1-test","generated":"2026-11-18","total":3,"entries":[`)
+	ents.WriteString(`{"version":"v1.1-test","generated":"2026-11-18","total":4,"entries":[`)
 	for i, e := range entries {
 		if i > 0 {
 			ents.WriteString(",")
@@ -125,7 +126,7 @@ func TestRunToolThenAnswer(t *testing.T) {
 		`{"action":"tool","tool_id":"test-echo","inputs":["hello"]}`,
 		`{"action":"answer","text":"echo 说了 hello"}`,
 	}))
-	res, err := ag.Run(context.Background(), "t1", "让 echo 说 hello", "")
+	res, err := ag.Run(context.Background(), "t1", "让 echo 说 hello", "", "")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -146,7 +147,7 @@ func TestRunResolveErrorThenRecover(t *testing.T) {
 		`{"action":"tool","tool_id":"test-echo","inputs":["ok"]}`,
 		`{"action":"answer","text":"换工具后成功"}`,
 	}))
-	res, err := ag.Run(context.Background(), "t2", "先调个不存在的工具再调 echo", "")
+	res, err := ag.Run(context.Background(), "t2", "先调个不存在的工具再调 echo", "", "")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -160,7 +161,7 @@ func TestRunMaxIterations(t *testing.T) {
 		`{"action":"tool","tool_id":"test-echo","inputs":["x"]}`,
 	}))
 	ag.MaxIter = 2
-	res, err := ag.Run(context.Background(), "t3", "一直调工具不交活", "")
+	res, err := ag.Run(context.Background(), "t3", "一直调工具不交活", "", "")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -174,11 +175,56 @@ func TestRunNoOutputCountsAsFailure(t *testing.T) {
 		`{"action":"tool","tool_id":"test-true","inputs":[]}`,
 		`{"action":"answer","text":"true 没输出"}`,
 	}))
-	res, err := ag.Run(context.Background(), "t4", "调 true（exit 0 但无输出）", "")
+	res, err := ag.Run(context.Background(), "t4", "调 true（exit 0 但无输出）", "", "")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if res.Status != "done" || res.CompletedSteps != 0 {
 		t.Fatalf("无输出的成功不应计入完成步数，实为 status=%s steps=%d", res.Status, res.CompletedSteps)
+	}
+}
+
+// 两次都不是合法 JSON 时，把原话当答案收下（不丢掉已调查的成果），交给监工去审。
+func TestRunNonJSONTreatedAsAnswer(t *testing.T) {
+	ag := newTestAgent(t, stubSeq([]string{
+		`{"action":"tool","tool_id":"test-echo","inputs":["hello"]}`,
+		`<p>这是直接输出的答案，不是 JSON</p>`,
+		`<p>这是直接输出的答案，不是 JSON</p>`,
+	}))
+	res, err := ag.Run(context.Background(), "t6", "调 echo 然后直接给答案", "", "")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Status != "done" {
+		t.Fatalf("非 JSON 答案应被收下并 done，实为 status=%s", res.Status)
+	}
+	if !strings.Contains(res.ReplyDraft, "直接输出的答案") {
+		t.Fatalf("回复应含模型原话，实为 %q", res.ReplyDraft)
+	}
+}
+
+// 熔断后缺交付报告时，要综合一份 report.md 出来，不能只回步骤汇总。
+func TestRunMaxIterationsSynthesizesReport(t *testing.T) {
+	ag := newTestAgent(t, stubSeq([]string{
+		`{"action":"tool","tool_id":"cap-ops-echo","inputs":["hello"]}`,
+		`{"action":"tool","tool_id":"cap-ops-echo","inputs":["world"]}`,
+		"# 综合报告\n\n这是综合出来的分析结论。",
+	}))
+	ag.MaxIter = 2
+	res, err := ag.Run(context.Background(), "t5", "调查一个东西", "", "")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Status != "done" {
+		t.Fatalf("综合出报告后应为 done，实为 status=%s", res.Status)
+	}
+	if !strings.Contains(res.ReplyDraft, "综合报告") {
+		t.Fatalf("回复应为综合报告，实为 %q", res.ReplyDraft)
+	}
+	if b, err := os.ReadFile(filepath.Join(ag.DataDir, "workspace", "t5", "report.md")); err != nil || !strings.Contains(string(b), "综合报告") {
+		t.Fatalf("workspace/t5/report.md 应含综合报告：%v %q", err, string(b))
+	}
+	if b, err := os.ReadFile(filepath.Join(ag.DataDir, "artifacts", "t5", "reply.md")); err != nil || !strings.Contains(string(b), "综合报告") {
+		t.Fatalf("artifacts/t5/reply.md 应含综合报告：%v %q", err, string(b))
 	}
 }
