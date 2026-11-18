@@ -97,7 +97,7 @@ const agentPromptHead = `你是 007 超级 Agent。按二号的办法做事：�
 - 第一级（下面只列 9 个大类）：先定大类。不知道用哪个大类，就挑最可能的一个展开看看。
 - 第二级：expand 某大类后，看到它下面的子类（每个一句话说明）与该大类的完整说明，再挑一个子类展开。
 - 第三级：expand 某子类后，看到它下面的工具（每个有完整英文描述），再挑一个工具调。
-- 展开（expand）只是导航，不算干活、不花钱；调工具（tool）才真正干活。展开后看到的列表会出现在“已跑步骤”里，接着挑就行。
+- 展开（expand）只是导航，不算干活、不花钱；调工具（tool）才真正干活。展开后看到的列表只在下一轮出现一次，接着挑就行；之后“已跑步骤”里只留一行摘要（带工具 ID），忘了描述可以重新展开。
 - 已经知道 tool_id 时不用展开，直接调工具。
 规则：
 - 记忆优先：如果下面“相关记忆摘要”里已经有这道题的答案或关键结论（比如 wiki 里有现成的逆向方案、踩过的坑），优先用它，只补必要的验证，不要从零重新推导。记忆里有的结论直接引用，不用再去现查；
@@ -213,7 +213,10 @@ func (a *Agent) toolList(category, subcategory string) (string, error) {
 }
 
 // buildTail 拼当轮尾巴：任务 + 记忆摘要 + 监工反馈（如有） + 已跑步骤的结果。
-func buildTail(taskText, memSummary, feedback string, history []stepRecord) string {
+// pendingListing 是上一轮刚展开的完整列表（只展示一次）：模型展开后需要
+// 在下一轮看到完整描述才能挑工具，但列表不进 history 全文——history 里
+// 只留一行带 ID 的摘要，否则每轮都把几千字的列表重发一遍，提示词爆炸。
+func buildTail(taskText, memSummary, feedback string, history []stepRecord, pendingListing string) string {
 	var b strings.Builder
 	b.WriteString("任务：")
 	b.WriteString(taskText)
@@ -239,8 +242,38 @@ func buildTail(taskText, memSummary, feedback string, history []stepRecord) stri
 	} else {
 		b.WriteString("还没跑过任何工具。\n")
 	}
+	if pendingListing != "" {
+		b.WriteString("刚展开的列表（只看这一次，挑一个工具调或继续展开）：\n")
+		b.WriteString(pendingListing)
+		b.WriteString("\n")
+	}
 	b.WriteString("下一步只输出一个 JSON 对象。")
 	return b.String()
+}
+
+// expandSummary 给展开步骤在 history 里留一行摘要：只记展开了什么、
+// 看到了哪些 ID，不贴完整描述。模型已经在展开后的那轮看过完整列表，
+// 之后凭 ID 就能调工具，不需要每轮重看描述。
+func (a *Agent) expandSummary(category, subcategory string) string {
+	if subcategory == "" {
+		subs := a.Reg.SubcategoriesOf(category)
+		ids := make([]string, 0, len(subs))
+		for _, s := range subs {
+			ids = append(ids, s.ID)
+		}
+		return fmt.Sprintf("展开 %s：子类 %s（共 %d 个）", category, strings.Join(ids, "、"), len(ids))
+	}
+	var ids []string
+	for _, e := range a.Reg.EntriesByCategory(category) {
+		if e.Subcategory != subcategory {
+			continue
+		}
+		if !e.Available || !e.Executable() || a.Reg.ProbeFailed(e.ToolID) {
+			continue
+		}
+		ids = append(ids, e.ToolID)
+	}
+	return fmt.Sprintf("展开 %s/%s：工具 %s（共 %d 个）", category, subcategory, strings.Join(ids, "、"), len(ids))
 }
 
 // synthesizePromptHead 是综合撰稿的冻结提示词：只写结论和分析，不写执行日志。
@@ -362,6 +395,9 @@ func (a *Agent) Run(ctx context.Context, taskID, taskText, memSummary, feedback 
 	frozen := agentPromptHead + a.categoryList()
 	history := []stepRecord{}
 	completed := 0
+	// pendingListing：上一轮刚展开的完整列表，只在下一轮的尾巴里出现一次。
+	// 模型看过就能挑工具，之后 history 里只留一行带 ID 的摘要，不再重发全文。
+	pendingListing := ""
 	for iter := 1; iter <= maxIter; iter++ {
 		// 时间护栏：到预算就停下来综合已有成果，不让开放式任务无限烧下去。
 		if time.Since(start) > budget {
@@ -374,14 +410,16 @@ func (a *Agent) Run(ctx context.Context, taskID, taskText, memSummary, feedback 
 			log.Printf("agent task=%s 卡住：连续 %d 轮失败，停下来综合", taskID, MaxConsecutiveFailures)
 			break
 		}
-		reply, _, _, err := a.Call(taskID, frozen, buildTail(taskText, memSummary, feedback, history))
+		tail := buildTail(taskText, memSummary, feedback, history, pendingListing)
+		pendingListing = "" // 列表只展示一次：本轮看过后就清掉，不再进下一轮
+		reply, _, _, err := a.Call(taskID, frozen, tail)
 		if err != nil {
 			return nil, fmt.Errorf("agent: 第 %d 轮模型调用失败: %w", iter, err)
 		}
 		act, perr := parseAction(reply)
 		if perr != nil {
 			// 坏 JSON 重试一次：把“只返回 JSON”追加进尾巴再调。
-			retry, _, _, rerr := a.Call(taskID, frozen, buildTail(taskText, memSummary, feedback, history)+"\n注意：上一轮回复不是合法 JSON，只返回 JSON 对象，不要加任何解释文字。")
+			retry, _, _, rerr := a.Call(taskID, frozen, tail+"\n注意：上一轮回复不是合法 JSON，只返回 JSON 对象，不要加任何解释文字。")
 			if rerr != nil {
 				return nil, fmt.Errorf("agent: 第 %d 轮模型调用失败: %w", iter, rerr)
 			}
@@ -428,7 +466,8 @@ func (a *Agent) Run(ctx context.Context, taskID, taskText, memSummary, feedback 
 				history = append(history, stepRecord{ToolID: "expand", Inputs: []string{act.Category, act.Subcategory}, ExitCode: -1, Status: "expand_error", Output: "展开失败：" + err.Error()})
 				continue
 			}
-			history = append(history, stepRecord{ToolID: "expand", Inputs: []string{act.Category, act.Subcategory}, ExitCode: 0, Status: "success", Output: listing})
+			history = append(history, stepRecord{ToolID: "expand", Inputs: []string{act.Category, act.Subcategory}, ExitCode: 0, Status: "success", Output: a.expandSummary(act.Category, act.Subcategory)})
+			pendingListing = listing // 完整列表只在下一轮展示一次，之后只留摘要
 			continue
 		}
 		// 调工具：先过代码层可调用性，再拼参数，再执行。

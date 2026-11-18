@@ -323,3 +323,52 @@ func TestParseActionExpand(t *testing.T) {
 		t.Fatal("expand 缺 category 应报错")
 	}
 }
+
+// 展开列表只展示一次：展开后的下一轮能看到完整列表，再往后只留摘要。
+// 否则每轮都把几千字的列表重发一遍，提示词爆炸（2026-11-18 实测：
+// 同类比标题任务提示词 16,280 → 168,774 token，主因就是列表在 history 里全文累积）。
+func TestExpandListingShownOnce(t *testing.T) {
+	var tails []string
+	call := func(taskID, frozen, tail string) (string, int64, int64, error) {
+		tails = append(tails, tail)
+		switch len(tails) {
+		case 1:
+			return `{"action":"expand","category":"ops"}`, 100, 20, nil
+		case 2:
+			return `{"action":"expand","category":"ops","subcategory":"shell"}`, 100, 20, nil
+		case 3:
+			return `{"action":"tool","tool_id":"test-echo","inputs":["hi"]}`, 100, 20, nil
+		default:
+			return `{"action":"answer","text":"好了"}`, 100, 20, nil
+		}
+	}
+	ag := newTestAgent(t, call)
+	res, err := ag.Run(context.Background(), "t11", "跑个 echo", "", "")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Status != "done" {
+		t.Fatalf("Status=%s, want done", res.Status)
+	}
+	if len(tails) < 4 {
+		t.Fatalf("只收到 %d 轮尾巴，want >= 4", len(tails))
+	}
+	// 第 2 轮：大类说明出现一次。
+	if !strings.Contains(tails[1], "Operations tools for tests") {
+		t.Fatal("第 2 轮尾巴应含展开的大类说明")
+	}
+	// 第 3 轮：大类说明已消失，工具列表出现一次。
+	if strings.Contains(tails[2], "Operations tools for tests") {
+		t.Fatal("第 3 轮尾巴不应再出现大类说明")
+	}
+	if !strings.Contains(tails[2], "test-echo 占位") {
+		t.Fatal("第 3 轮尾巴应含展开的工具列表")
+	}
+	// 第 4 轮：工具列表也消失，只剩带 ID 的摘要。
+	if strings.Contains(tails[3], "test-echo 占位") {
+		t.Fatal("第 4 轮尾巴不应再出现工具列表")
+	}
+	if !strings.Contains(tails[3], "展开 ops/shell") {
+		t.Fatal("第 4 轮尾巴应保留展开摘要")
+	}
+}
