@@ -96,6 +96,61 @@ func TestRecallTopKAndTruncation(t *testing.T) {
 	}
 }
 
+// 3b. L3 参考（二号记忆文件）参与检索：回 reference 源，文本取 ## 内容 节。
+func TestRecallReferenceContent(t *testing.T) {
+	st := openTest(t)
+	refDir := filepath.Join(st.root, "reference", "agent", "lessons")
+	if err := os.MkdirAll(refDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll reference: %v", err)
+	}
+	body := "# [候选] 抓验证页教训\n\n## 来源\n- **日期**: 2026-11-18\n\n## 内容\n抓验证页要用反检测浏览器，普通 curl 只回空壳。\n\n## 状态\n- **状态**: active\n"
+	if err := os.WriteFile(filepath.Join(refDir, "lesson-test.md"), []byte(body), 0o644); err != nil {
+		t.Fatalf("WriteFile reference: %v", err)
+	}
+	res, err := st.Recall("验证页反检测浏览器")
+	if err != nil {
+		t.Fatalf("Recall: %v", err)
+	}
+	found := false
+	for _, r := range res {
+		if strings.HasPrefix(r.Source, "reference/") {
+			found = true
+			if !strings.Contains(r.Text, "反检测浏览器") {
+				t.Fatalf("reference 文本应取 ## 内容 节，实为 %q", r.Text)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("应返回 reference 源，实为 %v", res)
+	}
+}
+
+// 3c. 无 Summary 行 / 无 ## 内容 节的高分命中，展示文本兜底取正文前几行，不回空。
+func TestRecallFallbackText(t *testing.T) {
+	st := openTest(t)
+	refDir := filepath.Join(st.root, "reference", "protocols")
+	if err := os.MkdirAll(refDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll reference: %v", err)
+	}
+	body := "# 验证规则\n\n本文件规定验证页兜底流程，普通抓取失败时换反检测浏览器。\n"
+	if err := os.WriteFile(filepath.Join(refDir, "rules-test.md"), []byte(body), 0o644); err != nil {
+		t.Fatalf("WriteFile reference: %v", err)
+	}
+	res, err := st.Recall("验证页兜底流程")
+	if err != nil {
+		t.Fatalf("Recall: %v", err)
+	}
+	if len(res) == 0 {
+		t.Fatalf("应返回命中，实为 0")
+	}
+	if res[0].Text == "" {
+		t.Fatalf("高分命中不应回空文本（%s）", res[0].Source)
+	}
+	if !strings.Contains(res[0].Text, "反检测浏览器") {
+		t.Fatalf("兜底文本应含正文内容，实为 %q", res[0].Text)
+	}
+}
+
 // 4. 换页摘要 ≤6000 字符，页链只留最近 8 条。
 func TestRolloverCapAndChain(t *testing.T) {
 	st := openTest(t)

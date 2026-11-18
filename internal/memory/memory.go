@@ -256,7 +256,50 @@ func score(content string, kws []string) int {
 	return n
 }
 
-// Recall 混合检索：词法必查 L1 与 Wiki；语义已注入时合并（同源取
+// firstBodyText 是展示文本的兜底：没有 Summary 行、也没有 ## 内容 节时，
+// 取正文前几行有意义的文字（跳过标题行与空行），避免高分命中回空文本。
+func firstBodyText(data string) string {
+	var b strings.Builder
+	for _, ln := range strings.Split(data, "\n") {
+		ln = strings.TrimSpace(ln)
+		if ln == "" || strings.HasPrefix(ln, "#") {
+			continue
+		}
+		b.WriteString(ln)
+		b.WriteString(" ")
+		if len([]rune(b.String())) >= MaxResultRunes {
+			break
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
+// contentSection 取二号 L3 参考文件的 ## 内容 节（到下一个 ## 标题为止）。
+// 没有该节时返回空串，调用方只用它做展示文本，计分仍按全文。
+func contentSection(data string) string {
+	lines := strings.Split(data, "\n")
+	start := -1
+	for i, ln := range lines {
+		if strings.HasPrefix(ln, "## 内容") {
+			start = i + 1
+			break
+		}
+	}
+	if start < 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, ln := range lines[start:] {
+		if strings.HasPrefix(ln, "## ") {
+			break
+		}
+		b.WriteString(ln)
+		b.WriteString("\n")
+	}
+	return strings.TrimSpace(b.String())
+}
+
+// Recall 混合检索：词法必查 L1、Wiki 与 L3 参考（二号记忆文件）；语义已注入时合并（同源取
 // 最高分），未注入时只用词法。结果按分数降序取前 3 条，每条 ≤240 字符。
 func (s *Store) Recall(query string) ([]Result, error) {
 	kws := keywords(query)
@@ -281,6 +324,9 @@ func (s *Store) Recall(query string) ([]Result, error) {
 				summary = strings.TrimSpace(strings.TrimPrefix(line, "Summary:"))
 				break
 			}
+		}
+		if summary == "" {
+			summary = firstBodyText(string(data))
 		}
 		if sc := score(string(data), kws); sc > 0 {
 			rel, _ := filepath.Rel(s.root, path)
@@ -311,6 +357,30 @@ func (s *Store) Recall(query string) ([]Result, error) {
 			}
 		}
 	}
+
+	// 词法：L3 参考（二号记忆文件，按分类保存）：读 ## 内容 节。
+	refRoot := filepath.Join(s.root, "reference")
+	_ = filepath.WalkDir(refRoot, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(path, ".md") {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+		if sc := score(string(data), kws); sc > 0 {
+			rel, _ := filepath.Rel(s.root, path)
+			rel = strings.TrimSuffix(rel, ".md")
+			text := contentSection(string(data))
+			if text == "" {
+				text = firstBodyText(string(data))
+			}
+			if old, ok := bySource[rel]; !ok || sc > old.Score {
+				bySource[rel] = Result{Source: rel, Text: truncateRunes(text, MaxResultRunes), Score: sc}
+			}
+		}
+		return nil
+	})
 
 	// 语义：已注入才合并，未注入不伪造。
 	if s.semantic != nil {
