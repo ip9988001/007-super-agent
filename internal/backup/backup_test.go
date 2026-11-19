@@ -15,18 +15,40 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// fakeGit 是测试用的 git 假实现：按 handler 决定每次调用的返回，并记下调用顺序。
+// fakeGit 是测试用的 git 假实现：按 handler 决定每次调用的返回，并记下调用顺序
+// 与每次调用拿到的 env（供断言 pull/push 是否带上 askpass 认证环境）。
 type fakeGit struct {
 	calls   []string
+	envs    [][]string
 	handler func(args []string) (string, error)
 }
 
-func (f *fakeGit) run(_ context.Context, _ string, args []string, _ []string) (string, error) {
+func (f *fakeGit) run(_ context.Context, _ string, args []string, env []string) (string, error) {
 	f.calls = append(f.calls, strings.Join(args, " "))
+	f.envs = append(f.envs, env)
 	if f.handler != nil {
 		return f.handler(args)
 	}
 	return "", nil
+}
+
+// envFor 返回第一次调用中命令包含 substr 那次拿到的 env（没有则返回 nil）。
+func (f *fakeGit) envFor(substr string) []string {
+	for i, c := range f.calls {
+		if strings.Contains(c, substr) {
+			return f.envs[i]
+		}
+	}
+	return nil
+}
+
+func envHas(env []string, prefix string) bool {
+	for _, e := range env {
+		if strings.HasPrefix(e, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func (f *fakeGit) has(substr string) bool {
@@ -327,6 +349,54 @@ func TestPullRunsBeforePushWhenUpstreamExists(t *testing.T) {
 	}
 	if pullIdx < 0 || pushIdx < 0 || pullIdx > pushIdx {
 		t.Fatalf("有上游时 pull 必须在 push 之前，调用：%v", fg.calls)
+	}
+}
+
+// TestPullGetsAskpassEnvForHTTPRemote：回归测试——HTTP 私密远端时，pull 与 push
+// 都必须拿到 askpass 认证环境。第 15 步原版只给 push 配了 askpass，pull 是裸调，
+// 2026-11-19 在测试机 main 分支上实测失败：
+// "could not read Username for 'https://github.com'"。
+func TestPullGetsAskpassEnvForHTTPRemote(t *testing.T) {
+	t.Setenv("GITHUB_API_TOKEN", "SECRET-TOKEN-123")
+	led, _ := testLedger(t)
+	fg := fakeRunEnv(0)
+	// HTTP 私密远端（与默认仓库名一致）+ 有上游，pull 必须跑。
+	orig := fg.handler
+	fg.handler = func(args []string) (string, error) {
+		if args[0] == "remote" {
+			return "https://github.com/ip9988001/super-agent-007.git\n", nil
+		}
+		if args[0] == "rev-parse" && len(args) > 2 && args[2] == "--symbolic-full-name" {
+			return "origin/main\n", nil
+		}
+		return orig(args)
+	}
+	memRoot := testMemoryRoot(t)
+	dataDir := filepath.Dir(memRoot)
+	repoDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repoDir, ".git"), 0o700); err != nil {
+		t.Fatalf("mkdir .git: %v", err)
+	}
+	// 不开 AllowLocalRemote，走真实 HTTP 远端路径。
+	r := NewRunner(Config{Enabled: true, DataDir: dataDir, RepoDir: repoDir}, led)
+	r.git = fg
+	res, err := r.Run(context.Background(), "2026-11-17")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !res.Committed {
+		t.Fatalf("期望 Committed，得 %+v", res)
+	}
+	pullEnv := fg.envFor("pull --rebase --autostash")
+	if !envHas(pullEnv, "GIT_ASKPASS=") {
+		t.Fatalf("pull 必须带 GIT_ASKPASS")
+	}
+	if !envHas(pullEnv, "SUPER_AGENT_GIT_TOKEN=") {
+		t.Fatalf("pull 必须带 SUPER_AGENT_GIT_TOKEN")
+	}
+	pushEnv := fg.envFor("push origin main")
+	if !envHas(pushEnv, "GIT_ASKPASS=") {
+		t.Fatalf("push 必须带 GIT_ASKPASS")
 	}
 }
 

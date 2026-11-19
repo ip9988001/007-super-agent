@@ -417,19 +417,30 @@ func writeAskpass() (string, error) {
 	return f.Name(), nil
 }
 
-// pushWithRetry 推送一次，失败隔 10 秒重试 1 次（第 4 点）。
-func (r *Runner) pushWithRetry(ctx context.Context, repoDir, branch, token string, isHTTP bool) error {
-	env := []string{"GIT_TERMINAL_PROMPT=0"}
-	var askpass string
-	var err error
-	if isHTTP {
-		askpass, err = writeAskpass()
-		if err != nil {
-			return err
-		}
-		defer os.Remove(askpass)
-		env = append(env, "GIT_ASKPASS="+askpass, "SUPER_AGENT_GIT_TOKEN="+token)
+// authEnv 为 git 认证准备环境：HTTP 远端时建临时 GIT_ASKPASS 脚本（只 echo
+// 环境变量，本身不含 Token 值）并返回 env + 清理函数；非 HTTP 远端只返回
+// GIT_TERMINAL_PROMPT=0。pull 与 push 都必须走这套 env——pull 若无 askpass，
+// 私有库 HTTPS 远端会因读不到用户名而失败（第 15 步漏了 pull 的认证，
+// 2026-11-19 实测：git pull --rebase 在 main 分支上报
+// "could not read Username for 'https://github.com'"）。
+func (r *Runner) authEnv(token string, isHTTP bool) (env []string, cleanup func(), err error) {
+	env = []string{"GIT_TERMINAL_PROMPT=0"}
+	cleanup = func() {}
+	if !isHTTP {
+		return env, cleanup, nil
 	}
+	askpass, err := writeAskpass()
+	if err != nil {
+		return nil, nil, err
+	}
+	cleanup = func() { os.Remove(askpass) }
+	env = append(env, "GIT_ASKPASS="+askpass, "SUPER_AGENT_GIT_TOKEN="+token)
+	return env, cleanup, nil
+}
+
+// pushWithRetry 推送一次，失败隔 10 秒重试 1 次（第 4 点）。
+// env 是 authEnv 给的认证环境（含临时 askpass，HTTP 远端才有）。
+func (r *Runner) pushWithRetry(ctx context.Context, repoDir, branch string, env []string) error {
 	var lastErr error
 	for attempt := 1; attempt <= MaxPushAttempts; attempt++ {
 		_, err := r.git.run(ctx, repoDir, []string{"push", "origin", branch}, env)
@@ -508,12 +519,18 @@ func (r *Runner) Run(ctx context.Context, date string) (Result, error) {
 		return r.fail(date, "git commit 失败", err)
 	}
 	// 第 3 点：推送前固定先拉齐历史（有上游才拉；新库无上游时跳过）。
+	// pull 与 push 共用一套认证 env（HTTP 远端需 askpass；见 authEnv）。
+	env, cleanup, err := r.authEnv(token, isHTTP)
+	if err != nil {
+		return r.fail(date, "建 git 认证失败", err)
+	}
+	defer cleanup()
 	if r.hasUpstream(ctx, repoDir) {
-		if _, err := r.git.run(ctx, repoDir, []string{"pull", "--rebase", "--autostash"}, nil); err != nil {
+		if _, err := r.git.run(ctx, repoDir, []string{"pull", "--rebase", "--autostash"}, env); err != nil {
 			return r.fail(date, "git pull --rebase 失败（本地提交已保留，下次再推）", err)
 		}
 	}
-	if err := r.pushWithRetry(ctx, repoDir, branch, token, isHTTP); err != nil {
+	if err := r.pushWithRetry(ctx, repoDir, branch, env); err != nil {
 		return r.fail(date, "git push 失败", err)
 	}
 	r.record(date, 0, fmt.Sprintf("committed files=%d branch=%s", n, branch))
