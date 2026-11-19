@@ -41,7 +41,11 @@ func (stubRunner) Run(req executor.RunRequest) (*executor.Result, *executor.Hand
 	out, err := cmd.Output()
 	res := &executor.Result{
 		TaskID: req.TaskID, SessionID: req.SessionID, ToolID: req.ToolID,
-		Command: strings.Join(argv, " "), StdoutTail: string(out),
+		// 按生产行为：StdoutTail 只留末尾 20 行，完整输出进 StdoutFull
+		//（2026-11-19 缺口 1 教训：桩此前把全量输出塞进 StdoutTail，
+		// 掩盖了 runTests 用尾巴匹配早期断言的 harness 缺陷）。
+		Command: strings.Join(argv, " "), StdoutTail: stubLastLines(string(out), 20),
+		StdoutFull: string(out),
 	}
 	if err != nil {
 		res.ExitCode = 1
@@ -49,6 +53,7 @@ func (stubRunner) Run(req executor.RunRequest) (*executor.Result, *executor.Hand
 		if ee, ok := err.(*exec.ExitError); ok {
 			res.ExitCode = ee.ExitCode()
 			res.ErrHead = string(ee.Stderr)
+			res.StderrFull = string(ee.Stderr)
 		} else {
 			res.ErrHead = err.Error()
 		}
@@ -57,6 +62,16 @@ func (stubRunner) Run(req executor.RunRequest) (*executor.Result, *executor.Hand
 		res.Status = "success"
 	}
 	return res, nil, nil
+}
+
+// stubLastLines 是测试桩用的末尾 N 行截取（与 executor.lastLines 同义）。
+func stubLastLines(s string, n int) string {
+	s = strings.TrimSuffix(s, "\n")
+	lines := strings.Split(s, "\n")
+	if len(lines) <= n {
+		return s
+	}
+	return strings.Join(lines[len(lines)-n:], "\n")
 }
 
 // stubModel 按冻结提示词里的角色词返回固定 JSON。
@@ -598,5 +613,99 @@ func TestParseBlueprintArrayFields(t *testing.T) {
 	}
 	if bp.SafetyChecks != "no network\nno writes" {
 		t.Fatalf("safety_checks 数组未拼接：%q", bp.SafetyChecks)
+	}
+}
+
+func TestTestReviewBody_CompactAndComplete(t *testing.T) {
+	// 2026-11-19 缺口 1 实测：test-result.md 全文送审被监工证据截断，
+	// 只剩第 1 条用例可见，监工按假测试铁律连打回 3 次驳回缺口。
+	// 紧凑审阅体必须塞进 400 token（≈667 rune）截断窗口，且逐条
+	// 断言行一个不少。
+	tr := &retrieval.Trace{
+		GapID:        "gap-2026-11-19-001",
+		Layer0Detail: "注册表 84 条：最高重叠 1 个关键词（cap-fetch-agent-reach），无 ≥2 命中；隔离/弃用记录 0 条：无 ≥2 命中",
+		Rounds: []retrieval.SearchRound{
+			{Query: "todo markdown json converter language:python", Page: 1, Ecosystem: "python"},
+			{Query: "todo markdown json converter language:javascript", Page: 1, Ecosystem: "javascript", Reason: "OFF_TOPIC"},
+			{Query: "todo markdown json converter language:go", Page: 1, Ecosystem: "go", Reason: "OFF_TOPIC"},
+		},
+		SearchesUsed: 3, CoreUsed: 0, Outcome: "exhausted",
+	}
+	verdicts := []testVerdict{
+		{Name: "正常：扫描单个 todo.md 输出任务 JSON", ExitCode: 0, Expect: `"tasks": 6`, Passed: true, Matched: true},
+		{Name: "正常：--compact 输出紧凑 JSON", ExitCode: 0, Expect: `"checked":true`, Passed: true, Matched: true},
+		{Name: "边界：空 Markdown 文件任务数为 0", ExitCode: 0, Expect: `"tasks": 0`, Passed: true, Matched: true},
+		{Name: "边界：代码围栏内的伪复选框被跳过", ExitCode: 0, Expect: `"tasks": 2`, Passed: true, Matched: true},
+		{Name: "失败：输入路径不存在", ExitCode: 2, Expect: "error: path not found", ExpectFail: true, Passed: true, Matched: true},
+	}
+	body := testReviewBody(tr, "自造依据：3 次搜索无合格候选（候选 0 个，覆盖 0%<80%），故自造；自造零上游代码，无胶水/许可/非公开接口问题。约束：脚本只用标准库、离线跑，解析库须安装、不在采用之列。", verdicts)
+	if n := len([]rune(body)); n > 720 {
+		t.Fatalf("审阅体 %d rune，超出 720 上限（监工截断窗口），全文：\n%s", n, body)
+	}
+	// 关键内容必须全在前 660 rune 内（截断只吃得到尾巴的证据行）。
+	head := string([]rune(body)[:min(660, len([]rune(body)))])
+	for _, v := range verdicts {
+		if !strings.Contains(head, v.Name) {
+			t.Fatalf("前 660 rune 缺用例名 %q", v.Name)
+		}
+		if !strings.Contains(head, v.Expect) {
+			t.Fatalf("前 660 rune 缺断言 %q", v.Expect)
+		}
+	}
+	for _, want := range []string{"查询基", "后缀：python | javascript | go", "top10=0", "回退反证", "共5条，通过5条"} {
+		if !strings.Contains(head, want) {
+			t.Fatalf("前 660 rune 缺 %q，全文：\n%s", want, body)
+		}
+	}
+	if !strings.Contains(body, "git_diff 不适用") {
+		t.Fatalf("审阅体缺 git_diff 说明，全文：\n%s", body)
+	}
+	// 超长输入也不得砍逐条核验行：查询词行应先被砍。
+	long := *tr
+	long.Rounds = []retrieval.SearchRound{
+		{Query: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Ecosystem: "python"},
+		{Query: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Ecosystem: "javascript"},
+		{Query: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", Ecosystem: "go"},
+	}
+	body2 := testReviewBody(&long, "自造依据：无候选。", verdicts)
+	if n := len([]rune(body2)); n > 720 {
+		t.Fatalf("超长输入下审阅体 %d rune，仍超出 720 上限", n)
+	}
+	head2 := string([]rune(body2)[:min(660, len([]rune(body2)))])
+	for _, v := range verdicts {
+		if !strings.Contains(head2, v.Name) || !strings.Contains(head2, v.Expect) {
+			t.Fatalf("超长输入下前 660 rune 缺逐条核验行：%q", v.Name)
+		}
+	}
+}
+
+func TestRunTestsMatchesEarlyStdout(t *testing.T) {
+	// 2026-11-19 缺口 1 教训：runTests 用 StdoutTail（末尾 20 行）匹配
+	// expect_contains，脚本输出 pretty-JSON 时 `"item_count": 5` 在第 4 行，
+	// 断言在正确输出上必然失败，修理工两轮修不好。匹配须用完整输出。
+	p, store, _, _ := newTestPipeline(t, emptySearchMock())
+	gap := writeTestGap(t, store, "convert foo files to bar format", "no_tool")
+	stageDir := t.TempDir()
+	script := "import sys\nfor i in range(1, 31):\n    print('line %d MARKER-NEEDLE-123' % i if i == 2 else 'line %d' % i)\n"
+	if err := os.WriteFile(filepath.Join(stageDir, "tool.py"), []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	plan := &TestPlan{Tests: []TestCase{
+		{Name: "正常：早期行断言", Argv: []string{"python3", "tool.py"}, ExpectContains: "MARKER-NEEDLE-123"},
+		{Name: "边界：尾部行断言", Argv: []string{"python3", "tool.py"}, ExpectContains: "line 30"},
+	}}
+	md, verdicts, err := p.runTests(context.Background(), "forge-test", gap, stageDir, "tool.py", plan, false)
+	if err != nil {
+		t.Fatalf("runTests 应通过（断言在完整输出里），得到：%v\n%s", err, md)
+	}
+	if len(verdicts) != 2 || !verdicts[0].Matched || !verdicts[1].Matched {
+		t.Fatalf("verdicts 应全命中：%+v", verdicts)
+	}
+	// 反例：不存在的子串仍须失败。
+	plan2 := &TestPlan{Tests: []TestCase{
+		{Name: "失败：子串不存在", Argv: []string{"python3", "tool.py"}, ExpectContains: "NO-SUCH-MARKER"},
+	}}
+	if _, _, err := p.runTests(context.Background(), "forge-test", gap, stageDir, "tool.py", plan2, false); err == nil {
+		t.Fatalf("不存在的子串应判失败")
 	}
 }

@@ -309,7 +309,7 @@ func (p *Pipeline) tryRevive(ctx context.Context, tr TrialState) error {
 	}
 	taskID := p.ForgeTaskID()
 	entryName := filepath.Base(tr.Entry.EntryPoint)
-	resultMD, rerr := p.runTests(ctx, taskID, gap, stageDir, entryName, &plan, true)
+	resultMD, _, rerr := p.runTests(ctx, taskID, gap, stageDir, entryName, &plan, true)
 	if rerr != nil {
 		return p.deprecate(ctx, tr, fmt.Sprintf("复活重测未通过：%v\n%s", rerr, resultMD))
 	}

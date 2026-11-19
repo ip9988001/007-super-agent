@@ -191,7 +191,7 @@ func (p *Pipeline) adoptOrWrap(ctx context.Context, taskID string, gap Gap, tr *
 		_ = p.Store.UpdateGapStatus(gap.GapID, "pending")
 		return err
 	}
-	resultMD, err := p.runTests(ctx, taskID, gap, stageDir, plan.Entry, tests, plan.OfflineCapable)
+	resultMD, verdicts, err := p.runTests(ctx, taskID, gap, stageDir, plan.Entry, tests, plan.OfflineCapable)
 	_ = os.WriteFile(filepath.Join(stageDir, "test-result.md"), []byte(resultMD), 0o600)
 	if err != nil {
 		// 采用分支的测试失败不修上游代码：直接转自造。
@@ -204,19 +204,23 @@ func (p *Pipeline) adoptOrWrap(ctx context.Context, taskID string, gap Gap, tr *
 	}
 	_ = os.WriteFile(filepath.Join(stageDir, "test-result.md"), []byte(resultMD), 0o600)
 	// 监工审测试结果（固定第 1 检查项 + ≤2 轮打回重做；留痕前置）。
-	err = p.advisorGate(ctx, taskID, "审测试结果（采用）"+gap.GapID, "【复用检索留痕】\n"+tr.Summary()+"\n\n"+resultMD, stageDir,
+	// 送审体用紧凑版 testReviewBody（见 pipeline.go 注释：全文送审
+	// 会被监工证据截断，只剩第 1 条用例可见）。
+	adoptBasis := fmt.Sprintf("采用依据：候选 %s 覆盖%d%% 胶水%d行 许可%s；入口 %s。", decision.Candidate, decision.Coverage, decision.WrapperLines, decision.LicenseTier, plan.Entry)
+	err = p.advisorGate(ctx, taskID, "审测试结果（采用）"+gap.GapID, testReviewBody(tr, adoptBasis, verdicts), stageDir,
 		EvAdvisorTestHalt, EvAdvisorTestPass, gap.GapID, "",
 		func(note string) (string, error) {
 			t2, err := p.genTests(ctx, taskID, gap, plan.Entry, toolDesc, plan.Entry, entryContent, stageDir, replay)
 			if err != nil {
 				return "", err
 			}
-			md2, err := p.runTests(ctx, taskID, gap, stageDir, plan.Entry, t2, plan.OfflineCapable)
+			md2, v2, err := p.runTests(ctx, taskID, gap, stageDir, plan.Entry, t2, plan.OfflineCapable)
+			// 失败的测试结果也落盘，否则排障无据。
+			_ = os.WriteFile(filepath.Join(stageDir, "test-result.md"), []byte(md2), 0o600)
 			if err != nil {
 				return "", err
 			}
-			_ = os.WriteFile(filepath.Join(stageDir, "test-result.md"), []byte(md2), 0o600)
-			return md2, nil
+			return testReviewBody(tr, adoptBasis, v2), nil
 		})
 	if err != nil {
 		if errors.Is(err, errAdvisorRejected) {

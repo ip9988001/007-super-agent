@@ -435,14 +435,27 @@ func (p *Pipeline) selfBuild(ctx context.Context, taskID string, gap Gap, tr *re
 	}
 	// 跑测试；不过时模型诊断修复（脚本/测试/输入文件三选一），最多 2 轮。
 	// 失败的测试结果也落盘（排障无据是 2026-11-19 的教训）。
-	resultMD, err := p.runTestsWithFix(ctx, taskID, gap, bp, stageDir, tests)
+	resultMD, verdicts, err := p.runTestsWithFix(ctx, taskID, gap, bp, stageDir, tests)
 	_ = os.WriteFile(filepath.Join(stageDir, "test-result.md"), []byte(resultMD), 0o600)
 	if err != nil {
 		_ = p.Store.UpdateGapStatus(gap.GapID, "pending")
 		return err
 	}
 	// 监工审测试结果（固定第 1 检查项 + ≤2 轮打回重做；留痕前置）。
-	err = p.advisorGate(ctx, taskID, "审测试结果 "+bp.ID, "【复用检索留痕】\n"+tr.Summary()+"\n\n"+resultMD, stageDir,
+	// 送审体用紧凑版 testReviewBody，不直接送 test-result.md 全文——
+	// 见 testReviewBody 注释（2026-11-19 缺口 1 教训）。
+	basis := ""
+	// 约束行：监工 2026-11-19 曾要求采用 markdown-it-py 等解析库，
+	// 但规格 §5 要求脚本只用标准库、离线可跑——解析库须安装、不在
+	// 采用之列；检索找的是独立工具仓库，不是库。不写明这条，
+	// 监工会按“该采用却去自造”反复打回。
+	const forgeStdlibConstraint = "约束：脚本只用标准库、离线跑，解析库须安装、不在采用之列。"
+	if tr.Outcome == "exhausted" {
+		basis = fmt.Sprintf("自造依据：%d 次搜索无合格候选（候选 0 个，覆盖 0%%<80%%），故自造；自造零上游代码，无胶水/许可/非公开接口问题。%s", tr.SearchesUsed, forgeStdlibConstraint)
+	} else if decision != nil {
+		basis = "分流结论：自造——" + decision.Reason + forgeStdlibConstraint
+	}
+	err = p.advisorGate(ctx, taskID, "审测试结果 "+bp.ID, testReviewBody(tr, basis, verdicts), stageDir,
 		EvAdvisorTestHalt, EvAdvisorTestPass, gap.GapID, bp.ID,
 		func(note string) (string, error) {
 			// 打回重做：重新生成测试用例并重跑。
@@ -450,12 +463,13 @@ func (p *Pipeline) selfBuild(ctx context.Context, taskID string, gap Gap, tr *re
 			if err != nil {
 				return "", err
 			}
-			md2, err := p.runTestsWithFix(ctx, taskID, gap, bp, stageDir, t2)
+			md2, v2, err := p.runTestsWithFix(ctx, taskID, gap, bp, stageDir, t2)
+			// 失败的测试结果也落盘（与主流程一致），否则排障无据。
+			_ = os.WriteFile(filepath.Join(stageDir, "test-result.md"), []byte(md2), 0o600)
 			if err != nil {
 				return "", err
 			}
-			_ = os.WriteFile(filepath.Join(stageDir, "test-result.md"), []byte(md2), 0o600)
-			return md2, nil
+			return testReviewBody(tr, basis, v2), nil
 		})
 	if err != nil {
 		if errors.Is(err, errAdvisorRejected) {
@@ -514,8 +528,9 @@ type blueprintExtra struct {
 // runTestsWithFix 跑测试；不过时把失败结果喂给模型诊断修复
 // （脚本错 / 测试错 / 输入文件缺失三选一，错哪边改哪边），最多 2 轮。
 // 2 轮仍不过返回错误（缺口回 pending，次日人工看）。
-func (p *Pipeline) runTestsWithFix(ctx context.Context, taskID string, gap Gap, bp *Blueprint, stageDir string, plan *TestPlan) (string, error) {
-	resultMD, err := p.runTests(ctx, taskID, gap, stageDir, bp.ScriptName, plan, true)
+// 同时返回最后一轮的逐条核验结果，供监工审测试的紧凑审阅体用。
+func (p *Pipeline) runTestsWithFix(ctx context.Context, taskID string, gap Gap, bp *Blueprint, stageDir string, plan *TestPlan) (string, []testVerdict, error) {
+	resultMD, verdicts, err := p.runTests(ctx, taskID, gap, stageDir, bp.ScriptName, plan, true)
 	for round := 0; round < 2 && err != nil; round++ {
 		var b strings.Builder
 		fmt.Fprintf(&b, "工具：%s（%s）\n缺口：%s\n", bp.Name, bp.Description, gap.TaskText)
@@ -532,11 +547,11 @@ func (p *Pipeline) runTestsWithFix(ctx context.Context, taskID string, gap Gap, 
 		fmt.Fprintf(&b, "测试失败结果：\n%s\n", resultMD)
 		reply, merr := p.callModel(ctx, taskID, fixPromptHead, b.String())
 		if merr != nil {
-			return resultMD, merr
+			return resultMD, verdicts, merr
 		}
 		fixed, ferr := ParseFixPlan(reply, bp.ScriptName)
 		if ferr != nil {
-			return resultMD, ferr
+			return resultMD, verdicts, ferr
 		}
 		bp.Script = fixed.Script
 		if fixed.ScriptName != "" {
@@ -544,14 +559,14 @@ func (p *Pipeline) runTestsWithFix(ctx context.Context, taskID string, gap Gap, 
 		}
 		scriptPath := filepath.Join(stageDir, bp.ScriptName)
 		if werr := os.WriteFile(scriptPath, []byte(bp.Script), 0o700); werr != nil {
-			return resultMD, werr
+			return resultMD, verdicts, werr
 		}
 		// 蓝图里的脚本同步更新（留痕一致）。
 		_ = p.Store.WriteBlueprint(bp)
 		plan = &TestPlan{Tests: fixed.Tests, Fixtures: fixed.Fixtures}
-		resultMD, err = p.runTests(ctx, taskID, gap, stageDir, bp.ScriptName, plan, true)
+		resultMD, verdicts, err = p.runTests(ctx, taskID, gap, stageDir, bp.ScriptName, plan, true)
 	}
-	return resultMD, err
+	return resultMD, verdicts, err
 }
 
 // replayInput 取该缺口对应的真实历史失败输入（执行账本）。
@@ -599,12 +614,13 @@ func (p *Pipeline) genTests(ctx context.Context, taskID string, gap Gap, toolNam
 	return ParseTestCases(reply, scriptName)
 }
 
-// runTests 在 staging 里跑测试用例，返回 test-result.md 全文。
+// runTests 在 staging 里跑测试用例，返回 test-result.md 全文与逐条核验
+// 结果（后者供监工审测试的紧凑审阅体用）。
 // 先写 fixtures（测试用的输入文件），再跑；argv 里与 staging 文件
 // 同名的相对路径解析成绝对路径（执行器的工作目录不是 staging，
 // 相对路径不解析就找不到文件）；offlineCapable 时用 unshare -n 断网跑
 // （离线类工具强制断网试跑）。
-func (p *Pipeline) runTests(ctx context.Context, taskID string, gap Gap, stageDir, entryName string, plan *TestPlan, offlineCapable bool) (string, error) {
+func (p *Pipeline) runTests(ctx context.Context, taskID string, gap Gap, stageDir, entryName string, plan *TestPlan, offlineCapable bool) (string, []testVerdict, error) {
 	// 测试留痕（复活重跑用）：把用例与输入文件原样存进 staging。
 	if tb, err := json.MarshalIndent(plan, "", "  "); err == nil {
 		_ = os.WriteFile(filepath.Join(stageDir, "tests.json"), append(tb, '\n'), 0o600)
@@ -613,7 +629,7 @@ func (p *Pipeline) runTests(ctx context.Context, taskID string, gap Gap, stageDi
 	for _, f := range plan.Fixtures {
 		dst := filepath.Join(stageDir, filepath.Base(f.Name))
 		if err := os.WriteFile(dst, []byte(f.Content), 0o600); err != nil {
-			return "", fmt.Errorf("forge tests %s: 写 fixture %s 失败: %w", gap.GapID, f.Name, err)
+			return "", nil, fmt.Errorf("forge tests %s: 写 fixture %s 失败: %w", gap.GapID, f.Name, err)
 		}
 	}
 	tests := plan.Tests
@@ -621,6 +637,7 @@ func (p *Pipeline) runTests(ctx context.Context, taskID string, gap Gap, stageDi
 	fmt.Fprintf(&b, "# 测试结果 %s\n\n", gap.GapID)
 	fmt.Fprintf(&b, "- 工具：%s\n- 时间：%s\n\n", entryName, p.now().UTC().Format(time.RFC3339))
 	passed := 0
+	verdicts := make([]testVerdict, 0, len(tests))
 	for i, tc := range tests {
 		argv := append([]string{}, tc.Argv...)
 		if offlineCapable {
@@ -637,12 +654,14 @@ func (p *Pipeline) runTests(ctx context.Context, taskID string, gap Gap, stageDi
 		})
 		if err != nil {
 			fmt.Fprintf(&b, "## %d. %s — FAIL\n- 命令：%v\n- 错误：%v\n\n", i+1, tc.Name, argv, err)
+			verdicts = append(verdicts, testVerdict{Name: tc.Name, ExitCode: -1, Expect: tc.ExpectContains, ExpectFail: tc.ExpectFail})
 			continue
 		}
 		if h != nil {
 			res, err = h.Wait()
 			if err != nil {
 				fmt.Fprintf(&b, "## %d. %s — FAIL\n- 命令：%v\n- 错误：%v\n\n", i+1, tc.Name, argv, err)
+				verdicts = append(verdicts, testVerdict{Name: tc.Name, ExitCode: -1, Expect: tc.ExpectContains, ExpectFail: tc.ExpectFail})
 				continue
 			}
 		}
@@ -653,7 +672,22 @@ func (p *Pipeline) runTests(ctx context.Context, taskID string, gap Gap, stageDi
 		} else {
 			ok = res.ExitCode == 0
 		}
-		if ok && tc.ExpectContains != "" && !strings.Contains(res.StdoutTail+res.ErrHead, tc.ExpectContains) {
+		// 期望子串在完整输出里找，不是在 20 行尾巴里找（2026-11-19
+		// 缺口 1 教训：脚本输出 pretty-JSON 时 `"item_count": 5` 在
+		// 第 4 行，StdoutTail 只留末尾 20 行，断言在正确输出上必然
+		// 失败，修理工两轮修不好——bug 在 harness 不在脚本。
+		// 执行器 Result 自带 StdoutFull/StderrFull（1MB 封顶）；
+		// 桩/旧调用方没填时回退到尾巴/错误头）。
+		stdout := res.StdoutFull
+		if stdout == "" {
+			stdout = res.StdoutTail
+		}
+		stderr := res.StderrFull
+		if stderr == "" {
+			stderr = res.ErrHead
+		}
+		matched := tc.ExpectContains == "" || strings.Contains(stdout+stderr, tc.ExpectContains)
+		if ok && !matched {
 			ok = false
 		}
 		status := "PASS"
@@ -662,6 +696,7 @@ func (p *Pipeline) runTests(ctx context.Context, taskID string, gap Gap, stageDi
 		} else {
 			passed++
 		}
+		verdicts = append(verdicts, testVerdict{Name: tc.Name, ExitCode: res.ExitCode, Expect: tc.ExpectContains, ExpectFail: tc.ExpectFail, Passed: ok, Matched: matched})
 		fmt.Fprintf(&b, "## %d. %s — %s\n- 命令：%v\n- 退出码：%d\n- 期望 stdout 含：%q\n- stdout 尾部：\n```\n%s\n```\n- stderr 头部：%s\n\n",
 			i+1, tc.Name, status, argv, res.ExitCode, tc.ExpectContains, res.StdoutTail, res.ErrHead)
 	}
@@ -672,14 +707,14 @@ func (p *Pipeline) runTests(ctx context.Context, taskID string, gap Gap, stageDi
 			Output: fmt.Sprintf("测试通过 %d/%d", passed, len(tests)),
 			Result: "fail",
 		})
-		return b.String(), fmt.Errorf("forge tests %s: 只通过 %d/%d", gap.GapID, passed, len(tests))
+		return b.String(), verdicts, fmt.Errorf("forge tests %s: 只通过 %d/%d", gap.GapID, passed, len(tests))
 	}
 	_ = p.Store.AppendEvent(Event{
 		Event: EvTestPass, GapID: gap.GapID,
 		Output: fmt.Sprintf("测试通过 %d/%d", passed, len(tests)),
 		Result: "ok",
 	})
-	return b.String(), nil
+	return b.String(), verdicts, nil
 }
 
 var errAdvisorRejected = errors.New("forge: 监工打回 2 轮仍未通过，驳回")
@@ -729,6 +764,158 @@ func (p *Pipeline) advisorGate(ctx context.Context, taskID, title, body, workDir
 		}
 	}
 	return errAdvisorRejected
+}
+
+// testVerdict 是一条 staging 测试用例的逐条核验结果（供监工审测试
+// 的紧凑审阅体用；完整 stdout 全文仍在 test-result.md 里）。
+type testVerdict struct {
+	Name       string
+	ExitCode   int
+	Expect     string // 期望 stdout（含）/stderr 里出现的子串；空表示只看退出码
+	ExpectFail bool
+	Passed     bool
+	Matched    bool // Expect 非空时，子串是否在 stdout+stderr 里命中
+}
+
+// testReviewBody 是监工审测试结果的精简审阅体：必须塞进监工证据
+// 的截断窗口（拟交付结论 ≤400 token ≈ 667 rune；任务与标准
+// ≤300 token ≈ 500 rune，审阅体经两处截断后仍须完整可见），
+// 否则监工看不到 2 号及以后的用例，只能凭 ledger 的退出码判。
+// 2026-11-19 缺口 1 教训：此前直接把 test-result.md 全文（含数 KB
+// JSON stdout 尾巴）送审，监工只看到第 1 条用例，其余全被截掉，
+// 又因 ledger 只记退出码、staging 未入 git 导致 git_diff 为空，
+// 监工按假测试铁律连续打回 3 次、缺口被驳回——工具本身 5/5 通过。
+// 本审阅体只放：压缩版 §2A 留痕 + 每条用例的断言行（期望子串与
+// 是否命中）+ 回退反证说明 + 证据位置，不放任何 stdout 全文。
+// 关键内容（留痕+逐条核验+回退反证）全排在前 660 rune 内，
+// 总长 ≤720 rune：万一仍超，截断只吃得到尾巴的证据行。
+// 超长时优先砍查询词行（留痕文件里有全文），逐条核验行绝不砍。
+func testReviewBody(tr *retrieval.Trace, basis string, verdicts []testVerdict) string {
+	const maxRunes = 720 // Draft 截断 ≈667 rune，关键内容须在前 660 内
+	// §2A 压缩版：结果/次数 + 第零层 + 轮次（生态+命中数）+ 候选数。
+	var trace strings.Builder
+	fmt.Fprintf(&trace, "检索：%s 搜索%d次 核心%d次 候选%d个；", tr.Outcome, tr.SearchesUsed, tr.CoreUsed, len(tr.Candidates))
+	if tr.Layer0Detail != "" {
+		fmt.Fprintf(&trace, "第零层：%s；", tr.Layer0Detail)
+	}
+	for i, r := range tr.Rounds {
+		eco := r.Ecosystem
+		if eco == "" {
+			eco = r.Reason
+		}
+		if eco == "" {
+			eco = "?"
+		}
+		fmt.Fprintf(&trace, "第%d轮 %s top10=%d kept=%d；", i+1, eco, len(r.Top10), len(r.Kept))
+	}
+	if tr.Recommended != "" {
+		fmt.Fprintf(&trace, "推荐=%s；", tr.Recommended)
+	}
+	// 查询词：各轮查询常只差语言后缀，提公共前缀、每轮只留后缀，
+	// 否则三条全长查询就把审阅体撑出截断窗口。
+	queries := ""
+	if len(tr.Rounds) > 0 {
+		qs := make([]string, len(tr.Rounds))
+		for i, r := range tr.Rounds {
+			qs[i] = r.Query
+		}
+		prefix := commonPrefixRunes(qs)
+		var qb strings.Builder
+		if len([]rune(prefix)) >= 10 {
+			qb.WriteString("查询基【" + prefix + "】后缀：")
+			for i, q := range qs {
+				if i > 0 {
+					qb.WriteString(" | ")
+				}
+				qb.WriteString(strings.TrimPrefix(q, prefix))
+			}
+		} else {
+			for i, q := range qs {
+				if i > 0 {
+					qb.WriteString(" | ")
+				}
+				qb.WriteString(q)
+			}
+		}
+		queries = qb.String()
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "【复用检索留痕】\n%s\n", trace.String())
+	if queries != "" {
+		fmt.Fprintf(&b, "%s\n", queries)
+	}
+	if basis != "" {
+		fmt.Fprintf(&b, "【分流依据】%s\n", basis)
+	}
+	passed := 0
+	for _, v := range verdicts {
+		if v.Passed {
+			passed++
+		}
+	}
+	fmt.Fprintf(&b, "【测试逐条核验】共%d条，通过%d条\n", len(verdicts), passed)
+	for i, v := range verdicts {
+		mark := "✗"
+		if v.Matched {
+			mark = "✓"
+		}
+		res := "FAIL"
+		if v.Passed {
+			res = "PASS"
+		}
+		exp := v.Expect
+		if exp == "" {
+			exp = "（无，仅退出码）"
+		}
+		// 退出码只在非 0 或失败用例时印（正常通过即 0，省长度）。
+		exit := ""
+		if v.ExitCode != 0 || v.ExpectFail {
+			exit = fmt.Sprintf(" 退出%d", v.ExitCode)
+		}
+		fmt.Fprintf(&b, "%d.%s%s 【%s】%s %s\n", i+1, v.Name, exit, exp, mark, res)
+	}
+	b.WriteString("【回退反证】各用例均断言 stdout 具体值；解析回退为空输出则断言不命中、必失败。\n")
+	b.WriteString("【证据】staging 文件见 artifact_stats；git_diff 不适用（未入 git）。\n")
+	out := b.String()
+	if len([]rune(out)) <= maxRunes {
+		return out
+	}
+	// 超长：先砍查询词行（留痕文件 data/forge/retrieval/<gap>.json 里有全文）。
+	if queries != "" {
+		out = strings.Replace(out, queries+"\n", "", 1)
+	}
+	if len([]rune(out)) <= maxRunes {
+		return out
+	}
+	// 仍超长：只留最短证据行；逐条核验行与回退反证绝不动。
+	out = strings.Replace(out, "【证据】staging 文件见 artifact_stats；git_diff 不适用（未入 git）。\n", "【证据】见 artifact_stats。\n", 1)
+	return out
+}
+
+// commonPrefixRunes 返回一组字符串的最长公共前缀（按 rune 计）。
+func commonPrefixRunes(ss []string) string {
+	if len(ss) == 0 {
+		return ""
+	}
+	rs := [][]rune{[]rune(ss[0])}
+	for _, s := range ss[1:] {
+		rs = append(rs, []rune(s))
+	}
+	n := len(rs[0])
+	for _, r := range rs[1:] {
+		if len(r) < n {
+			n = len(r)
+		}
+	}
+	i := 0
+	for ; i < n; i++ {
+		for _, r := range rs[1:] {
+			if r[i] != rs[0][i] {
+				return string(rs[0][:i])
+			}
+		}
+	}
+	return string(rs[0][:n])
 }
 
 // blueprintReviewBody 是监工审蓝图的精简审阅体：检索留痕与蓝图要点

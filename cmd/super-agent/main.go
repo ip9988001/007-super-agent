@@ -468,8 +468,8 @@ func main() {
 	// （处理缺口队列 + 试用期检查，周日复查上游）；影子模式不跑
 	// 锻造（会真调模型、真改注册表）。
 	if !shadow && lc != nil {
-		seLoop.Forge = newForgePipeline(dataDir, reg, led, ex, lc, d.session)
-		log.Printf("forge ready: daily budget 500 milli, max 3 gaps/day")
+		seLoop.Forge = newForgePipeline(dataDir, reg, led, ex, lc, d.session, cfg.ForgeDailyBudgetMilli)
+		log.Printf("forge ready: daily budget %d milli, max 3 gaps/day", cfg.ForgeDailyBudgetMilli)
 	}
 	log.Printf("self-evolve loop started: daily 04:30 Beijing, rebuild Sunday 04:30")
 
@@ -522,7 +522,9 @@ func main() {
 // newForgePipeline 建锻造流水线（守护进程与 forge-run 子命令共用）：
 // 模型走 lc.CallTask（flash），监工走 ex.ReviewDelivery（固定第 1 检查项
 // 由 forge 包自带），执行走 ex，检索走匿名 GitHub 客户端（绝不带 Token）。
-func newForgePipeline(dataDir string, reg *registry.Registry, led *ledger.Ledger, ex *executor.Executor, lc *llm.Client, sessionID string) *forge.Pipeline {
+// forgeBudgetMilli 是当日锻造预算上限（毫分），来自 config.ForgeDailyBudgetMilli
+// （规格 §10 默认 500；.env FORGE_DAILY_BUDGET_MILLI 或同名环境变量可覆盖）。
+func newForgePipeline(dataDir string, reg *registry.Registry, led *ledger.Ledger, ex *executor.Executor, lc *llm.Client, sessionID string, forgeBudgetMilli int64) *forge.Pipeline {
 	store := &forge.Store{DataDir: dataDir}
 	ret := retrieval.New(http.DefaultClient, filepath.Join(dataDir, "forge", "retrieval", "cache"))
 	// 锻造的模型调用（蓝图/分流/测试生成）提示词与输出都比主循环长，
@@ -552,7 +554,7 @@ func newForgePipeline(dataDir string, reg *registry.Registry, led *ledger.Ledger
 		Store: store, Reg: reg, Led: led, Ret: ret,
 		Model: model, Review: review, Run: ex,
 		SessionID:        sessionID,
-		DailyBudgetMilli: 500, MaxGapsPerDay: 3,
+		DailyBudgetMilli: forgeBudgetMilli, MaxGapsPerDay: 3,
 	}
 }
 
@@ -606,7 +608,7 @@ func runForgeCmd(args []string, dataDirFlag string) {
 	}
 	ex.Advisor = adv
 	adv.Ledger = led
-	fp := newForgePipeline(dDir, reg, led, ex, lc, sessionID)
+	fp := newForgePipeline(dDir, reg, led, ex, lc, sessionID, cfg.ForgeDailyBudgetMilli)
 	ctx := context.Background()
 	taskID := fp.ForgeTaskID()
 	spentBefore, _ := led.SummarizeExpenseByTask(taskID)

@@ -112,3 +112,36 @@ func TestShadowMode(t *testing.T) {
 		t.Fatalf("Shadow = true, want false (env var overrides file)")
 	}
 }
+
+func TestForgeDailyBudgetMilli(t *testing.T) {
+	p := writeEnv(t, "FORGE_DAILY_BUDGET_MILLI=3000\n")
+	t.Setenv("SUPER_AGENT_ENV", p)
+	t.Setenv("FORGE_DAILY_BUDGET_MILLI", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ForgeDailyBudgetMilli != 3000 {
+		t.Fatalf("ForgeDailyBudgetMilli = %d, want 3000 from file", cfg.ForgeDailyBudgetMilli)
+	}
+	// 环境变量覆盖文件里的值。
+	t.Setenv("FORGE_DAILY_BUDGET_MILLI", "800")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ForgeDailyBudgetMilli != 800 {
+		t.Fatalf("ForgeDailyBudgetMilli = %d, want 800 (env var overrides file)", cfg.ForgeDailyBudgetMilli)
+	}
+	// 非法值不生效，走默认值 500。
+	p = writeEnv(t, "FORGE_DAILY_BUDGET_MILLI=abc\n")
+	t.Setenv("SUPER_AGENT_ENV", p)
+	t.Setenv("FORGE_DAILY_BUDGET_MILLI", "")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ForgeDailyBudgetMilli != 500 {
+		t.Fatalf("ForgeDailyBudgetMilli = %d, want 500 default on bad value", cfg.ForgeDailyBudgetMilli)
+	}
+}

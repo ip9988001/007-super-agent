@@ -63,24 +63,31 @@ type Config struct {
 	BackupTokenKey string
 	// BackupRepoDir：git 工作区（部署目录）；为空时取 DataDir 的父目录。
 	BackupRepoDir string
+	// ForgeDailyBudgetMilli：锻造当日预算上限（毫分；规格 §10 默认
+	// 500 毫分 = ¥0.50/天）。由 .env 的 FORGE_DAILY_BUDGET_MILLI 或同名
+	// 环境变量覆盖（与 SHADOW_MODE 同口径：文件先行，环境变量再覆盖）。
+	// 2026-11-19 用户授权放开当日上限跑第 23 步验收：测试机 .env 临时
+	// 设 3000（¥3.00），验收完删掉该行并重启，恢复默认 500。
+	ForgeDailyBudgetMilli int64
 }
 
 // Defaults 返回带默认值的配置。
 func Defaults() *Config {
 	return &Config{
-		WorkerModel:  "deepseek-flash",
-		AdvisorModel: "deepseek-reasoner",
-		AdvisorMode:  AdvisorStandard,
-		DataDir:      "./data",
-		ListenAddr:   "127.0.0.1:6262",
-		MergeWindow:  60 * time.Second,
-		ForcedWake:   180 * time.Second,
-		Debounce:     3 * time.Second,
-		MaxPending:   100,
-		Shadow:       false,
-		BackupEnabled: false,
-		BackupRepo:    "ip9988001/super-agent-007",
-		BackupTokenKey: "GITHUB_API_TOKEN",
+		WorkerModel:           "deepseek-flash",
+		AdvisorModel:          "deepseek-reasoner",
+		AdvisorMode:           AdvisorStandard,
+		DataDir:               "./data",
+		ListenAddr:            "127.0.0.1:6262",
+		MergeWindow:           60 * time.Second,
+		ForcedWake:            180 * time.Second,
+		Debounce:              3 * time.Second,
+		MaxPending:            100,
+		ForgeDailyBudgetMilli: 500,
+		Shadow:                false,
+		BackupEnabled:         false,
+		BackupRepo:            "ip9988001/super-agent-007",
+		BackupTokenKey:        "GITHUB_API_TOKEN",
 	}
 }
 
@@ -141,6 +148,18 @@ func Load() (*Config, error) {
 	if v, ok := kv["MAX_PENDING"]; ok {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			cfg.MaxPending = n
+		}
+	}
+	// 锻造当日预算上限（规格 §10，默认 500 毫分 = ¥0.50/天）：
+	// .env 的 FORGE_DAILY_BUDGET_MILLI 先行，环境变量再覆盖。
+	if v, ok := kv["FORGE_DAILY_BUDGET_MILLI"]; ok {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.ForgeDailyBudgetMilli = int64(n)
+		}
+	}
+	if v := os.Getenv("FORGE_DAILY_BUDGET_MILLI"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.ForgeDailyBudgetMilli = int64(n)
 		}
 	}
 	switch cfg.AdvisorMode {

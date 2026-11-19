@@ -96,16 +96,20 @@ func CollectEvidenceBundle(ctx context.Context, db *sql.DB, req EvidenceRequest)
 		// 注意：列名按我方 ledger.db 真实 schema（internal/ledger/schema.sql）：
 		// Gemini 原稿的 stage_no / cmd_head_300 / err_head_600 / exec_id 在本库不存在，
 		// 改用 exit_code / status / substr(command,1,300) / err_head，按 id 倒序。
+		// 2026-11-19 缺口 1 教训：只给命令+退出码时，监工无法核验测试
+		// 断言的 stdout 内容（“ledger 未捕获 stdout JSON”），只能凭
+		// exit=0 判假测试；stdout_tail 列本就存在（末尾 20 行），
+		// 一并取前 200 字进证据（500 token 总封顶会截掉旧行）。
 		rows, err := db.QueryContext(ctx,
-			`SELECT exit_code, status, substr(command,1,300), err_head FROM execution_ledger WHERE task_id = ? ORDER BY id DESC LIMIT 5`,
+			`SELECT exit_code, status, substr(command,1,300), substr(stdout_tail,1,200), err_head FROM execution_ledger WHERE task_id = ? ORDER BY id DESC LIMIT 5`,
 			req.TaskID)
 		if err == nil {
 			defer rows.Close()
 			for rows.Next() {
 				var code int
-				var status, cmdH, errH string
-				if rows.Scan(&code, &status, &cmdH, &errH) == nil {
-					cmdLines = append(cmdLines, fmt.Sprintf("[exit=%d status=%s] %s | err=%s", code, status, cmdH, errH))
+				var status, cmdH, outH, errH string
+				if rows.Scan(&code, &status, &cmdH, &outH, &errH) == nil {
+					cmdLines = append(cmdLines, fmt.Sprintf("[exit=%d status=%s] %s | out=%s | err=%s", code, status, cmdH, outH, errH))
 				}
 			}
 		}
