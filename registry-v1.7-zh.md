@@ -18,7 +18,7 @@
 
 分析和优化网站在搜索引擎与 AI 回答里的表现（SEO / GEO / AEO）。任务是检查一个网站的搜索表现、做 SEO 体检、给内容打分、生成帮助 AI 理解站点的摘要文件（llms.txt）时，从这个大类里挑。包含内容打分（可读性、关键词覆盖等纯文本工具）、站点体检（技术 SEO 检查、结构化数据）、claude-seo 技能包（一整套 SEO agent 与脚本）。任务是“让这个站排得更好”或“检查这个站的 SEO”时，先到这里找。不包含通用网页抓取（fetch）、UI 设计（design）。
 
-### design 设计（8 条，可调 2）
+### design 设计（11 条，可调 2）
 
 生成、检查、改进视觉设计与用户界面。任务涉及做一个界面、按标准检查设计、肉眼验证一个页面、合成视频时，从这个大类里挑。包含 UI 生成（界面布局与设计语言）、视觉检查（截图比对、用 impeccable 引擎按设计规则体检）、视频合成。任务是“把这个做得好看”或“检查这个设计对不对”时，先到这里找。不包含 SEO（seo）、抓页面内容（fetch）。还有一条铁律：本项目的 DESIGN.md（从代码反推的规范）与参照库的 84 份 DESIGN.md（别人站点的分析）同名但绝不能混用，混用会污染下一次体检。
 
@@ -60,13 +60,13 @@
 
 生成界面与设计语言。按品牌与目标生成 UI 布局、设计规范、DESIGN.md。任务是“做一个界面”时用。/design --write 会直接改目标源码，备份全靠 prompt 一句话，默认只读。截图验证的规程也登记在这里，打分检查见 visual-check。
 
-### design / video-compose 视频合成（1 条）
+### design / video-compose 视频合成（2 条）
 
-视频合成。把素材合成为视频。hyperframes 是 HTML 即源码的视频合成框架：组合、动画、标题卡、字幕、配音、音频反应视觉与转场全用带 data-* 时序属性的 HTML + GSAP 时间线写，npx hyperframes 做 lint/inspect/preview/render。注意：它未在三号上实测跑通过，条目暂定为待核实。
+视频合成。把素材合成为视频。hyperframes 是 HTML 即源码的视频合成框架：组合、动画、标题卡、字幕、配音、音频反应视觉与转场全用带 data-* 时序属性的 HTML + GSAP 时间线写，npx hyperframes 做 lint/inspect/preview/render。2026-11-19 已在测试机实测：CLI 0.9.63 init + render 出真 MP4（10 秒，29 KB），不再是待核实；另有 hyperframes-skill（核心 skill 集 6 个）工作流条目。
 
-### design / visual-check 视觉检查（3 条）
+### design / visual-check 视觉检查（5 条）
 
-肉眼验证设计。用浏览器截图、比对、按规则打分。任务是“这个设计对不对、好不好看”时用。impeccable 检测器是打分主力（离线、确定性），但它的 skill 工作流 24 个命令里只有 detect 真实现了；网关超时矩阵是机制说明文档，不是检查器。
+肉眼验证设计。用浏览器截图、比对、按规则打分。任务是“这个设计对不对、好不好看”时用。impeccable 检测器是打分主力（离线、确定性），但它的 skill 工作流 24 个命令里只有 detect 真实现了；网关超时矩阵是机制说明文档，不是检查器。2026-11-19 新增 Hallmark（50 套主题，sloplint 真浏览器 8 宽度检查）与 taste-skill（design-taste-frontend，Figma/x.ai 水准美术指导 + 浏览器检查 + 完工门），两者都已实测跑通。
 
 ### fetch / browser 浏览器（6 条）
 
@@ -215,10 +215,16 @@ SEO 体检与技能包。GEO/SEO/AEO 体检器（抓一页出 JSON 体检报告�
 
 - impeccable：本地设计反模式检测器（引擎 0.1.16 / skill 4.7.0，二进制 21MB，整技能 23MB）。零 API、零联网、离线确定性；文件 0.06s、URL 2-29s。/ui 路由的打分完全靠它。（英文 one_liner 见注册表；调用类型 cli；可用；入口 `impeccable`）
 
+- hallmark-skill：Hallmark v2 设计 skill（SKILL.md 154 行，50 套主题）。做看起来像设计过的网页，不像 AI 生成的；redesign 改版、audit 只出报告；sloplint 在真浏览器 8 个宽度检查。2026-11-19 实测：静态 2 FAIL/1 REFLEX/1 WARN，--render 5 张截图 3 FAIL/1 REFLEX/3 WARN。浏览器检查要 puppeteer-core + CHROME_PATH（chrome-with-nosandbox）。（英文 one_liner 见注册表；调用类型 sop；可用；入口 `SKILL.md: hallmark`）
+
+- taste-skill：taste-skill design-taste-frontend v2.5.1（SKILL.md 381 行）。给 coding agent 的美术指导，做 Figma/x.ai 水准公司官网；一屏一块、左右对齐、真实照片；浏览器检查 + 完工门。2026-11-19 实测：consistency.mjs 真浏览器跑通，完整 PASS/WARN/FAIL 表。浏览器检查要 CHROME_PATH（chrome-with-nosandbox）。（英文 one_liner 见注册表；调用类型 sop；可用；入口 `SKILL.md: design-taste-frontend`）
+
 
 ### design / video-compose 视频合成
 
-- hyperframes：HTML 即源码的视频合成框架。组合、动画、标题卡、字幕、配音、音频反应视觉与转场全用带 data-* 时序属性的 HTML + GSAP 时间线写，npx hyperframes 做 lint/inspect/preview/render。未在三号上实测跑通过。[待核实]（英文 one_liner 见注册表；调用类型 cli；可用；入口 `npx hyperframes`）
+- hyperframes：HTML 即源码的视频合成框架。组合、动画、标题卡、字幕、配音、音频反应视觉与转场全用带 data-* 时序属性的 HTML + GSAP 时间线写，npx hyperframes 做 lint/inspect/preview/render。2026-11-19 已在测试机实测：CLI 0.9.63 init + render 出真 MP4（10 秒，29 KB）。（英文 one_liner 见注册表；调用类型 cli；可用；入口 `npx hyperframes`）
+
+- hyperframes-skill：HyperFrames 核心 skill 集（6 个 skill：hyperframes、hyperframes-cli、hyperframes-registry、media-use、reverse-any-video、style-sampling）。HTML 写视频，渲染成确定性 MP4；主入口 /hyperframes。2026-11-19 实测：init + render 出真 MP4（10 秒，29 KB）。本地渲染免费，不用 API key。（英文 one_liner 见注册表；调用类型 sop；可用；入口 `SKILL.md: hyperframes`）
 
 
 ### security / scan 安全扫描
