@@ -400,6 +400,142 @@ func TestPullGetsAskpassEnvForHTTPRemote(t *testing.T) {
 	}
 }
 
+// fakeHTTPGit 搭一个 HTTP 私密远端 + 有上游的假 git 环境（复用 fakeRunEnv 的其余行为）。
+func fakeHTTPGit() *fakeGit {
+	fg := fakeRunEnv(0)
+	orig := fg.handler
+	fg.handler = func(args []string) (string, error) {
+		if args[0] == "remote" {
+			return "https://github.com/ip9988001/super-agent-007.git\n", nil
+		}
+		if args[0] == "rev-parse" && len(args) > 2 && args[2] == "--symbolic-full-name" {
+			return "origin/main\n", nil
+		}
+		return orig(args)
+	}
+	return fg
+}
+
+// TestTokenFallbackToEnvFile：回归测试——环境变量未设置时，Runner 必须能从
+// .env 文件里取到 Token（2026-11-19 用户要求：备份 Runner 自己读 .env 兜底，
+// 不再依赖启动时导出 .env 就能推）。
+func TestTokenFallbackToEnvFile(t *testing.T) {
+	const key = "TEST_BACKUP_TOKEN_FALLBACK"
+	const fileToken = "FILE-TOKEN-ABC-123"
+	t.Setenv(key, "") // 环境变量置空，模拟守护进程未导出 .env 就启动
+	envFile := filepath.Join(t.TempDir(), "test.env")
+	mustWrite(t, envFile, key+"="+fileToken+"\nOTHER_KEY=decoy\n")
+
+	led, _ := testLedger(t)
+	fg := fakeHTTPGit()
+	memRoot := testMemoryRoot(t)
+	dataDir := filepath.Dir(memRoot)
+	repoDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repoDir, ".git"), 0o700); err != nil {
+		t.Fatalf("mkdir .git: %v", err)
+	}
+	r := NewRunner(Config{
+		Enabled: true, DataDir: dataDir, RepoDir: repoDir,
+		TokenEnvKey: key, EnvFile: envFile,
+	}, led)
+	r.git = fg
+	res, err := r.Run(context.Background(), "2026-11-17")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !res.Committed {
+		t.Fatalf("期望 Committed，得 %+v", res)
+	}
+	pullEnv := fg.envFor("pull --rebase --autostash")
+	if !envHas(pullEnv, "SUPER_AGENT_GIT_TOKEN="+fileToken) {
+		t.Fatalf("pull 必须带 .env 文件里的 Token，env：%v", pullEnv)
+	}
+	pushEnv := fg.envFor("push origin main")
+	if !envHas(pushEnv, "SUPER_AGENT_GIT_TOKEN="+fileToken) {
+		t.Fatalf("push 必须带 .env 文件里的 Token，env：%v", pushEnv)
+	}
+	// sanitize 也必须能抹掉从 .env 来的 Token。
+	if got := r.sanitize("失败：token " + fileToken + " 被拒"); strings.Contains(got, fileToken) {
+		t.Fatalf("sanitize 未抹掉 .env 来的 Token：%q", got)
+	}
+}
+
+// TestTokenEnvVarWinsOverEnvFile：环境变量设置时优先于 .env 文件。
+func TestTokenEnvVarWinsOverEnvFile(t *testing.T) {
+	const key = "TEST_BACKUP_TOKEN_FALLBACK"
+	const envToken = "ENV-TOKEN-XYZ-789"
+	const fileToken = "FILE-TOKEN-ABC-123"
+	t.Setenv(key, envToken)
+	envFile := filepath.Join(t.TempDir(), "test.env")
+	mustWrite(t, envFile, key+"="+fileToken+"\n")
+
+	led, _ := testLedger(t)
+	fg := fakeHTTPGit()
+	memRoot := testMemoryRoot(t)
+	dataDir := filepath.Dir(memRoot)
+	repoDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repoDir, ".git"), 0o700); err != nil {
+		t.Fatalf("mkdir .git: %v", err)
+	}
+	r := NewRunner(Config{
+		Enabled: true, DataDir: dataDir, RepoDir: repoDir,
+		TokenEnvKey: key, EnvFile: envFile,
+	}, led)
+	r.git = fg
+	res, err := r.Run(context.Background(), "2026-11-17")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !res.Committed {
+		t.Fatalf("期望 Committed，得 %+v", res)
+	}
+	pushEnv := fg.envFor("push origin main")
+	if !envHas(pushEnv, "SUPER_AGENT_GIT_TOKEN="+envToken) {
+		t.Fatalf("环境变量设置时 push 必须带环境变量的 Token，env：%v", pushEnv)
+	}
+	if envHas(pushEnv, "SUPER_AGENT_GIT_TOKEN="+fileToken) {
+		t.Fatalf("环境变量设置时不应使用 .env 文件里的 Token，env：%v", pushEnv)
+	}
+}
+
+// TestPullCarriesIdentityFlags：回归测试——pull --rebase 必须带 -c 身份。
+// rebase（含 autostash）重写提交时要 committer 身份；2026-11-19 实测：
+// 备份提交已写好，pull 在这一步报 "unable to auto-detect email address"，
+// 仓库留在 rebase 中途（工作区 detached HEAD，提交滞留本地未推出）。
+func TestPullCarriesIdentityFlags(t *testing.T) {
+	t.Setenv("GITHUB_API_TOKEN", "SECRET-TOKEN-123")
+	led, _ := testLedger(t)
+	fg := fakeHTTPGit()
+	memRoot := testMemoryRoot(t)
+	dataDir := filepath.Dir(memRoot)
+	repoDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repoDir, ".git"), 0o700); err != nil {
+		t.Fatalf("mkdir .git: %v", err)
+	}
+	r := NewRunner(Config{Enabled: true, DataDir: dataDir, RepoDir: repoDir}, led)
+	r.git = fg
+	res, err := r.Run(context.Background(), "2026-11-17")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !res.Committed {
+		t.Fatalf("期望 Committed，得 %+v", res)
+	}
+	var pullCall string
+	for _, c := range fg.calls {
+		if strings.Contains(c, "pull --rebase --autostash") {
+			pullCall = c
+			break
+		}
+	}
+	if pullCall == "" {
+		t.Fatalf("有上游时必须跑 pull，调用：%v", fg.calls)
+	}
+	if !strings.Contains(pullCall, "-c user.name=007-agent") || !strings.Contains(pullCall, "-c user.email=007-agent@localhost") {
+		t.Fatalf("pull 必须带 -c 身份（rebase 要 committer），调用：%q", pullCall)
+	}
+}
+
 func TestNotAGitRepoFails(t *testing.T) {
 	led, dbPath := testLedger(t)
 	r := NewRunner(Config{Enabled: true, DataDir: t.TempDir(), RepoDir: t.TempDir()}, led)

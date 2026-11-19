@@ -279,6 +279,14 @@ func main() {
 		return
 	}
 
+	// 子命令：backup-run —— 手动跑一次记忆自动备份（第 15 步），跑完退出，不启动守护进程。
+	// 用法：super-agent backup-run [--data-dir DIR] [--date YYYY-MM-DD]
+	// 默认日期为昨天（与 04:00 精炼后备份的口径一致）。备份开关关闭时直接报错退出。
+	if flag.NArg() > 0 && flag.Arg(0) == "backup-run" {
+		runBackupOnce(flag.Args()[1:], *dataDirFlag)
+		return
+	}
+
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("config: %v", err)
@@ -482,6 +490,7 @@ func main() {
 			Repo:        cfg.BackupRepo,
 			ServerID:    cfg.BackupServerID,
 			TokenEnvKey: cfg.BackupTokenKey,
+			EnvFile:     cfg.EnvFile,
 			DataDir:     dataDir,
 			RepoDir:     cfg.BackupRepoDir,
 		}, led)
@@ -647,6 +656,57 @@ func runForgeCmd(args []string, dataDirFlag string) {
 	spentAfter, _ := led.SummarizeExpenseByTask(taskID)
 	log.Printf("forge-run: 本次费用 %d 毫分（当日锻造任务 %s 累计 %d 毫分）",
 		spentAfter.CostCNYMilli-spentBefore.CostCNYMilli, taskID, spentAfter.CostCNYMilli)
+}
+
+// runBackupOnce 是 `super-agent backup-run` 子命令：手动跑一次记忆备份。
+// 与守护进程的接线完全一致（同一份 config、同一个 backup.Runner），
+// 区别只是跑完即退出。Token 按 BACKUP_TOKEN_KEY 的键名取：先进程环境变量，
+// 空了再读 .env 文件（Runner 内部兜底），启动时不必导出 .env。
+func runBackupOnce(args []string, dataDirFlag string) {
+	fs := flag.NewFlagSet("backup-run", flag.ExitOnError)
+	dateFlag := fs.String("date", "", "备份的 L1 日期 YYYY-MM-DD（默认昨天）")
+	_ = fs.Parse(args)
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatalf("config: %v", err)
+	}
+	if dataDirFlag != "" {
+		cfg.DataDir = dataDirFlag
+	}
+	if !cfg.BackupEnabled {
+		log.Fatalf("backup-run: 记忆自动备份未开启（BACKUP_ENABLED=1 才跑）")
+	}
+	dataDir := cfg.ResolveDataDir()
+	dbPath := filepath.Join(dataDir, "ledger.db")
+	led, err := ledger.Open(dbPath)
+	if err != nil {
+		log.Fatalf("ledger open %s: %v", dbPath, err)
+	}
+	defer ledger.Close(led)
+	date := *dateFlag
+	if date == "" {
+		// 与精炼钩子同口径：昨天（北京时间）。
+		loc, lerr := time.LoadLocation("Asia/Shanghai")
+		if lerr != nil {
+			loc = time.FixedZone("CST", 8*3600)
+		}
+		date = time.Now().In(loc).AddDate(0, 0, -1).Format("2006-01-02")
+	}
+	br := backup.NewRunner(backup.Config{
+		Enabled:     true,
+		Repo:        cfg.BackupRepo,
+		ServerID:    cfg.BackupServerID,
+		TokenEnvKey: cfg.BackupTokenKey,
+		EnvFile:     cfg.EnvFile,
+		DataDir:     dataDir,
+		RepoDir:     cfg.BackupRepoDir,
+	}, led)
+	res, err := br.Run(context.Background(), date)
+	if err != nil {
+		log.Fatalf("backup-run: %v", err)
+	}
+	log.Printf("backup-run done: committed=%v no_change=%v files=%d branch=%s date=%s",
+		res.Committed, res.NoChange, res.Files, res.Branch, date)
 }
 
 // runIndexMemory 是 `super-agent index-memory` 子命令：重建 data/memory/

@@ -22,6 +22,7 @@
 package backup
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"log"
@@ -63,6 +64,10 @@ type Config struct {
 	ServerID string
 	// TokenEnvKey 是读 Token 的环境变量键名（只存键名）；默认 DefaultTokenKey。
 	TokenEnvKey string
+	// EnvFile 是已读到的 .env 路径（config.EnvFile，如 /etc/super-agent/.env）；
+	// Token 兜底时优先读它；为空时按 $SUPER_AGENT_ENV → /etc/super-agent/.env
+	// → ./.env 的顺序找。只存路径，不存值。
+	EnvFile string
 	// DataDir 是守护进程数据目录；记忆根为 <DataDir>/memory，标记文件放 <DataDir>。
 	DataDir string
 	// RepoDir 是 git 工作区（部署目录）；为空时取 DataDir 的父目录。
@@ -167,9 +172,79 @@ func (r *Runner) nowFunc() time.Time {
 	return beijingNow()
 }
 
+// envFileCandidates 返回读 Token 兜底时要查的 .env 路径：配置已读到的
+// .env（cfg.EnvFile）优先，其后是 llm 包同口径的 $SUPER_AGENT_ENV →
+// /etc/super-agent/.env → ./.env；去重。
+func (r *Runner) envFileCandidates() []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, cand := range []string{r.cfg.EnvFile, os.Getenv("SUPER_AGENT_ENV"), "/etc/super-agent/.env", "./.env"} {
+		if cand == "" || seen[cand] {
+			continue
+		}
+		seen[cand] = true
+		out = append(out, cand)
+	}
+	return out
+}
+
+// resolveToken 取 Token：先进程环境变量，空了再读 .env 文件里同键名的值
+// （llm.ResolveAPIKey 同口径）。值本身只返回给调用方，绝不写日志。
+// 守护进程不再依赖启动时导出 .env——没导出也能从 .env 文件里拿到 Token。
+func (r *Runner) resolveToken() string {
+	if v := os.Getenv(r.cfg.TokenEnvKey); v != "" {
+		return v
+	}
+	for _, cand := range r.envFileCandidates() {
+		kv, err := parseEnvFile(cand)
+		if err != nil || kv == nil {
+			continue
+		}
+		if v, ok := kv[r.cfg.TokenEnvKey]; ok && v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// parseEnvFile 读 KEY=VALUE 文件（与 llm/config 包同口径：跳过空行与 # 注释，
+// 值两侧引号剥掉）。只给 resolveToken 用。
+func parseEnvFile(path string) (map[string]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	out := map[string]string{}
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 64*1024), 1024*1024)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		k = strings.TrimSpace(k)
+		v = strings.TrimSpace(v)
+		if len(v) >= 2 && v[0] == v[len(v)-1] && (v[0] == '"' || v[0] == '\'') {
+			v = v[1 : len(v)-1]
+		}
+		if k != "" {
+			out[k] = v
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // sanitize 把文本里万一沾上的 Token 值替换掉（记账/日志前的最后一道防线）。
 func (r *Runner) sanitize(s string) string {
-	tok := os.Getenv(r.cfg.TokenEnvKey)
+	tok := r.resolveToken()
 	if tok == "" || !strings.Contains(s, tok) {
 		return s
 	}
@@ -479,9 +554,9 @@ func (r *Runner) Run(ctx context.Context, date string) (Result, error) {
 	}
 	token := ""
 	if isHTTP {
-		token = os.Getenv(r.cfg.TokenEnvKey)
+		token = r.resolveToken()
 		if token == "" {
-			return r.fail(date, "Token 未设置", fmt.Errorf("环境变量 %s 为空", r.cfg.TokenEnvKey))
+			return r.fail(date, "Token 未设置", fmt.Errorf("环境变量与 .env 均未提供 %s", r.cfg.TokenEnvKey))
 		}
 	}
 	rels, err := r.candidates(date)
@@ -520,13 +595,17 @@ func (r *Runner) Run(ctx context.Context, date string) (Result, error) {
 	}
 	// 第 3 点：推送前固定先拉齐历史（有上游才拉；新库无上游时跳过）。
 	// pull 与 push 共用一套认证 env（HTTP 远端需 askpass；见 authEnv）。
+	// pull 也带 -c 身份：rebase（含 autostash 的贮藏）重写提交时要 committer
+	// 身份；没配 -c 且机器上又没 git config 时，rebase 会报
+	// "unable to auto-detect email address"（2026-11-19 实测：备份提交已写好，
+	// pull --rebase 在这一步失败，仓库留在 rebase 中途）。
 	env, cleanup, err := r.authEnv(token, isHTTP)
 	if err != nil {
 		return r.fail(date, "建 git 认证失败", err)
 	}
 	defer cleanup()
 	if r.hasUpstream(ctx, repoDir) {
-		if _, err := r.git.run(ctx, repoDir, []string{"pull", "--rebase", "--autostash"}, env); err != nil {
+		if _, err := r.git.run(ctx, repoDir, []string{"-c", "user.name=007-agent", "-c", "user.email=007-agent@localhost", "pull", "--rebase", "--autostash"}, env); err != nil {
 			return r.fail(date, "git pull --rebase 失败（本地提交已保留，下次再推）", err)
 		}
 	}
