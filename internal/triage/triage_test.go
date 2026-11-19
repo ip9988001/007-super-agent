@@ -375,12 +375,12 @@ func fixtureWithEntryPoint(t *testing.T, toolID, entryPoint string) string {
 // entry_point 不存在的工具，ResolveTool 必须报 ErrProbeFailed，
 // 调用方据此记账，不执行。
 func TestResolveToolProbeFailed(t *testing.T) {
-	dir := fixtureWithEntryPoint(t, "cap-design-hyperframes", "no-such-cmd-xyz-123")
+	dir := fixtureWithEntryPoint(t, "cap-ops-tesseract", "no-such-cmd-xyz-123")
 	rg, err := registry.Load(dir)
 	if err != nil {
 		t.Fatalf("load registry: %v", err)
 	}
-	if _, _, err := ResolveTool(rg, "cap-design-hyperframes"); !errors.Is(err, ErrProbeFailed) {
+	if _, _, err := ResolveTool(rg, "cap-ops-tesseract"); !errors.Is(err, ErrProbeFailed) {
 		t.Fatalf("ResolveTool err = %v, want ErrProbeFailed", err)
 	}
 }
@@ -388,16 +388,16 @@ func TestResolveToolProbeFailed(t *testing.T) {
 // TestResolveToolProbePasses 是 B-03 的通过路：verified=false 但
 // entry_point 真实存在的工具，探针通过后照常定位，不禁用。
 func TestResolveToolProbePasses(t *testing.T) {
-	dir := fixtureWithEntryPoint(t, "cap-design-hyperframes", "echo hyperframes")
+	dir := fixtureWithEntryPoint(t, "cap-ops-tesseract", "echo tesseract")
 	rg, err := registry.Load(dir)
 	if err != nil {
 		t.Fatalf("load registry: %v", err)
 	}
-	e, l3, err := ResolveTool(rg, "cap-design-hyperframes")
+	e, l3, err := ResolveTool(rg, "cap-ops-tesseract")
 	if err != nil || e == nil || l3 == "" {
 		t.Fatalf("ResolveTool = %v, %q, %v, want success after probe", e, l3, err)
 	}
-	if rg.NeedsProbe("cap-design-hyperframes") {
+	if rg.NeedsProbe("cap-ops-tesseract") {
 		t.Fatal("probe passed but NeedsProbe still true")
 	}
 }

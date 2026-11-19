@@ -34,7 +34,7 @@ type Runner interface {
 var ErrBudgetPaused = errors.New("forge: 当日进化预算已用完，暂停至次日")
 
 // 固定第 1 检查项：监工两道门都先核查 reuse_search 分流是否合理。
-const fixedCheckItem1 = `先看检索留痕：检索是否按 §2A 走了（第零层强制全查、外部层按语言生态排序、≤3 次搜索、核心 API 只查元数据 ≤15 次/缺口、raw 直读不计额度）；红线/硬门槛判得对不对；有没有“该采用却去自造”（成熟工具在手却重写），或“该自造却硬采用”（覆盖 <80%、胶水 >100 行、魔改非公开接口、许可被禁却硬上）。分流错了就 HALT，不管后面写得再好。`
+const fixedCheckItem1 = `先看检索留痕：检索是否按 §2A 走了（第零层模型判定、查询词模型写、≤3 次搜索、核心 API 只查元数据 ≤15 次/缺口、raw 直读不计额度）；红线/硬门槛判得对不对（许可证只记录不否决：自迭代工具只进私密仓）；有没有“该采用却去自造”（成熟工具在手却重写），或“该自造却硬采用”（覆盖 <80%、胶水 >100 行、魔改非公开接口）。分流错了就 HALT，不管后面写得再好。`
 
 // Pipeline 是锻造流水线（规格 §4–§8）。
 type Pipeline struct {
@@ -131,16 +131,23 @@ func isTransientModelErr(err error) bool {
 		strings.Contains(msg, "eof")
 }
 
-// localCheck 是第零层（规格 §2A.1）：本机注册表 + 已隔离记录强制全查，
-// 零成本。命中返回 (true, 说明)；未命中返回 (false, 检查摘要)——
-// 摘要进检索留痕，供监工核验“确实查过”（2026-11-19 监工 HALT 指出）。
-func (p *Pipeline) localCheck(taskText string) (bool, string) {
+// localCheck 是第零层（规格 §2A.1）：本机注册表 + 已隔离记录强制全查。
+// 2026-11-19 修正：判定改模型驱动——关键词重叠只做粗筛召回 top 5
+//（不做决定），把缺口 + 候选喂给模型判 hit/coverage；覆盖 ≥80%
+// 才算命中，不确定的一律算没命中。模型不可用/解析失败时默认没命中，
+// 绝不误命中（宁可多搜一次，也不错杀一个缺口）；预算耗尽时返回
+// ErrBudgetPaused 向上传。命中与未命中都写摘要进检索留痕，供监工核验。
+func (p *Pipeline) localCheck(ctx context.Context, taskID, taskText string) (bool, string, error) {
+	type cand struct {
+		id, desc string
+		hit      int
+	}
 	kws := retrieval.ExtractKeywords(taskText)
 	if len(kws) == 0 {
-		return false, "关键词为空，未做本地比对"
+		return false, "关键词为空，未做本地比对", nil
 	}
-	// 注册表：关键词与 one_liner/tool_id 重叠 ≥2 个词即命中。
-	bestHit, bestTool := 0, ""
+	// 粗筛召回：按关键词重叠数排序，只取前 5 个候选（不做决定）。
+	var cands []cand
 	for _, e := range p.Reg.AllEntries() {
 		hay := strings.ToLower(e.ToolID + " " + e.OneLiner + " " + e.Category + " " + e.Subcategory)
 		hit := 0
@@ -149,14 +156,10 @@ func (p *Pipeline) localCheck(taskText string) (bool, string) {
 				hit++
 			}
 		}
-		if hit > bestHit {
-			bestHit, bestTool = hit, e.ToolID
-		}
-		if hit >= 2 {
-			return true, fmt.Sprintf("注册表已有工具 %s（关键词命中 %d 个）", e.ToolID, hit)
+		if hit > 0 {
+			cands = append(cands, cand{e.ToolID, e.OneLiner, hit})
 		}
 	}
-	// 已隔离记录：同名/同关键词的隔离工具也算命中（不再重造）。
 	trials, _ := p.ListTrials()
 	nBad := 0
 	for _, tr := range trials {
@@ -171,11 +174,69 @@ func (p *Pipeline) localCheck(taskText string) (bool, string) {
 				hit++
 			}
 		}
-		if hit >= 2 {
-			return true, fmt.Sprintf("已隔离/已废弃工具 %s（状态 %s，关键词命中 %d 个）", tr.ToolID, tr.Status, hit)
+		if hit > 0 {
+			cands = append(cands, cand{tr.ToolID, "已隔离/已废弃工具（状态 " + tr.Status + "）", hit})
 		}
 	}
-	return false, fmt.Sprintf("注册表 %d 条：最高重叠 %d 个关键词（%s），无 ≥2 命中；隔离/弃用记录 %d 条：无 ≥2 命中", len(p.Reg.AllEntries()), bestHit, bestTool, nBad)
+	sort.Slice(cands, func(i, j int) bool { return cands[i].hit > cands[j].hit })
+	if len(cands) > 5 {
+		cands = cands[:5]
+	}
+	if len(cands) == 0 {
+		return false, fmt.Sprintf("注册表 %d 条：无关键词重叠候选；隔离/弃用记录 %d 条：无候选", len(p.Reg.AllEntries()), nBad), nil
+	}
+	var tail strings.Builder
+	fmt.Fprintf(&tail, "缺口：%s\n候选（粗筛 top %d，只做召回，不做决定）：\n", taskText, len(cands))
+	for i, c := range cands {
+		fmt.Fprintf(&tail, "%d. %s：%s（关键词重叠 %d 个）\n", i+1, c.id, c.desc, c.hit)
+	}
+	reply, err := p.callModel(ctx, taskID, layer0PromptHead, tail.String())
+	if err != nil {
+		if errors.Is(err, ErrBudgetPaused) {
+			return false, "第零层模型判定遇预算耗尽", err
+		}
+		// 模型不可用 → 默认没命中（绝不误命中），走外部搜索。
+		return false, fmt.Sprintf("第零层模型判定失败（%v），按未命中处理；粗筛候选 %d 个", err, len(cands)), nil
+	}
+	d, perr := ParseLayer0Decision(reply)
+	if perr != nil {
+		return false, fmt.Sprintf("第零层模型回复解析失败（%v），按未命中处理；粗筛候选 %d 个", perr, len(cands)), nil
+	}
+	if !d.Hit || d.Coverage < 80 || strings.TrimSpace(d.ToolID) == "" {
+		return false, fmt.Sprintf("第零层模型判定未命中（覆盖 %d%%，%s）；粗筛候选 %d 个", d.Coverage, d.Reason, len(cands)), nil
+	}
+	return true, fmt.Sprintf("注册表已有工具 %s（模型判定覆盖 %d%%：%s）", d.ToolID, d.Coverage, d.Reason), nil
+}
+
+// genQueries 让模型写检索查询词（聚焦 + 放宽各一条）。
+func (p *Pipeline) genQueries(ctx context.Context, taskID, taskText string) (string, string, error) {
+	reply, err := p.callModel(ctx, taskID, queryPromptHead, "缺口："+taskText)
+	if err != nil {
+		return "", "", err
+	}
+	d, err := ParseQueryDecision(reply)
+	if err != nil {
+		return "", "", err
+	}
+	return d.Focused, d.Broad, nil
+}
+
+// rewriteQuery 让模型在 0 结果时重写查询。
+func (p *Pipeline) rewriteQuery(ctx context.Context, taskID, taskText, prior string) (string, error) {
+	reply, err := p.callModel(ctx, taskID, rewritePromptHead, "缺口："+taskText+"\n已搜情况："+prior)
+	if err != nil {
+		return "", err
+	}
+	return ParseRewriteDecision(reply)
+}
+
+// judgeCoverage 让模型判单个候选的覆盖度（R4）。
+func (p *Pipeline) judgeCoverage(ctx context.Context, taskID, taskText, candidate string) (int, string, error) {
+	reply, err := p.callModel(ctx, taskID, coveragePromptHead, "缺口："+taskText+"\n候选："+candidate)
+	if err != nil {
+		return 0, "", err
+	}
+	return ParseCoverageDecision(reply)
 }
 
 // ProcessGaps 处理当天的缺口队列（规格 §4）：pending 在先、deferred
@@ -233,6 +294,48 @@ func (p *Pipeline) ProcessGaps(ctx context.Context) (int, error) {
 	return processed, nil
 }
 
+// retrieve 跑一次复用优先检索（第零层 + 外部层），ProcessGap 与
+// RetrieveOnly 共用同一段代码，避免两处分叉。
+func (p *Pipeline) retrieve(ctx context.Context, taskID string, gap Gap) (*retrieval.Trace, error) {
+	return p.Ret.Retrieve(ctx, retrieval.GapInput{
+		GapID: gap.GapID, TaskText: gap.TaskText,
+		Keywords: gap.Keywords,
+		LocalCheck: func(ctx context.Context, taskText string) (bool, string, error) {
+			return p.localCheck(ctx, taskID, taskText)
+		},
+		QueryGen: func(ctx context.Context, taskText string) (string, string, error) {
+			return p.genQueries(ctx, taskID, taskText)
+		},
+		RewriteQuery: func(ctx context.Context, taskText, prior string) (string, error) {
+			return p.rewriteQuery(ctx, taskID, taskText, prior)
+		},
+		CoverageJudge: func(ctx context.Context, taskText, candidate string) (int, string, error) {
+			return p.judgeCoverage(ctx, taskID, taskText, candidate)
+		},
+	})
+}
+
+// RetrieveOnly 只跑检索（第零层 + 外部层），写 trace 与留痕，
+// 不分流、不画蓝图、不叫监工、不进 staging、不注册。
+// 供验收回归用（旧缺口只验检索与第零层，不必全量重造）。
+// 缺口状态不动（不改 pending/done），trace 文件照常落盘。
+func (p *Pipeline) RetrieveOnly(ctx context.Context, gap Gap) (*retrieval.Trace, error) {
+	taskID := p.ForgeTaskID()
+	tr, err := p.retrieve(ctx, taskID, gap)
+	if err != nil {
+		_ = p.saveTrace(gap.GapID, tr)
+		return tr, err
+	}
+	_ = p.saveTrace(gap.GapID, tr)
+	_ = p.Store.AppendEvent(Event{
+		Event: EvReuseSearchDone, GapID: gap.GapID,
+		Input:  gap.TaskText,
+		Output: fmt.Sprintf("outcome=%s searches=%d core=%d（仅检索验收，不分流/不注册）", tr.Outcome, tr.SearchesUsed, tr.CoreUsed),
+		Result: "ok",
+	})
+	return tr, nil
+}
+
 // ProcessGap 跑通一个缺口的全流程：检索 → 分流 → 采用/包装或自造 →
 // 监工两道门 → staging 试造 → 注册（风险分级门禁）。
 func (p *Pipeline) ProcessGap(ctx context.Context, gap Gap) error {
@@ -240,12 +343,9 @@ func (p *Pipeline) ProcessGap(ctx context.Context, gap Gap) error {
 	if err := p.Store.UpdateGapStatus(gap.GapID, "processing"); err != nil {
 		return err
 	}
-	// ---- 检索（复用优先） ----
-	tr, err := p.Ret.Retrieve(ctx, retrieval.GapInput{
-		GapID: gap.GapID, TaskText: gap.TaskText,
-		Keywords:   gap.Keywords,
-		LocalCheck: p.localCheck,
-	})
+	// ---- 检索（复用优先；2026-11-19 修正：查询词、第零层、覆盖度
+	// 三处关键判断全部改模型驱动，机械规则只做召回与回退） ----
+	tr, err := p.retrieve(ctx, taskID, gap)
 	if err != nil {
 		// 限流顺延：记 SEARCH_DEFERRED_RATE_LIMIT，缺口留队列最高位，
 		// 次日续跑，不转自造（交互-23 Q5）。

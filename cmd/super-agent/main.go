@@ -572,6 +572,7 @@ func runForgeCmd(args []string, dataDirFlag string) {
 	fs := flag.NewFlagSet("forge-run", flag.ExitOnError)
 	dataDir := fs.String("data-dir", dataDirFlag, "数据目录（覆盖配置）")
 	gapID := fs.String("gap", "", "只处理指定缺口")
+	retrievalOnly := fs.Bool("retrieval-only", false, "只跑检索（第零层+外部层），不分流/不注册（验收回归用，需配合 --gap）")
 	checkTrials := fs.Bool("check-trials", false, "只检查试用期")
 	confirmPending := fs.String("confirm-pending", "", "人工确认一个 high 风险挂起工具并注册")
 	if err := fs.Parse(args); err != nil {
@@ -638,6 +639,16 @@ func runForgeCmd(args []string, dataDirFlag string) {
 		g, err := fp.Store.ReadGap(*gapID)
 		if err != nil {
 			log.Fatalf("forge-run: 读缺口 %s: %v", *gapID, err)
+		}
+		if *retrievalOnly {
+			tr, err := fp.RetrieveOnly(ctx, g)
+			if err != nil {
+				log.Fatalf("forge-run: 检索缺口 %s: %v", *gapID, err)
+			}
+			log.Printf("forge-run: 缺口 %s 仅检索完毕 outcome=%s searches=%d core=%d recommended=%s layer0=%v",
+				*gapID, tr.Outcome, tr.SearchesUsed, tr.CoreUsed, tr.Recommended, tr.Layer0Hit)
+			log.Printf("forge-run: 检索摘要 %s", tr.Summary())
+			break
 		}
 		if err := fp.ProcessGap(ctx, g); err != nil {
 			log.Fatalf("forge-run: 处理缺口 %s: %v", *gapID, err)

@@ -78,6 +78,26 @@ func stubLastLines(s string, n int) string {
 func stubModel(t *testing.T) ModelCall {
 	return func(ctx context.Context, taskID, frozen, tail string) (string, error) {
 		switch {
+		case strings.Contains(frozen, "第零层检查员"):
+			// 只认缺口原文里提到 ping（且候选里有 ping-test）才命中；
+			// 其余只沾关键词的（markdown/html、bili 等）一律 no-hit。
+			// 注意：tail 里候选描述本身也含 ping 字样，只看“缺口：”那一段。
+			gapPart := tail
+			if i := strings.Index(tail, "候选"); i >= 0 {
+				gapPart = tail[:i]
+			}
+			if strings.Contains(gapPart, "ping") {
+				return `{"hit":true,"tool_id":"ping-test","coverage":95,"reason":"ping diagnostics tool covers it"}`, nil
+			}
+			return `{"hit":false,"tool_id":"","coverage":0,"reason":"no candidate actually covers the gap"}`, nil
+		case strings.Contains(frozen, "查询词写手"):
+			// 重写（tail 里有“已搜情况”）与首次写查询共用角色词，用 tail 区分。
+			if strings.Contains(tail, "已搜情况") {
+				return `{"query":"foo bar converter"}`, nil
+			}
+			return `{"focused":"foo bar converter","broad":"foo bar file convert"}`, nil
+		case strings.Contains(frozen, "覆盖度评审"):
+			return `{"coverage":90,"reason":"covers it"}`, nil
 		case strings.Contains(frozen, "分流器"):
 			return `{"branch":"self_build","candidate":"","coverage":0,"reason":"no candidate passed red lines","wrapper_lines":0,"license_tier":"permissive"}`, nil
 		case strings.Contains(frozen, "锻造器"):
@@ -275,6 +295,42 @@ func TestTriageHardRuleOverride(t *testing.T) {
 	d, err = ParseTriageDecision(`{"branch":"wrap","candidate":"acme/md2html","coverage":95,"reason":"wrap it","wrapper_lines":150,"license_tier":"permissive"}`)
 	if err != nil || d.Branch != "self_build" {
 		t.Fatalf("胶水 >100 行应改判自造：%v %+v", err, d)
+	}
+	// 许可证不再兜底：banned 也不改判（只记录，不否决）。
+	d, err = ParseTriageDecision(`{"branch":"adopt","candidate":"acme/md2html","coverage":95,"reason":"fits","wrapper_lines":10,"license_tier":"banned"}`)
+	if err != nil || d.Branch != "adopt" {
+		t.Fatalf("许可证 banned 不应改判自造：%v %+v", err, d)
+	}
+}
+
+// TestLocalCheckNoFalseHit 是缺口 2/3 的回归：第零层只数关键词时
+// 会误命中 lightpanda（markdown+HTML）与 cap-fetch-bili；
+// 改模型判定后，这两个缺口都必须判未命中。
+func TestLocalCheckNoFalseHit(t *testing.T) {
+	p, _, _, reg := newTestPipeline(t, emptySearchMock())
+	for _, e := range []registry.Entry{
+		{ToolID: "cap-fetch-lightpanda", Category: "fetch", Subcategory: "browser", CallType: "cli", EntryPoint: "/bin/true", OutputContract: "x", SourceFile: "test", OneLiner: "Headless JS engine that runs JavaScript and dumps the page as markdown or html"},
+		{ToolID: "cap-fetch-bili", Category: "fetch", Subcategory: "video", CallType: "cli", EntryPoint: "/bin/true", OutputContract: "x", SourceFile: "test", OneLiner: "Bilibili video tool: fetch titles and metadata from bilibili"},
+	} {
+		if err := reg.AddEntry(e); err != nil {
+			t.Fatalf("AddEntry %s: %v", e.ToolID, err)
+		}
+	}
+	// 缺口 2：Markdown 转 HTML。旧规则下 lightpanda 命中 ≥2 个关键词。
+	hit, detail, err := p.localCheck(context.Background(), "forge-2026-11-19", "convert markdown file to html")
+	if err != nil {
+		t.Fatalf("localCheck 缺口 2: %v", err)
+	}
+	if hit {
+		t.Fatalf("缺口 2 不应命中（lightpanda 不转 Markdown 文件）：%s", detail)
+	}
+	// 缺口 3：curl 取标题。旧规则下 cap-fetch-bili 命中 ≥2 个关键词。
+	hit, detail, err = p.localCheck(context.Background(), "forge-2026-11-19", "fetch web page title with curl")
+	if err != nil {
+		t.Fatalf("localCheck 缺口 3: %v", err)
+	}
+	if hit {
+		t.Fatalf("缺口 3 不应命中（cap-fetch-bili 是 Bilibili 专用）：%s", detail)
 	}
 }
 
@@ -707,5 +763,37 @@ func TestRunTestsMatchesEarlyStdout(t *testing.T) {
 	}}
 	if _, _, err := p.runTests(context.Background(), "forge-test", gap, stageDir, "tool.py", plan2, false); err == nil {
 		t.Fatalf("不存在的子串应判失败")
+	}
+}
+
+// TestRetrieveOnly 是 --retrieval-only 的单测：只跑检索与第零层，
+// 不分流、不画蓝图、不注册；注册表条数与缺口状态都不动。
+func TestRetrieveOnly(t *testing.T) {
+	p, _, _, reg := newTestPipeline(t, emptySearchMock())
+	gap := Gap{GapID: "gap-2026-11-19-001", TaskID: "t1", TaskText: "convert foo files to bar format", Trigger: "no_tool", CreatedTS: "2026-11-19T00:00:00Z", Status: "pending"}
+	if _, _, err := p.Store.WriteGap(gap); err != nil {
+		t.Fatalf("WriteGap: %v", err)
+	}
+	before := reg.Count()
+	tr, err := p.RetrieveOnly(context.Background(), gap)
+	if err != nil {
+		t.Fatalf("RetrieveOnly: %v", err)
+	}
+	if tr.Outcome != "exhausted" || tr.SearchesUsed != 3 {
+		t.Fatalf("outcome=%q searches=%d, want exhausted/3", tr.Outcome, tr.SearchesUsed)
+	}
+	if reg.Count() != before {
+		t.Fatalf("RetrieveOnly 不应注册工具：%d -> %d", before, reg.Count())
+	}
+	if _, err := os.Stat(filepath.Join(p.Store.BlueprintsDir(), "gap-2026-11-19-001.md")); !os.IsNotExist(err) {
+		t.Fatalf("RetrieveOnly 不应写蓝图")
+	}
+	// 缺口状态不动。
+	g2, err := p.Store.ReadGap("gap-2026-11-19-001")
+	if err != nil {
+		t.Fatalf("ReadGap: %v", err)
+	}
+	if g2.Status != "pending" {
+		t.Fatalf("RetrieveOnly 不应改缺口状态：%q", g2.Status)
 	}
 }

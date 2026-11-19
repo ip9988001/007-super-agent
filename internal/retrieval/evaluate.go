@@ -1,19 +1,21 @@
 package retrieval
 
 import (
+	"fmt"
 	"strings"
 	"time"
 )
 
-// 评估常量（规格 §2A.4）。
+// 评估常量（规格 §2A.4，2026-11-19 修正版）。
 const (
-	// StaleMonths：>18 个月无提交/发布 → 原则上淘汰（H3，估算值，
-	// 上线后用检索日志校准）。
+	// StaleMonths：>18 个月无提交/发布 → 只记 stale 警告，不淘汰
+	//（H3 已降为参考：功能符合就照常用，同等功能优先新鲜的）。
 	StaleMonths = 18
-	// MinStars：星数只作初筛下限，过滤个人玩具仓库。
-	MinStars = 50
+	// MinStars：星数初筛下限（H0，<700 星直接淘汰；用户 2026-11-19
+	// 定：700 星以上、多人认同的开源项目比较安全）。
+	MinStars = 700
 	// MinCoverage：功能覆盖 ≥80% 才算合格（R4 的反向；覆盖度由锻造侧
-	// 模型判定，本包只记录“未判定”，见 CandidateEval.CoverageUnknown）。
+	// 模型判定，见 CandidateEval.Coverage / CoverageReason）。
 	MinCoverage = 80
 )
 
@@ -35,19 +37,28 @@ type CandidateEval struct {
 	DefaultBranch string    `json:"default_branch,omitempty"` // 默认分支（raw 下载先用它）
 	FromCache     bool      `json:"from_cache"`
 	CachedAt      time.Time `json:"cached_at"`
-	HardThreshold string    `json:"hard_threshold,omitempty"` // H1/H2/H3（淘汰原因）
+	HardThreshold string    `json:"hard_threshold,omitempty"` // H0/H2（淘汰原因）
 	RedLines      []string  `json:"red_lines,omitempty"`      // 未过的红线
 	Passed        bool      `json:"passed"`
-	// CoverageUnknown：本包不判功能覆盖（R4 需理解需求语义，由锻造侧
-	// 模型判定）；Passed 只表示“可查的硬门槛与红线全过”。
-	CoverageUnknown bool `json:"coverage_unknown"`
+	// Stale：>18 个月无提交/发布（H3 警告，不淘汰）；StaleWarning 记
+	// 上次更新日期与警告，供 ledger/trace 备查。
+	Stale        bool   `json:"stale,omitempty"`
+	StaleWarning string `json:"stale_warning,omitempty"`
+	// Coverage / CoverageReason：模型判定的功能覆盖度（0–100）与理由；
+	// 未判定时 CoverageUnknown 为 true（R4 需理解需求语义，由锻造侧
+	// 模型判定）。Passed 只表示“可查的硬门槛与红线全过”，覆盖度另判。
+	Coverage        int    `json:"coverage,omitempty"`
+	CoverageReason  string `json:"coverage_reason,omitempty"`
+	CoverageUnknown bool   `json:"coverage_unknown"`
 }
 
-// licenseTier 是许可分级（规格 §2A.4，口径 B）：
-//   - permissive：全路放行；
-//   - lgpl_mpl：仅限未改动的独立外部进程调用；
-//   - gpl：允许独立 CLI 进程调用，仅禁抄代码进公开库；
-//   - banned：无许可证或仅限非商用，全路淘汰。
+// licenseTier 是许可分级（只记录，不淘汰：2026-11-19 用户定——
+// 自迭代工具只进私密仓、不进公开仓、不卖，许可证只记在账本里备查）：
+//   - permissive：MIT/BSD/Apache/ISC/Unlicense；
+//   - lgpl_mpl：LGPL/MPL；
+//   - gpl：GPL/AGPL；
+//   - banned：无许可证或仅限非商用（只记录分级，不再淘汰）。
+// LicenseTierOf 的返回值只用于 ledger/trace 记录与分流提示，不作否决。
 func licenseTier(spdx string) string {
 	switch strings.ToUpper(strings.TrimSpace(spdx)) {
 	case "MIT", "BSD-2-CLAUSE", "BSD-3-CLAUSE", "APACHE-2.0", "ISC", "UNLICENSE":
@@ -65,18 +76,19 @@ func licenseTier(spdx string) string {
 func LicenseTierOf(spdx string) string { return licenseTier(spdx) }
 
 // heavyRuntimes 是测试机没有的重型运行时（规格 §2A.4 R3）：
-// 需要它们即转自造。测试机现有：Python 3.11、Node 22、Java 25；
-// Go 未装（只能用预编译二进制，编译归 Muse）。
+// 需要它们即转自造。测试机现有：Python 3.11、Node 22、Java 25、
+// Go（2026-11-19 已装，/usr/local/go，go1.27.4；007 本体编译仍归
+// Muse 本地交叉编译，不改部署流程）。
 var heavyRuntimes = []string{"cargo", "rustc", "ruby", "php", "deno", "bun", "dotnet", "swift", "kotlin"}
 
 // InferRuntimeNeed 从依赖清单文件名推断运行需求。
-// go.mod → go-binary（只能用预编译二进制）；package.json → node；
+// go.mod → go（测试机已装 Go，可在服务器上编译）；package.json → node；
 // pyproject.toml/setup.py/requirements.txt → python；
 // pom.xml/build.gradle → java；其余 unknown。
 func InferRuntimeNeed(depsFile string) string {
 	switch depsFile {
 	case "go.mod":
-		return "go-binary"
+		return "go"
 	case "package.json":
 		return "node"
 	case "pyproject.toml", "setup.py", "requirements.txt":
@@ -109,23 +121,27 @@ func scanSuspicious(content string) string {
 }
 
 // EvaluateCandidate 对一个已深挖的候选做可查的硬门槛与红线判定
-// （不含 R4 功能覆盖——那是锻造侧模型的活）。
-// now 由调用方传（测试可固定时钟）。
+// （不含 R4 功能覆盖——那是锻造侧模型的活，由调用方在 DeepDive 后
+// 用 CoverageJudge 补判，见 retrieve.go）。
+// 2026-11-19 修正版：H1 与 R1（许可证）已删——许可证只记录不淘汰
+//（自迭代工具只进私密仓）；H3（>18 个月未更新）降为 stale 警告。
+// 保留的一票否决：H0（星数 <700）、H2（Archived）、R2（安全）、
+// R3（重型运行时）、R5（无法验证）。now 由调用方传（测试可固定时钟）。
 func EvaluateCandidate(ce *CandidateEval, now time.Time) {
-	// H2：Archived / Deprecated → 淘汰。
+	// H2：Archived / Deprecated → 淘汰（保留）。
 	if ce.Archived {
 		ce.HardThreshold = "H2"
 		ce.Passed = false
 		return
 	}
-	// H1：无 LICENSE 文件 → 淘汰（LICENSE 文件以 raw 直读为准；
-	// 详情里的 license 字段只是初值，两处都没有才算无）。
-	if !ce.LicenseFileOK && ce.License == "" {
-		ce.HardThreshold = "H1"
+	// H0：星数 <700 → 淘汰（用户 2026-11-19 定：700 星以上才比较安全）。
+	if ce.Stars < MinStars {
+		ce.HardThreshold = "H0"
 		ce.Passed = false
 		return
 	}
-	// H3：>18 个月无提交/发布 → 原则上淘汰。
+	// H3：>18 个月无提交/发布 → 只记 stale 警告，不淘汰；功能符合
+	// 就照常用，同等功能优先新鲜的（警告进 ledger/trace 备查）。
 	last := ce.LastCommit
 	if last == "" {
 		last = ce.LastPush
@@ -133,21 +149,15 @@ func EvaluateCandidate(ce *CandidateEval, now time.Time) {
 	if last != "" {
 		if t, err := time.Parse(time.RFC3339, last); err == nil {
 			if now.Sub(t) > time.Duration(StaleMonths)*30*24*time.Hour {
-				ce.HardThreshold = "H3"
-				ce.Passed = false
-				return
+				ce.Stale = true
+				ce.StaleWarning = fmt.Sprintf("最后更新 %s，超过 %d 个月未更新（仅作参考标记，不淘汰）", last, StaleMonths)
 			}
 		}
 	}
-	// R1 许可违规：无许可证 / NC / 仅限非商用 → 淘汰；
-	// LGPL/MPL 与 GPL 只限制“源码并入 Go 本体 / 抄进公开库”，
-	// 独立进程调用放行（口径 B），不在检索层淘汰。
-	tier := licenseTier(ce.License)
-	if tier == "banned" {
-		ce.RedLines = append(ce.RedLines, "R1")
-		ce.Passed = false
-		return
-	}
+	// 许可证：只记录分级（licenseTier），不淘汰、不记红线。
+	// 无许可证 / NC / GPL 等一律放行进下一步，由模型判覆盖度；
+	// 锻造工具只进私密仓，不进公开库。
+	_ = licenseTier(ce.License)
 	// R2 安全扫描：轻量信号命中 → 记红线（锻造侧三阶检查再定）。
 	if ce.SecurityFlag != "" {
 		ce.RedLines = append(ce.RedLines, "R2")

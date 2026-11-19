@@ -167,6 +167,139 @@ func (s *Store) ReadBlueprint(gapID string) (string, error) {
 	return string(b), nil
 }
 
+// ---- 查询词生成（2026-11-19 修正：关键判断改 LLM 驱动） ----
+
+// queryPromptHead 是查询词生成的冻结提示词：模型按缺口写两条查询。
+const queryPromptHead = `你是 007 的锻造查询词写手。根据下面的缺口原文，写两条 GitHub 仓库搜索查询，只输出一个 JSON 对象，不要任何解释、不要 markdown 代码围栏。
+字段：
+{"focused":"聚焦查询（1-2 个核心词，不要加 language 限定，不要加多余的词）",
+ "broad":"放宽查询（去 language 限定，换同义词或更通用的词）"}
+硬规则（违反即错）：
+- 聚焦查询只能含 1-2 个词，必须是缺口里最核心的功能词；
+- 两条查询都不许加 language: 限定；
+- 不要把缺口原文整句照抄，不要加 the/and/for 这类停用词。`
+
+// QueryDecision 是查询词生成的模型输出。
+type QueryDecision struct {
+	Focused string `json:"focused"`
+	Broad   string `json:"broad"`
+}
+
+// ParseQueryDecision 解析查询词生成 JSON（focused 必填）。
+func ParseQueryDecision(reply string) (*QueryDecision, error) {
+	start := strings.Index(reply, "{")
+	end := strings.LastIndex(reply, "}")
+	if start < 0 || end < 0 || end < start {
+		return nil, fmt.Errorf("forge queries: 回复里没有 JSON 对象")
+	}
+	var d QueryDecision
+	if err := json.Unmarshal([]byte(reply[start:end+1]), &d); err != nil {
+		return nil, fmt.Errorf("forge queries: JSON 非法: %w", err)
+	}
+	if strings.TrimSpace(d.Focused) == "" {
+		return nil, fmt.Errorf("forge queries: focused 为空")
+	}
+	return &d, nil
+}
+
+// rewritePromptHead 是查询重写（0 结果时）的冻结提示词。
+const rewritePromptHead = `你是 007 的锻造查询词写手。上一轮搜索 0 结果，根据下面的缺口原文与已用查询，重写一条新的 GitHub 仓库搜索查询，只输出一个 JSON 对象，不要任何解释、不要 markdown 代码围栏。
+字段：
+{"query":"重写后的查询（1-3 个核心词，不加 language 限定）"}
+硬规则（违反即错）：
+- 必须换词，不能原样重复已用过的查询；
+- 只用缺口里最核心的功能词，去掉可能跑题的修饰词；
+- 不加 language: 限定。`
+
+// ParseRewriteDecision 解析查询重写 JSON（query 必填）。
+func ParseRewriteDecision(reply string) (string, error) {
+	start := strings.Index(reply, "{")
+	end := strings.LastIndex(reply, "}")
+	if start < 0 || end < 0 || end < start {
+		return "", fmt.Errorf("forge rewrite: 回复里没有 JSON 对象")
+	}
+	var d struct {
+		Query string `json:"query"`
+	}
+	if err := json.Unmarshal([]byte(reply[start:end+1]), &d); err != nil {
+		return "", fmt.Errorf("forge rewrite: JSON 非法: %w", err)
+	}
+	if strings.TrimSpace(d.Query) == "" {
+		return "", fmt.Errorf("forge rewrite: query 为空")
+	}
+	return d.Query, nil
+}
+
+// ---- 第零层模型判定（2026-11-19 修正：关键判断改 LLM 驱动） ----
+
+// layer0PromptHead 是第零层判定的冻结提示词：模型判已有工具是否
+// 真能覆盖缺口。只输出 JSON，不要解释。
+const layer0PromptHead = `你是 007 的锻造第零层检查员。根据下面的缺口与候选工具清单，判断本地是否已有工具能覆盖这个缺口，只输出一个 JSON 对象，不要任何解释、不要 markdown 代码围栏。
+字段：
+{"hit":true/false,
+ "tool_id":"命中的工具 id（未命中时空串）",
+ "coverage":0-100（该工具对缺口功能的覆盖度，整数；未命中填 0）,
+ "reason":"一句话依据"}
+硬规则（违反即错）：
+- 只有某个工具确实能干缺口里说的活、覆盖 ≥80%，才判 hit；
+- 只看名字像、关键词重叠、功能沾边，都不算 hit；
+- 不确定的一律判 no-hit；
+- 候选清单里标了“已隔离/已废弃”的工具，判 hit 时要在 reason 里写明它的状态。`
+
+// Layer0Decision 是第零层判定的模型输出。
+type Layer0Decision struct {
+	Hit      bool   `json:"hit"`
+	ToolID   string `json:"tool_id"`
+	Coverage int    `json:"coverage"`
+	Reason   string `json:"reason"`
+}
+
+// ParseLayer0Decision 解析第零层判定 JSON。
+func ParseLayer0Decision(reply string) (*Layer0Decision, error) {
+	start := strings.Index(reply, "{")
+	end := strings.LastIndex(reply, "}")
+	if start < 0 || end < 0 || end < start {
+		return nil, fmt.Errorf("forge layer0: 回复里没有 JSON 对象")
+	}
+	var d Layer0Decision
+	if err := json.Unmarshal([]byte(reply[start:end+1]), &d); err != nil {
+		return nil, fmt.Errorf("forge layer0: JSON 非法: %w", err)
+	}
+	return &d, nil
+}
+
+// ---- 覆盖度判定（2026-11-19 修正：关键判断改 LLM 驱动） ----
+
+// coveragePromptHead 是候选覆盖度判定的冻结提示词。
+const coveragePromptHead = `你是 007 的锻造覆盖度评审。根据下面的缺口与候选摘要，判断这个候选能覆盖缺口功能的百分之多少，只输出一个 JSON 对象，不要任何解释、不要 markdown 代码围栏。
+字段：
+{"coverage":0-100（整数）,
+ "reason":"一句话依据：覆盖了哪些、缺了哪些"}
+硬规则（违反即错）：
+- 只看名字像、关键词重叠、功能沾边，都不能算覆盖；
+- 缺了缺口里明确要求的关键能力，覆盖度就要往下扣；
+- 不确定时往低了估，不要往高了估。`
+
+// ParseCoverageDecision 解析覆盖度判定 JSON。
+func ParseCoverageDecision(reply string) (int, string, error) {
+	start := strings.Index(reply, "{")
+	end := strings.LastIndex(reply, "}")
+	if start < 0 || end < 0 || end < start {
+		return 0, "", fmt.Errorf("forge coverage: 回复里没有 JSON 对象")
+	}
+	var d struct {
+		Coverage int    `json:"coverage"`
+		Reason   string `json:"reason"`
+	}
+	if err := json.Unmarshal([]byte(reply[start:end+1]), &d); err != nil {
+		return 0, "", fmt.Errorf("forge coverage: JSON 非法: %w", err)
+	}
+	if d.Coverage < 0 || d.Coverage > 100 {
+		return 0, "", fmt.Errorf("forge coverage: 覆盖度 %d 超出 0-100", d.Coverage)
+	}
+	return d.Coverage, d.Reason, nil
+}
+
 // ---- 分流判定（规格 §2A.4，锻造侧模型调用） ----
 
 // triagePromptHead 是分流判定的冻结提示词：决定采用/包装 vs 自造。
@@ -182,9 +315,8 @@ const triagePromptHead = `你是 007 的锻造分流器。根据下面的缺口�
 - 覆盖 <80% → 必须 self_build；
 - 胶水预计 >100 行 → 必须 self_build；
 - 需魔改上游非公开接口、或需为小功能单独装一套新语言运行时 → 必须 self_build；
-- 候选无 LICENSE 或仅限非商用 → 必须 self_build；
-- GPL/AGPL 候选只能独立 CLI 进程调用，抄代码进公开库禁止（但这不构成转自造的理由，独立调用即可）；
-- 采用/包装分支：1 条 CLI 命令或 ≤50 行包装脚本内完成目标动作、无需常驻进程或独立数据库、5 条红线全过。`
+- 许可证只记录，不构成转自造的理由（2026-11-19 用户定：自迭代工具只进私密仓、不进公开仓、不卖；无许可证、禁商用、GPL/AGPL 都不淘汰，license_tier 字段只做记录）；
+- 采用/包装分支：1 条 CLI 命令或 ≤50 行包装脚本内完成目标动作、无需常驻进程或独立数据库、其余红线全过。`
 
 // TriageDecision 是分流判定的模型输出。
 type TriageDecision struct {
@@ -218,9 +350,10 @@ func ParseTriageDecision(reply string) (*TriageDecision, error) {
 			return nil, fmt.Errorf("forge triage: 采用/包装分支缺 candidate")
 		}
 		// 硬规则兜底：模型判错时强制改判自造（不静默放行）。
-		if d.Coverage < 80 || d.WrapperLines > 100 || d.LicenseTier == "banned" {
+		// 许可证不参与兜底（2026-11-19 用户定：只记录，不否决）。
+		if d.Coverage < 80 || d.WrapperLines > 100 {
 			d.Branch = "self_build"
-			d.Reason = fmt.Sprintf("硬规则兜底改判自造（coverage=%d wrapper_lines=%d license=%s）：%s",
+			d.Reason = fmt.Sprintf("硬规则兜底改判自造（coverage=%d wrapper_lines=%d license=%s 只记录）：%s",
 				d.Coverage, d.WrapperLines, d.LicenseTier, d.Reason)
 		}
 	}

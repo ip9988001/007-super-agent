@@ -1,6 +1,7 @@
 package retrieval
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -143,7 +144,9 @@ func TestLayer0HitNoExternalCalls(t *testing.T) {
 	c := newTestClient(mt)
 	tr, err := c.Retrieve(t.Context(), GapInput{
 		GapID: "gap-2026-11-19-002", TaskText: "markdown to html cli",
-		LocalCheck: func(string) (bool, string) { return true, "已有工具 cap-fetch-md2html" },
+		LocalCheck: func(context.Context, string) (bool, string, error) {
+			return true, "已有工具 cap-fetch-md2html", nil
+		},
 	})
 	if err != nil {
 		t.Fatalf("Retrieve: %v", err)
@@ -364,15 +367,16 @@ func TestEvaluateHardThresholds(t *testing.T) {
 		ce   CandidateEval
 		want string // "" 表示通过
 	}{
-		{"archived H2", CandidateEval{Archived: true}, "H2"},
-		{"no license H1", CandidateEval{License: "", LicenseFileOK: false, ReadmeOK: true, DepsFile: "package.json"}, "H1"},
-		{"stale H3", CandidateEval{License: "MIT", LicenseFileOK: true, ReadmeOK: true, DepsFile: "package.json", LastCommit: "2024-01-01T00:00:00Z"}, "H3"},
-		{"no license field banned R1", CandidateEval{License: "NOASSERTION", LicenseFileOK: true, ReadmeOK: true, DepsFile: "package.json", LastCommit: "2026-10-01T00:00:00Z"}, "R1"},
-		{"gpl passes (口径B)", CandidateEval{License: "GPL-3.0", LicenseFileOK: true, ReadmeOK: true, DepsFile: "package.json", LastCommit: "2026-10-01T00:00:00Z"}, ""},
-		{"mit passes", CandidateEval{License: "MIT", LicenseFileOK: true, ReadmeOK: true, DepsFile: "package.json", LastCommit: "2026-10-01T00:00:00Z"}, ""},
-		{"security flag R2", CandidateEval{License: "MIT", LicenseFileOK: true, ReadmeOK: true, DepsFile: "package.json", LastCommit: "2026-10-01T00:00:00Z", SecurityFlag: "curl|bash"}, "R2"},
-		{"heavy runtime R3", CandidateEval{License: "MIT", LicenseFileOK: true, ReadmeOK: true, DepsFile: "package.json", LastCommit: "2026-10-01T00:00:00Z", RuntimeNeed: "heavy:cargo"}, "R3"},
-		{"no readme no deps R5", CandidateEval{License: "MIT", LicenseFileOK: true, LastCommit: "2026-10-01T00:00:00Z"}, "R5"},
+		{"archived H2", CandidateEval{Archived: true, Stars: 800}, "H2"},
+		{"stars<700 H0", CandidateEval{Stars: 100, License: "MIT", LicenseFileOK: true, ReadmeOK: true, DepsFile: "package.json", LastCommit: "2026-10-01T00:00:00Z"}, "H0"},
+		{"no license passes (record only)", CandidateEval{Stars: 800, License: "", LicenseFileOK: false, ReadmeOK: true, DepsFile: "package.json", LastCommit: "2026-10-01T00:00:00Z"}, ""},
+		{"stale H3 warning only", CandidateEval{Stars: 800, License: "MIT", LicenseFileOK: true, ReadmeOK: true, DepsFile: "package.json", LastCommit: "2024-01-01T00:00:00Z"}, ""},
+		{"no license field passes (record only)", CandidateEval{Stars: 800, License: "NOASSERTION", LicenseFileOK: true, ReadmeOK: true, DepsFile: "package.json", LastCommit: "2026-10-01T00:00:00Z"}, ""},
+		{"gpl passes (record only)", CandidateEval{Stars: 800, License: "GPL-3.0", LicenseFileOK: true, ReadmeOK: true, DepsFile: "package.json", LastCommit: "2026-10-01T00:00:00Z"}, ""},
+		{"mit passes", CandidateEval{Stars: 800, License: "MIT", LicenseFileOK: true, ReadmeOK: true, DepsFile: "package.json", LastCommit: "2026-10-01T00:00:00Z"}, ""},
+		{"security flag R2", CandidateEval{Stars: 800, License: "MIT", LicenseFileOK: true, ReadmeOK: true, DepsFile: "package.json", LastCommit: "2026-10-01T00:00:00Z", SecurityFlag: "curl|bash"}, "R2"},
+		{"heavy runtime R3", CandidateEval{Stars: 800, License: "MIT", LicenseFileOK: true, ReadmeOK: true, DepsFile: "package.json", LastCommit: "2026-10-01T00:00:00Z", RuntimeNeed: "heavy:cargo"}, "R3"},
+		{"no readme no deps R5", CandidateEval{Stars: 800, License: "MIT", LicenseFileOK: true, LastCommit: "2026-10-01T00:00:00Z"}, "R5"},
 	}
 	for _, tc := range cases {
 		ce := tc.ce
@@ -387,6 +391,12 @@ func TestEvaluateHardThresholds(t *testing.T) {
 		if tc.want == "" && !ce.Passed {
 			t.Errorf("%s: 应通过却未通过", tc.name)
 		}
+	}
+	// H3 降为警告：超 18 个月未更新仍通过，但必须记 stale。
+	stale := CandidateEval{Stars: 800, License: "MIT", LicenseFileOK: true, ReadmeOK: true, DepsFile: "package.json", LastCommit: "2024-01-01T00:00:00Z"}
+	EvaluateCandidate(&stale, now)
+	if !stale.Passed || !stale.Stale || stale.StaleWarning == "" {
+		t.Errorf("stale 应通过且记警告，得到 passed=%v stale=%v warning=%q", stale.Passed, stale.Stale, stale.StaleWarning)
 	}
 }
 
@@ -528,5 +538,107 @@ func TestFuzzyGapRescueByResearch(t *testing.T) {
 	}
 	if tr.Recommended != "acme/md2html" {
 		t.Fatalf("recommended=%q, want acme/md2html", tr.Recommended)
+	}
+}
+
+// TestRetrieveModelQueries 是模型写查询词的顺风局：QueryGen 给聚焦与
+// 放宽两条查询，首轮即推荐；查询不加 language 限定，留痕记 model。
+func TestRetrieveModelQueries(t *testing.T) {
+	mt := githubMock(t)
+	c := newTestClient(mt)
+	tr, err := c.Retrieve(t.Context(), GapInput{
+		GapID: "gap-2026-11-19-010", TaskText: "markdown to html cli",
+		QueryGen: func(context.Context, string) (string, string, error) {
+			return "md2html", "markdown html converter", nil
+		},
+		CoverageJudge: func(context.Context, string, string) (int, string, error) {
+			return 95, "covers markdown to html conversion", nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Retrieve: %v", err)
+	}
+	if tr.QuerySource != "model" {
+		t.Fatalf("query_source=%q, want model", tr.QuerySource)
+	}
+	if len(tr.ModelQueries) != 2 || tr.ModelQueries[0] != "md2html" {
+		t.Fatalf("model_queries=%v", tr.ModelQueries)
+	}
+	if tr.Outcome != "recommend" || tr.Recommended != "acme/md2html" {
+		t.Fatalf("outcome=%q recommended=%q", tr.Outcome, tr.Recommended)
+	}
+	if tr.SearchesUsed != 1 {
+		t.Fatalf("searches=%d, want 1（聚焦查询首轮命中）", tr.SearchesUsed)
+	}
+	if len(tr.Candidates) != 1 || tr.Candidates[0].Coverage != 95 || tr.Candidates[0].CoverageUnknown {
+		t.Fatalf("candidates=%+v, want coverage=95 已判定", tr.Candidates)
+	}
+	// 首轮搜索的查询就是模型写的聚焦查询，且不带 language 限定。
+	q := mt.requests[0].URL.Query().Get("q")
+	if q != "md2html" {
+		t.Fatalf("首轮查询 q=%q, want md2html", q)
+	}
+}
+
+// TestRetrieveModelQueryFallback 是模型写查询失败时的回退：
+// QueryGen 报错 → 机械抽取，留痕记 fallback-mechanical，仍能推荐。
+func TestRetrieveModelQueryFallback(t *testing.T) {
+	mt := githubMock(t)
+	c := newTestClient(mt)
+	tr, err := c.Retrieve(t.Context(), GapInput{
+		GapID: "gap-2026-11-19-011", TaskText: "markdown to html cli",
+		Keywords: []string{"markdown", "html", "cli"},
+		QueryGen: func(context.Context, string) (string, string, error) {
+			return "", "", fmt.Errorf("model down")
+		},
+	})
+	if err != nil {
+		t.Fatalf("Retrieve: %v", err)
+	}
+	if tr.QuerySource != "fallback-mechanical" {
+		t.Fatalf("query_source=%q, want fallback-mechanical", tr.QuerySource)
+	}
+	if tr.Outcome != "recommend" {
+		t.Fatalf("outcome=%q, want recommend（机械回退仍应走通）", tr.Outcome)
+	}
+}
+
+// TestCoverageJudgeR4 是覆盖度模型判定：判 60% → 不通过且记 R4；
+// 判 90% → 通过且 Coverage 有值。
+func TestCoverageJudgeR4(t *testing.T) {
+	mt := githubMock(t)
+	c := newTestClient(mt)
+	c.coverageTaskText = "markdown to html cli"
+	c.coverageJudge = func(context.Context, string, string) (int, string, error) {
+		return 60, "only converts part of the format", nil
+	}
+	tr := &Trace{GapID: "gap-x"}
+	ce, err := c.DeepDive(t.Context(), tr, "acme/md2html")
+	if err != nil {
+		t.Fatalf("DeepDive: %v", err)
+	}
+	if ce.Passed || ce.Coverage != 60 || ce.CoverageUnknown {
+		t.Fatalf("覆盖 60%% 应不通过，得到 %+v", ce)
+	}
+	found := false
+	for _, r := range ce.RedLines {
+		if r == "R4" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("覆盖 <80%% 应记 R4，得到 %v", ce.RedLines)
+	}
+	// 判 90% → 通过。
+	c.coverageJudge = func(context.Context, string, string) (int, string, error) {
+		return 90, "covers the conversion", nil
+	}
+	tr2 := &Trace{GapID: "gap-y"}
+	ce2, err := c.DeepDive(t.Context(), tr2, "acme/md2html")
+	if err != nil {
+		t.Fatalf("DeepDive 2: %v", err)
+	}
+	if !ce2.Passed || ce2.Coverage != 90 || ce2.CoverageUnknown {
+		t.Fatalf("覆盖 90%% 应通过，得到 %+v", ce2)
 	}
 }

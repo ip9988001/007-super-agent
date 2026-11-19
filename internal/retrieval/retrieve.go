@@ -8,6 +8,19 @@ import (
 	"time"
 )
 
+// QueryGenerator 是模型写查询词：输入缺口原文，返回聚焦查询（1–2 个
+// 核心词，不加 language 限定）与放宽查询（去 language、换同义词）。
+// 为 nil 时回退到 ExtractKeywords 机械抽取（留痕注明回退）。
+type QueryGenerator func(ctx context.Context, taskText string) (focused, broad string, err error)
+
+// QueryRewriter 是模型重写查询：上一轮 0 结果时，看已搜情况重写。
+// prior 是已用查询与每轮 top10 数的摘要。为 nil 时回退到 refineQuery。
+type QueryRewriter func(ctx context.Context, taskText, prior string) (string, error)
+
+// CoverageJudge 是模型判覆盖度：输入缺口原文与候选摘要，返回 0–100
+// 的覆盖度与一句话理由。≥80% 才算覆盖（R4）。
+type CoverageJudge func(ctx context.Context, taskText, candidate string) (coverage int, reason string, err error)
+
 // GapInput 是一次检索的输入。
 type GapInput struct {
 	GapID    string // gap-YYYY-MM-DD-NNN
@@ -16,8 +29,14 @@ type GapInput struct {
 	Keywords []string
 	// LocalCheck：第零层本地检查（调用方注入：查自家注册表 / wiki /
 	// 隔离记录）。命中时返回 (true, 说明)，不做任何外部搜索。
-	// 为 nil 时跳过第零层。
-	LocalCheck func(taskText string) (hit bool, detail string)
+	// 为 nil 时跳过第零层。模型不可用时必须返回 no-hit，绝不误命中；
+	// 返回 error 时 Retrieve 直接失败（预算耗尽等要向上传）。
+	LocalCheck func(ctx context.Context, taskText string) (hit bool, detail string, err error)
+	// QueryGen / RewriteQuery / CoverageJudge：模型驱动的三处判断
+	//（2026-11-19 修正：关键判断改 LLM 驱动）。为 nil 时各走机械回退。
+	QueryGen      QueryGenerator
+	RewriteQuery  QueryRewriter
+	CoverageJudge CoverageJudge
 	// ResumeQuery / ResumeReason：锻造侧模型判定后要求追加一轮检索时用：
 	// 下一轮改用该查询与理由（仍计入 ≤3 次总额度）。
 	ResumeQuery  string
@@ -41,6 +60,8 @@ type Trace struct {
 	GapID          string          `json:"gap_id"`
 	Layer0Hit      bool            `json:"layer0_hit"`
 	Layer0Detail   string          `json:"layer0_detail,omitempty"`
+	QuerySource    string          `json:"query_source,omitempty"` // model / fallback-mechanical
+	ModelQueries   []string        `json:"model_queries,omitempty"` // 模型写的查询词（有则记）
 	Rounds         []SearchRound   `json:"rounds"`
 	Candidates     []CandidateEval `json:"candidates"`
 	Recommended    string          `json:"recommended,omitempty"`
@@ -76,8 +97,22 @@ func (tr *Trace) Summary() string {
 	if tr.DeferredReason != "" {
 		fmt.Fprintf(&b, " 顺延原因：%s", tr.DeferredReason)
 	}
+	if tr.QuerySource != "" {
+		fmt.Fprintf(&b, " 查询来源=%s", tr.QuerySource)
+		if len(tr.ModelQueries) > 0 {
+			fmt.Fprintf(&b, " 模型查询=%q", strings.Join(tr.ModelQueries, " | "))
+		}
+	}
 	for i, c := range tr.Candidates {
 		fmt.Fprintf(&b, " 候选%d=%s stars=%d 许可=%s 过=%v 红线=%v", i+1, c.FullName, c.Stars, c.License, c.Passed, c.RedLines)
+		if !c.CoverageUnknown {
+			fmt.Fprintf(&b, " 覆盖=%d%%(%s)", c.Coverage, c.CoverageReason)
+		} else {
+			fmt.Fprintf(&b, " 覆盖=未判定")
+		}
+		if c.Stale {
+			fmt.Fprintf(&b, " stale警告(%s)", c.StaleWarning)
+		}
 		var raw []string
 		if c.ReadmeOK {
 			raw = append(raw, "README")
@@ -116,11 +151,23 @@ func (tr *Trace) Summary() string {
 func (c *Client) Retrieve(ctx context.Context, in GapInput) (*Trace, error) {
 	start := time.Now()
 	tr := &Trace{GapID: in.GapID}
+	// 本次检索的覆盖度判定上下文（DeepDive 用；检索结束即清掉，
+	// 覆盖度是任务相关的，不进缓存——见 saveCache 的剥离逻辑）。
+	c.coverageJudge = in.CoverageJudge
+	c.coverageTaskText = in.TaskText
+	defer func() { c.coverageJudge = nil; c.coverageTaskText = "" }()
 
-	// 第零层：强制全查，本地零成本。命中即停，不做外部搜索；
+	// 第零层：强制全查。命中即停，不做外部搜索；
 	// 未命中也把检查摘要写进留痕（监工要核验“确实查过”）。
+	// LocalCheck 本身是模型驱动的（锻造侧注入）；它返回 error 时
+	// 直接失败（预算耗尽等要向上传，不静默走外部搜索）。
 	if in.LocalCheck != nil {
-		hit, detail := in.LocalCheck(in.TaskText)
+		hit, detail, lerr := in.LocalCheck(ctx, in.TaskText)
+		if lerr != nil {
+			tr.Layer0Detail = detail
+			tr.DurationMs = time.Since(start).Milliseconds()
+			return tr, lerr
+		}
 		tr.Layer0Detail = detail
 		if hit {
 			tr.Layer0Hit = true
@@ -130,21 +177,42 @@ func (c *Client) Retrieve(ctx context.Context, in GapInput) (*Trace, error) {
 		}
 	}
 
-	keywords := in.Keywords
-	if len(keywords) == 0 {
-		keywords = ExtractKeywords(in.TaskText)
+	// 查询词：优先模型写（2026-11-19 修正）；模型失败/空返回时
+	// 才回退到 ExtractKeywords 机械抽取，留痕注明回退。
+	var modelQueries []string
+	querySource := "fallback-mechanical"
+	var query string
+	if in.QueryGen != nil {
+		if focused, broad, qerr := in.QueryGen(ctx, in.TaskText); qerr == nil && strings.TrimSpace(focused) != "" {
+			query = strings.TrimSpace(focused)
+			modelQueries = append(modelQueries, query)
+			if strings.TrimSpace(broad) != "" {
+				modelQueries = append(modelQueries, strings.TrimSpace(broad))
+			}
+			querySource = "model"
+		}
 	}
-	query := strings.Join(keywords, " ")
-	if strings.TrimSpace(query) == "" {
-		query = in.TaskText
+	tr.QuerySource = querySource
+	tr.ModelQueries = modelQueries
+	// 机械回退路径：关键词 + 语言生态顺序（旧行为原样保留，
+	// 只在模型不可用时走；测试 TestFuzzyGapRescueByResearch 覆盖它）。
+	var keywords []string
+	var ecos []string
+	if query == "" {
+		keywords = in.Keywords
+		if len(keywords) == 0 {
+			keywords = ExtractKeywords(in.TaskText)
+		}
+		query = strings.Join(keywords, " ")
+		if strings.TrimSpace(query) == "" {
+			query = in.TaskText
+		}
+		ecos = ecosystemOrder(keywords, in.TaskText)
 	}
-	// 外部层按语言生态动态顺序（规格 §2A）：每轮搜一个生态层，
-	// 缺口里明确提到的语言排最前，其余默认 python → javascript → go。
-	ecos := ecosystemOrder(keywords, in.TaskText)
 	ecoIdx := 0
-	paged := false // 当前生态层是否已翻过第 2 页
+	paged := false // 当前生态层是否已翻过第 2 页（仅机械回退路径用）
 
-	// 追加轮（锻造侧模型要求）：先用它，再走机械轮次。
+	// 追加轮（锻造侧模型要求）：先用它，再走正常轮次。
 	pendingQuery, pendingReason := in.ResumeQuery, in.ResumeReason
 
 	for tr.SearchesUsed < c.MaxSearchesPerGap {
@@ -157,6 +225,34 @@ func (c *Client) Retrieve(ctx context.Context, in GapInput) (*Trace, error) {
 		if pendingQuery != "" {
 			q, page, reason = pendingQuery, 1, pendingReason
 			pendingQuery, pendingReason = "", ""
+		} else if querySource == "model" {
+			// 模型查询路径：不加 language 限定、不机械翻页换生态。
+			// 第 1 轮聚焦查询，第 2 轮放宽查询，第 3 轮模型看已搜结果重写。
+			switch len(tr.Rounds) {
+			case 0:
+				eco = "model"
+				q, page, reason = modelQueries[0], 1, ""
+			case 1:
+				eco = "model"
+				if len(modelQueries) > 1 {
+					q = modelQueries[1]
+				} else {
+					q = modelQueries[0]
+				}
+				page, reason = 1, tr.nextReason()
+			default:
+				eco = "model"
+				page, reason = 1, tr.nextReason()
+				if in.RewriteQuery != nil {
+					if rq, rerr := in.RewriteQuery(ctx, in.TaskText, tr.priorSummary()); rerr == nil && strings.TrimSpace(rq) != "" {
+						q = strings.TrimSpace(rq)
+					} else {
+						q = refineQuery(tr.Rounds[len(tr.Rounds)-1].Query)
+					}
+				} else {
+					q = refineQuery(tr.Rounds[len(tr.Rounds)-1].Query)
+				}
+			}
 		} else if len(tr.Rounds) == 0 {
 			eco = ecos[0]
 			q, page, reason = ecosystemQuery(query, eco), 1, ""
@@ -238,6 +334,16 @@ func asRateLimited(err error) (error, bool) {
 		return sl, true
 	}
 	return nil, false
+}
+
+// priorSummary 汇总已搜轮次（供模型重写查询时看：用过哪些查询、
+// 每轮返回多少、留存多少）。只含查询词与计数，不含候选详情。
+func (tr *Trace) priorSummary() string {
+	var b strings.Builder
+	for i, r := range tr.Rounds {
+		fmt.Fprintf(&b, "第%d轮 query=%q top10=%d kept=%d reason=%s；", i+1, r.Query, len(r.Top10), len(r.Kept), r.Reason)
+	}
+	return b.String()
 }
 
 // nextReason 按上一轮的淘汰情况定结构化重搜理由：
@@ -336,8 +442,8 @@ func refineQuery(query string) string {
 	return strings.Join(parts[:len(parts)-1], " ")
 }
 
-// searchRound 跑一轮搜索并粗筛前十：Archived 的直接淘汰；其余按新鲜度
-// 排序，留 3–5 个（星数 <50 的排最后，仍可留作候补）。
+// searchRound 跑一轮搜索并粗筛前十：Archived 的直接淘汰；星数
+// <700（H0）的直接淘汰；其余按新鲜度排序，留 3–5 个。
 func (c *Client) searchRound(ctx context.Context, tr *Trace, query string, page int, reason string) (SearchRound, error) {
 	round := SearchRound{
 		Query: query, Page: page, Reason: reason,
@@ -350,7 +456,7 @@ func (c *Client) searchRound(ctx context.Context, tr *Trace, query string, page 
 	for _, it := range items {
 		round.Top10 = append(round.Top10, it.FullName)
 	}
-	// 粗筛：Archived 直接淘汰；其余按新鲜度排序。
+	// 粗筛：Archived 直接淘汰；星数 <700（H0）直接淘汰；其余按新鲜度排序。
 	sorted := sortCandidatesByFreshness(items)
 	kept := 0
 	for _, it := range sorted {
@@ -359,6 +465,10 @@ func (c *Client) searchRound(ctx context.Context, tr *Trace, query string, page 
 		}
 		if it.Archived {
 			round.Eliminated[it.FullName] = "archived"
+			continue
+		}
+		if it.Stars < MinStars {
+			round.Eliminated[it.FullName] = "stars<700"
 			continue
 		}
 		// 已深挖过的候选不再重复深挖（同一缺口内去重）。
@@ -415,8 +525,39 @@ func (c *Client) deepDiveRound(ctx context.Context, tr *Trace, round SearchRound
 // 否则详情 + 提交 + Release（3 次核心调用）+ raw 直读 README、
 // LICENSE、依赖清单（package.json / pyproject.toml / go.mod，
 // 按顺序命中即停），再做可查的硬门槛与红线判定。
+// judgeCoverage 用模型判覆盖度（R4）：只在硬门槛与红线已过时调。
+// 未接模型时保持 CoverageUnknown（调用方按旧口径处理）；模型失败
+// 时不误判为通过：Passed=false，记 R4，理由写明失败原因。
+func (c *Client) judgeCoverage(ctx context.Context, ce *CandidateEval) {
+	if c.coverageJudge == nil || c.coverageTaskText == "" {
+		return
+	}
+	summary := fmt.Sprintf("%s stars=%d 许可=%s README=%v 依赖清单=%s 运行需求=%s 最后更新=%s",
+		ce.FullName, ce.Stars, ce.License, ce.ReadmeOK, ce.DepsFile, ce.RuntimeNeed, ce.LastCommit)
+	cov, reason, err := c.coverageJudge(ctx, c.coverageTaskText, summary)
+	if err != nil {
+		ce.Passed = false
+		ce.RedLines = append(ce.RedLines, "R4")
+		ce.CoverageReason = "覆盖度模型判定失败：" + err.Error()
+		ce.CoverageUnknown = true
+		return
+	}
+	ce.Coverage = cov
+	ce.CoverageReason = reason
+	ce.CoverageUnknown = false
+	if cov < MinCoverage {
+		ce.Passed = false
+		ce.RedLines = append(ce.RedLines, "R4")
+	}
+}
+
 func (c *Client) DeepDive(ctx context.Context, tr *Trace, fullName string) (*CandidateEval, error) {
 	if ce, ok := c.loadCache(fullName); ok {
+		// 缓存里只有硬门槛层面的判定（覆盖度是任务相关的，存时已剥掉，
+		// 见 saveCache）；本次缺口的覆盖度现判。
+		if ce.Passed {
+			c.judgeCoverage(ctx, ce)
+		}
 		return ce, nil
 	}
 	owner, repo, _ := strings.Cut(fullName, "/")
@@ -501,6 +642,9 @@ func (c *Client) DeepDive(ctx context.Context, tr *Trace, fullName string) (*Can
 	}
 
 	EvaluateCandidate(ce, c.Now())
+	if ce.Passed {
+		c.judgeCoverage(ctx, ce)
+	}
 	c.saveCache(ce)
 	return ce, nil
 }

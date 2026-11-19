@@ -88,6 +88,11 @@ type Client struct {
 	lastSearch time.Time
 	remaining  map[string]int       // resource -> 最近一次响应头的 Remaining
 	resetAt    map[string]time.Time // resource -> 最近一次响应头的 Reset
+
+	// 本次检索的覆盖度判定上下文（Retrieve 进入时设、退出时清；
+	// 锻造是串行的，同一时间只跑一个缺口）。
+	coverageJudge    CoverageJudge
+	coverageTaskText string
 }
 
 // New 建一个检索客户端。httpDoer 为 nil 时用默认 HTTP 客户端
@@ -514,11 +519,31 @@ func (c *Client) saveCache(ce *CandidateEval) {
 	if c.CacheDir == "" {
 		return
 	}
-	ce.CachedAt = c.Now()
-	b, err := json.Marshal(ce)
+	// 覆盖度是任务相关的：存缓存前剥掉（并去掉因此记的 R4、恢复
+	// 硬门槛层面的 Passed），否则别的缺口会读到上一个缺口的覆盖度。
+	cp := *ce
+	cp.Coverage = 0
+	cp.CoverageReason = ""
+	cp.CoverageUnknown = true
+	// 建新切片，防串改原 ce.RedLines 的底数组。
+	var kept []string
+	hadR4 := false
+	for _, r := range ce.RedLines {
+		if r == "R4" {
+			hadR4 = true
+			continue
+		}
+		kept = append(kept, r)
+	}
+	cp.RedLines = kept
+	if hadR4 && cp.HardThreshold == "" && len(kept) == 0 {
+		cp.Passed = true
+	}
+	cp.CachedAt = c.Now()
+	b, err := json.Marshal(&cp)
 	if err != nil {
 		return
 	}
 	_ = os.MkdirAll(c.CacheDir, 0o700)
-	_ = os.WriteFile(c.cachePath(ce.FullName), b, 0o600)
+	_ = os.WriteFile(c.cachePath(cp.FullName), b, 0o600)
 }

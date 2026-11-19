@@ -67,19 +67,19 @@ func copyFile(src, dst string) error {
 	return err
 }
 
-// 1. 加载 84 条（第 19 步第 5 批：73 − 2 遗留 + 13 新增）。
-func TestLoad84Entries(t *testing.T) {
+// 1. 加载 87 条（84 + 2026-11-19 三个设计 skill：hallmark / taste-skill / hyperframes-skill）。
+func TestLoad87Entries(t *testing.T) {
 	rg, err := Load(fixture(t))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if got := rg.Count(); got != 84 {
-		t.Fatalf("Count = %d, want 84", got)
+	if got := rg.Count(); got != 87 {
+		t.Fatalf("Count = %d, want 87", got)
 	}
 	if got := len(Categories()); got != 9 {
 		t.Fatalf("Categories = %d, want 9", got)
 	}
-	want := map[string]int{"fetch": 13, "code": 8, "seo": 7, "design": 8, "security": 5, "runtime": 7, "media": 6, "ops": 16, "memory": 14}
+	want := map[string]int{"fetch": 13, "code": 8, "seo": 7, "design": 11, "security": 5, "runtime": 7, "media": 6, "ops": 16, "memory": 14}
 	for cat, n := range want {
 		if got := len(rg.EntriesByCategory(cat)); got != n {
 			t.Errorf("category %s = %d entries, want %d", cat, got, n)
@@ -305,8 +305,8 @@ func TestNeedsProbeAndMarkVerified(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if !rg.NeedsProbe("cap-design-hyperframes") {
-		t.Fatal("hyperframes verified=false, want NeedsProbe=true")
+	if !rg.NeedsProbe("cap-ops-tesseract") {
+		t.Fatal("tesseract verified=false, want NeedsProbe=true")
 	}
 	if rg.NeedsProbe("cap-code-semgrep") {
 		t.Fatal("semgrep verified, want NeedsProbe=false")
@@ -317,8 +317,8 @@ func TestNeedsProbeAndMarkVerified(t *testing.T) {
 	if rg.NeedsProbe("cap-memory-playbooks") {
 		t.Fatal("available=false, want NeedsProbe=false")
 	}
-	rg.MarkVerified("cap-design-hyperframes")
-	if rg.NeedsProbe("cap-design-hyperframes") {
+	rg.MarkVerified("cap-ops-tesseract")
+	if rg.NeedsProbe("cap-ops-tesseract") {
 		t.Fatal("after MarkVerified, want NeedsProbe=false")
 	}
 }
@@ -439,7 +439,7 @@ func TestEntryPointOverride(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	tool := "cap-design-hyperframes" // cli、available、verified=false
+	tool := "cap-design-hyperframes" // cli、available
 	before, ok := rg.Entry(tool)
 	if !ok {
 		t.Fatalf("Entry(%s) missing", tool)
@@ -496,7 +496,7 @@ func TestUnmarkVerified(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	tool := "cap-design-hyperframes" // verified=false
+	tool := "cap-ops-tesseract" // verified=false
 	if !rg.NeedsProbe(tool) {
 		t.Fatal("NeedsProbe before MarkVerified = false, want true")
 	}
@@ -630,8 +630,8 @@ func TestSnapshotRestoreRollback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if rg.Count() != 84 {
-		t.Fatalf("fixture 应为 84 条，得到 %d", rg.Count())
+	if rg.Count() != 87 {
+		t.Fatalf("fixture 应为 87 条，得到 %d", rg.Count())
 	}
 	snap := filepath.Join(t.TempDir(), "before.json")
 	if err := rg.Snapshot(snap); err != nil {
@@ -646,26 +646,26 @@ func TestSnapshotRestoreRollback(t *testing.T) {
 	if err := rg.AddEntry(forged); err != nil {
 		t.Fatalf("AddEntry: %v", err)
 	}
-	if rg.Count() != 85 {
-		t.Fatalf("加后应为 85 条，得到 %d", rg.Count())
+	if rg.Count() != 88 {
+		t.Fatalf("加后应为 88 条，得到 %d", rg.Count())
 	}
 	n, err := rg.RestoreSnapshot(snap)
 	if err != nil {
 		t.Fatalf("RestoreSnapshot: %v", err)
 	}
-	if n != 84 || rg.Count() != 84 {
-		t.Fatalf("回滚后应为 84 条，得到 restored=%d count=%d", n, rg.Count())
+	if n != 87 || rg.Count() != 87 {
+		t.Fatalf("回滚后应为 87 条，得到 restored=%d count=%d", n, rg.Count())
 	}
 	if _, ok := rg.Entry("forge-snapshot-test"); ok {
 		t.Fatalf("回滚后锻造工具仍在注册表里")
 	}
-	// 磁盘上的 registry.json 也回到了 84 条。
+	// 磁盘上的 registry.json 也回到了 87 条。
 	rg2, err := Load(dir)
 	if err != nil {
 		t.Fatalf("回滚后重载: %v", err)
 	}
-	if rg2.Count() != 84 {
-		t.Fatalf("磁盘 registry.json 回滚后应为 84 条，得到 %d", rg2.Count())
+	if rg2.Count() != 87 {
+		t.Fatalf("磁盘 registry.json 回滚后应为 87 条，得到 %d", rg2.Count())
 	}
 	// 锻造工具的 L3 文件也被清掉（否则下次 Load 会报孤儿 L3）。
 	if _, err := os.Stat(filepath.Join(dir, "index", "L3", "forge-snapshot-test.md")); !os.IsNotExist(err) {

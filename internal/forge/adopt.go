@@ -230,7 +230,9 @@ func (p *Pipeline) adoptOrWrap(ctx context.Context, taskID string, gap Gap, tr *
 		_ = p.Store.UpdateGapStatus(gap.GapID, "pending")
 		return err
 	}
-	// 注册（与自造同一套门禁；GPL/LGPL/MPL 强制 private-cli-only）。
+	// 注册（与自造同一套门禁）。private-cli-only 只是记录字段
+	//（2026-11-19 用户定：自迭代工具只进私密仓，许可证不阻断；
+	// 公开打包本来就不含锻造工具，注册表数据也不进公开库）。
 	privateCLI := decision.LicenseTier == "gpl" || decision.LicenseTier == "lgpl_mpl"
 	entry := registry.Entry{
 		ToolID:         "forge-" + strings.ReplaceAll(repo, "-", ""),
