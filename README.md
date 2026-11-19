@@ -42,19 +42,19 @@
 
 ## 007 自带什么
 
-装完就有 **39 个命令行工具**，一键安装脚本在 `install-toolchain.sh`（仓库根目录），版本钉死，全部走公开源，2026-11-18 在 Debian 12 测试机上逐个实测通过。另外注册表里还有 **9 个助手脚本 + 3 个 SEO 脚本 + 14 个 skill**，其中 4 个脚本、3 个 SEO 脚本和 13 个 skill 的文件就在公开库的 `tools/` 里，见下面「公开库里有什么、没有什么」。
+装完就有 **39 个命令行工具**，一键安装脚本在 `install-toolchain.sh`（仓库根目录），版本钉死，全部走公开源，2026-11-18 在 Debian 12 测试机上逐个实测通过。另外注册表里还有 **9 个助手脚本 + 3 个 SEO 脚本 + 14 个 skill**，这些文件不在公开库里，见下面「公开库里有什么、没有什么」。
 
 **抓取与浏览器（10）**：agent-reach 1.6.0、playwright 1.64.1、lightpanda 1.1.0-nightly、scrapling 0.5、httpx 0.28.1、yt-dlp 2026.10.21、curl 7.88.1、gh 2.103.2、camoufox 0.5.9、chrome-nosandbox（playwright chromium 封装）
 
 **代码与审计（11）**：rea 6.8.0、codegraph 1.6.2、semgrep 1.182.1、ast-grep 0.51.0、trivy 0.76.1、gitleaks 8.30.1、bandit 1.9.4、pip-audit 2.10.1、ghidra 12.2、rg 13.0.0、git 2.39.5
 
-**SEO 脚本（3）**：claude-seo、geo-seo-aeo、content-scorers（文件在公开库 `tools/seo-toolkit/`，无独立版本号）
+**SEO 脚本（3）**：claude-seo、geo-seo-aeo、content-scorers（随 seo-toolkit 种子走，无独立版本号）
 
 **设计（2）**：hyperframes 0.9.63、impeccable 4.7.0
 
 **基础运行环境（13）**：python3 3.11.2、node v22.23.4、npm 10.9.9、uv 0.13.5、yarn 1.22.22、java Temurin 25.0.5、pandoc 2.17.1.1、ffmpeg 5.1.9、edge-tts 7.3.1、jq 1.6、tesseract 5.3.0、magick 6.9.11-60、mpv 0.35.1
 
-**助手脚本（9）**：run-audit.sh（接 `/audit` 前缀）、cap-drift.sh、cap-scan.sh、chrome-cdp.sh、chrome-nosandbox、inventory.sh、inventory2.sh、link-selftest.cjs、totp.js（其中 run-audit.sh、chrome-cdp.sh、chrome-nosandbox、totp.js 在公开库 `tools/scripts/`）
+**助手脚本（9）**：run-audit.sh（接 `/audit` 前缀）、cap-drift.sh、cap-scan.sh、chrome-cdp.sh、chrome-nosandbox、inventory.sh、inventory2.sh、link-selftest.cjs、totp.js
 
 **Skill（14）**：长期能力 5 个——long-term（长期记忆）、adjudicator（裁决）、retrieval（检索）、migration（迁移）、forge（锻造）；工具型 9 个——agent-reach、browser-tools、edge-tts、github-get、hyperframes、impeccable、lightpanda、reverse-engineer-anything（逆向）、scrapling
 
@@ -62,11 +62,11 @@
 
 ## 公开库里有什么、没有什么
 
-**有的**：Go 框架全部代码、宪法 34 条、工具总账（84 条）、三级索引、一键安装脚本（装 39 个上游工具），以及种子里能公开的部分（`tools/`）：4 个助手脚本、3 个 SEO 脚本加它的运行器、13 个 skill 的文件。
+**有的**：Go 框架全部代码、宪法 34 条、工具总账（84 条）、三级索引、一键安装脚本（装 39 个上游工具）。
 
-**没有的**：种子其余部分（只在私有构建里）：5 个三号专属脚本（cap-drift.sh、cap-scan.sh、inventory.sh、inventory2.sh、link-selftest.cjs）、67 份能力文档、84 份设计资料、30 个停用的扩展、其余 27 个 skill。
+**没有的**：工具种子（`tools/`，933 个文件）不在公开库里。那是另一台机器上自带的文件：9 个助手脚本、SEO 工具包的脚本、14 个 skill 的文件、67 篇能力文档、84 个品牌的设计资料、30 个停用的扩展。种子只在私有构建里。
 
-**对你的影响**：注册表里 11 条指着种子文件的可执行工具，现在有 7 条能直接用——3 个 SEO 脚本（content-scorers、geo-seo-aeo、claude-seo）、chrome-nosandbox、totp.js、chrome-cdp.sh（007 通用版）、run-audit.sh（007 通用版，缺本地规则快照时自动走在线规则）；剩下 4 条（cap-drift、cap-scan、inventory、inventory2）是三号专属，查的是三号自己的系统，没有种子就用不了，启动自检会报坏、启动探针会把它们从规划器清单里拿掉。13 个 skill 的文件都在公开库里；impeccable 的引擎二进制（21MB）不在库里，首次运行时启动器会自动从 GitHub 下载并校验（VERSION 0.1.25）。
+**对你的影响**：注册表里有 11 条可执行工具的入口指着种子里的文件——2 个 SEO 脚本（content-scorers、geo-seo-aeo）、claude-seo、run-audit.sh、cap-drift.sh、cap-scan.sh、chrome-cdp.sh、chrome-nosandbox、inventory.sh、inventory2.sh、totp.js；还有 13 个 skill 的文件也在种子里。没有种子时，启动自检会把这 11 条报成坏掉（`watchdog check` 里看得到），启动探针也会把它们从规划器清单里拿掉，模型没机会挑中它们。9 个助手脚本里的 link-selftest.cjs 是三号专属、已标不可用，只存档。
 
 ## 快在哪里：分诊 + 三级索引
 

@@ -387,8 +387,8 @@ func TestProbeEntryByCallType(t *testing.T) {
 }
 
 // TestL2OpsSingleFile 是 v1.7 重新分类后的 ops：34 条拆走 18 条
-//（security 5、runtime 7、media 6）后剩 16 条，一份 ops.md 放得下
-//（3 行头 + 16 条 = 19 行），不再拆 ops-2.md；新三类各有单份 L2。
+// （security 5、runtime 7、media 6）后剩 16 条，一份 ops.md 放得下
+// （3 行头 + 16 条 = 19 行），不再拆 ops-2.md；新三类各有单份 L2。
 func TestL2OpsSingleFile(t *testing.T) {
 	rg, err := Load(fixture(t))
 	if err != nil {
@@ -619,5 +619,56 @@ func TestProbeRecordsFailureAndProbeAll(t *testing.T) {
 	}
 	if rg.ProbeFailed("cap-test-bad") {
 		t.Fatal("ProbeFailed(bad after fix) = true, want false")
+	}
+}
+
+// TestSnapshotRestoreRollback 是快照回滚：第 23 步注册前快照 → 加一条
+// 锻造工具 → RestoreSnapshot 回滚 → 条数与磁盘内容都回到快照状态。
+func TestSnapshotRestoreRollback(t *testing.T) {
+	dir := fixture(t)
+	rg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if rg.Count() != 84 {
+		t.Fatalf("fixture 应为 84 条，得到 %d", rg.Count())
+	}
+	snap := filepath.Join(t.TempDir(), "before.json")
+	if err := rg.Snapshot(snap); err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	forged := Entry{
+		ToolID: "forge-snapshot-test", Category: "ops", Subcategory: "shell",
+		CallType: "cli", EntryPoint: "/bin/true", OutputContract: "exit code",
+		SourceFile: "forge:test", OneLiner: "A forged test tool for snapshot rollback checks.",
+		Forged: true, Experimental: true, Risk: "low",
+	}
+	if err := rg.AddEntry(forged); err != nil {
+		t.Fatalf("AddEntry: %v", err)
+	}
+	if rg.Count() != 85 {
+		t.Fatalf("加后应为 85 条，得到 %d", rg.Count())
+	}
+	n, err := rg.RestoreSnapshot(snap)
+	if err != nil {
+		t.Fatalf("RestoreSnapshot: %v", err)
+	}
+	if n != 84 || rg.Count() != 84 {
+		t.Fatalf("回滚后应为 84 条，得到 restored=%d count=%d", n, rg.Count())
+	}
+	if _, ok := rg.Entry("forge-snapshot-test"); ok {
+		t.Fatalf("回滚后锻造工具仍在注册表里")
+	}
+	// 磁盘上的 registry.json 也回到了 84 条。
+	rg2, err := Load(dir)
+	if err != nil {
+		t.Fatalf("回滚后重载: %v", err)
+	}
+	if rg2.Count() != 84 {
+		t.Fatalf("磁盘 registry.json 回滚后应为 84 条，得到 %d", rg2.Count())
+	}
+	// 锻造工具的 L3 文件也被清掉（否则下次 Load 会报孤儿 L3）。
+	if _, err := os.Stat(filepath.Join(dir, "index", "L3", "forge-snapshot-test.md")); !os.IsNotExist(err) {
+		t.Fatalf("回滚后锻造工具的 L3 文件应被删除")
 	}
 }

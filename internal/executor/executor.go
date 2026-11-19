@@ -182,10 +182,12 @@ func (h *Handle) Cancel() { h.cancel() }
 
 // RunRequest 是一次执行的请求。
 type RunRequest struct {
-	TaskID           string
-	SessionID        string
-	ToolID           string
-	Argv             []string      // 要跑的命令与参数
+	TaskID    string
+	SessionID string
+	ToolID    string
+	Argv      []string // 要跑的命令与参数
+	Dir       string   // 工作目录（空 = 继承守护进程 cwd；锻造 staging 测试用它，
+	// 否则相对路径参数在守护进程 cwd 下找不到输入文件）
 	Timeout          time.Duration // ≤30s 内联，>30s 后台；>1800s 截到 1800s
 	Irreversible     bool
 	IrreversibleKind string
@@ -467,6 +469,9 @@ func capFullOutput(s string) string {
 func (e *Executor) runCmd(ctx context.Context, req RunRequest, cmdStr string, timeout time.Duration, cancel context.CancelFunc) (*Result, error) {
 	start := time.Now()
 	cmd := exec.CommandContext(ctx, req.Argv[0], req.Argv[1:]...)
+	if req.Dir != "" {
+		cmd.Dir = req.Dir
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if e.Env != nil {
 		cmd.Env = e.Env

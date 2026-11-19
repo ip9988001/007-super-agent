@@ -59,6 +59,10 @@ type StatusTriad struct {
 }
 
 // Entry 是总账里的一条工具（字段与 step1 registry.json 逐一对应）。
+// 第 23 步锻造标记（omitempty：旧条目没有这些字段，Load 不受影响）：
+// Forged 表示由锻造流程注册；Experimental 表示仍在试用期；
+// BlueprintID 是来源蓝图；Risk 是风险分级 low/medium/high；
+// PrivateCLIOnly 表示 GPL/AGPL 口径 B 的独立 CLI 工具，公开打包须跳过。
 type Entry struct {
 	ToolID         string         `json:"tool_id"`
 	Category       string         `json:"category"`
@@ -76,14 +80,19 @@ type Entry struct {
 	OneLiner       string         `json:"one_liner"`
 	VerifiedBasis  string         `json:"verified_basis"`
 	Note           string         `json:"note"`
+	Forged         bool           `json:"forged,omitempty"`
+	Experimental   bool           `json:"experimental,omitempty"`
+	BlueprintID    string         `json:"blueprint_id,omitempty"`
+	Risk           string         `json:"risk,omitempty"`
+	PrivateCLIOnly bool           `json:"private_cli_only,omitempty"`
 }
 
 type registryFile struct {
-	Version       string           `json:"version"`
-	Generated     string           `json:"generated"`
-	Total         int              `json:"total"`
-	Entries       []Entry          `json:"entries"`
-	Categories    []CategoryMeta   `json:"categories"`
+	Version       string            `json:"version"`
+	Generated     string            `json:"generated"`
+	Total         int               `json:"total"`
+	Entries       []Entry           `json:"entries"`
+	Categories    []CategoryMeta    `json:"categories"`
 	Subcategories []SubcategoryMeta `json:"subcategories"`
 }
 
@@ -126,6 +135,9 @@ func WithSession(sessionID, taskID string) Option {
 // 由 mu 保护。第 20 步：entryPointOverride 是同一口径的第二层覆盖——
 // 自进化自动应用的 entry_point 修正只活在内存里，重启即失效，
 // 永久修正仍须由人写进 registry.json；存入前必须先过探针。
+// 第 23 步例外：锻造注册/隔离会改写 registry.json（AddEntry /
+// RemoveEntry / RestoreSnapshot），因为锻造工具本来就是运行时新生
+// 的条目；改写前一律先做版本快照（见 Snapshot）。
 type Registry struct {
 	dataDir   string
 	entries   []Entry
@@ -133,6 +145,8 @@ type Registry struct {
 	byCat     map[string][]*Entry
 	catMeta   []CategoryMeta
 	subMeta   []SubcategoryMeta
+	version   string // registry.json 的 version 字段（Save 时原样写回）
+	generated string // registry.json 的 generated 字段（Save 时原样写回）
 	metrics   MetricsRecorder
 	sessionID string
 	taskID    string
@@ -166,6 +180,8 @@ func Load(dataDir string, opts ...Option) (*Registry, error) {
 	rg.entries = f.Entries
 	rg.catMeta = f.Categories
 	rg.subMeta = f.Subcategories
+	rg.version = f.Version
+	rg.generated = f.Generated
 	rg.byID = make(map[string]*Entry, len(f.Entries))
 	rg.byCat = make(map[string][]*Entry)
 	for i := range rg.entries {
@@ -234,6 +250,34 @@ func (rg *Registry) checkL3Correspondence() error {
 
 // Count 返回总账条目数。
 func (rg *Registry) Count() int { return len(rg.entries) }
+
+// AllEntries 返回全部条目的指针切片（只读；第 23 步锻造的第零层
+// 检查用）。返回的是内部指针，调用方只读字段，不许改写。
+func (rg *Registry) AllEntries() []*Entry {
+	rg.mu.RLock()
+	defer rg.mu.RUnlock()
+	out := make([]*Entry, 0, len(rg.entries))
+	for i := range rg.entries {
+		out = append(out, &rg.entries[i])
+	}
+	return out
+}
+
+// SetExperimental 改一条锻造工具的 experimental 标记并落盘
+// （第 23 步试用期转正时去掉标记用）。非锻造条目拒绝。
+func (rg *Registry) SetExperimental(toolID string, experimental bool) error {
+	rg.mu.Lock()
+	defer rg.mu.Unlock()
+	e, ok := rg.byID[toolID]
+	if !ok {
+		return fmt.Errorf("registry: 没有工具 %q", toolID)
+	}
+	if !e.Forged {
+		return fmt.Errorf("registry: %q 不是锻造工具", toolID)
+	}
+	e.Experimental = experimental
+	return rg.persist()
+}
 
 // Entry 按 tool_id 取一条；不存在返回 false。
 // 返回的是拷贝（带上内存覆盖层的 entry_point）：调用方只读字段，
@@ -432,6 +476,231 @@ func (rg *Registry) ProbeAll() (checked, ok, failed int) {
 	return checked, ok, failed
 }
 
+// ---- 第 23 步锻造：注册 / 隔离 / 快照（改写 registry.json 的唯一入口） ----
+
+// registryPath 返回 registry.json 的路径。
+func (rg *Registry) registryPath() string {
+	return filepath.Join(rg.dataDir, "registry", "registry.json")
+}
+
+// persist 把内存里的总账写回 registry.json（0600），并写 L3 文件。
+// 调用方须已持有 rg.mu 写锁；只在 AddEntry / RemoveEntry /
+// RestoreSnapshot 内部调。
+func (rg *Registry) persist() error {
+	f := registryFile{
+		Version: rg.version, Generated: rg.generated,
+		Total: len(rg.entries), Entries: rg.entries,
+		Categories: rg.catMeta, Subcategories: rg.subMeta,
+	}
+	b, err := json.MarshalIndent(f, "", "  ")
+	if err != nil {
+		return fmt.Errorf("registry persist: %w", err)
+	}
+	if err := os.WriteFile(rg.registryPath(), append(b, '\n'), 0o600); err != nil {
+		return fmt.Errorf("registry persist: %w", err)
+	}
+	return nil
+}
+
+// l3Content 给一条锻造工具生成最小 L3 文件（≤1600 字符，供 Load 的
+// L3 对应校验与人查阅）。非锻造条目不走这里。
+func l3Content(e Entry) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "# %s\n\n## 一句话\n%s\n\n", e.ToolID, e.OneLiner)
+	fmt.Fprintf(&b, "## 怎么调\n入口：`%s`\n\n", e.EntryPoint)
+	fmt.Fprintf(&b, "## 来源\n锻造注册（蓝图 %s，风险 %s）。\n\n", e.BlueprintID, e.Risk)
+	fmt.Fprintf(&b, "## 验收\n退出码 0 为成功；失败返回 code 与 stderr 头 600 字。\n")
+	if e.PrivateCLIOnly {
+		b.WriteString("\n> private-cli-only：GPL/AGPL 独立 CLI 工具，公开打包自动跳过。\n")
+	}
+	return b.String()
+}
+
+// AddEntry 注册一条新工具（第 23 步锻造用）：内存 + registry.json +
+// L3 文件三处一起落盘。tool_id 重复、分类非法、必填字段缺失、风险
+// 分级非法都拒绝。调用前须先做版本快照（见 Snapshot）。
+// 注意：切片用“建新切片替换”的方式更新，读侧持旧切片不受影响；
+// 锻造只在夜间窗口跑，网关串行，冲突窗口极小。
+func (rg *Registry) AddEntry(e Entry) error {
+	if err := validateEntry(&e); err != nil {
+		return err
+	}
+	if e.Risk != "" && e.Risk != "low" && e.Risk != "medium" && e.Risk != "high" {
+		return fmt.Errorf("%w: %s 非法 risk %q", ErrInvalidRegistry, e.ToolID, e.Risk)
+	}
+	rg.mu.Lock()
+	defer rg.mu.Unlock()
+	if _, dup := rg.byID[e.ToolID]; dup {
+		return fmt.Errorf("%w: duplicate tool_id %q", ErrInvalidRegistry, e.ToolID)
+	}
+	// 先写 L3 文件（失败则内存不动）；再更新内存；最后落盘 registry.json。
+	l3Path := filepath.Join(rg.dataDir, "index", "L3", e.ToolID+".md")
+	content := l3Content(e)
+	if n := len([]rune(content)); n > MaxL3Runes {
+		return fmt.Errorf("%w: L3 %s has %d runes, cap %d", ErrLimitExceeded, e.ToolID, n, MaxL3Runes)
+	}
+	if err := os.WriteFile(l3Path, []byte(content), 0o600); err != nil {
+		return fmt.Errorf("registry add %q: 写 L3 失败: %w", e.ToolID, err)
+	}
+	newEntries := make([]Entry, len(rg.entries)+1)
+	copy(newEntries, rg.entries)
+	newEntries[len(rg.entries)] = e
+	rg.entries = newEntries
+	rg.byID[e.ToolID] = &rg.entries[len(rg.entries)-1]
+	newCat := make([]*Entry, 0, len(rg.byCat[e.Category])+1)
+	newCat = append(newCat, rg.byCat[e.Category]...)
+	newCat = append(newCat, &rg.entries[len(rg.entries)-1])
+	rg.byCat[e.Category] = newCat
+	if err := rg.persist(); err != nil {
+		// 落盘失败：回滚内存与 L3（尽力，不掩盖原错）。
+		delete(rg.byID, e.ToolID)
+		rg.entries = rg.entries[:len(rg.entries)-1]
+		rg.byCat[e.Category] = rg.byCat[e.Category][:len(rg.byCat[e.Category])-1]
+		_ = os.Remove(l3Path)
+		return err
+	}
+	return nil
+}
+
+// RemoveEntry 从注册表摘掉一条工具（第 23 步隔离用）：内存 +
+// registry.json + L3 文件三处一起清掉。不存在的 tool_id 返回
+// ErrNotFound。调用前应已做版本快照。
+func (rg *Registry) RemoveEntry(toolID string) error {
+	rg.mu.Lock()
+	defer rg.mu.Unlock()
+	e, ok := rg.byID[toolID]
+	if !ok {
+		return fmt.Errorf("%w: %q", ErrNotFound, toolID)
+	}
+	cat := e.Category
+	newEntries := make([]Entry, 0, len(rg.entries)-1)
+	for i := range rg.entries {
+		if rg.entries[i].ToolID != toolID {
+			newEntries = append(newEntries, rg.entries[i])
+		}
+	}
+	rg.entries = newEntries
+	delete(rg.byID, toolID)
+	// byID 指针全部重建（entries 切片换了，旧指针失效）。
+	rg.byID = make(map[string]*Entry, len(rg.entries))
+	for i := range rg.entries {
+		rg.byID[rg.entries[i].ToolID] = &rg.entries[i]
+	}
+	newCat := make([]*Entry, 0, len(rg.byCat[cat]))
+	for _, ce := range rg.byCat[cat] {
+		if ce.ToolID != toolID {
+			if ne, ok := rg.byID[ce.ToolID]; ok {
+				newCat = append(newCat, ne)
+			}
+		}
+	}
+	rg.byCat[cat] = newCat
+	delete(rg.verifiedOverride, toolID)
+	delete(rg.probeFailed, toolID)
+	delete(rg.entryPointOverride, toolID)
+	if err := rg.persist(); err != nil {
+		return err
+	}
+	l3Path := filepath.Join(rg.dataDir, "index", "L3", toolID+".md")
+	if err := os.Remove(l3Path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("registry remove %q: 删 L3 失败: %w", toolID, err)
+	}
+	return nil
+}
+
+// Snapshot 把当前 registry.json 原样复制到 path（第 23 步注册前必做，
+// 隔离回滚用）。目录不存在时创建。
+func (rg *Registry) Snapshot(path string) error {
+	raw, err := os.ReadFile(rg.registryPath())
+	if err != nil {
+		return fmt.Errorf("registry snapshot: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("registry snapshot: %w", err)
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		return fmt.Errorf("registry snapshot: %w", err)
+	}
+	return nil
+}
+
+// RestoreSnapshot 用快照文件恢复注册表（第 23 步隔离回滚的兜底）：
+// 快照非法时拒绝、不动内存。恢复后删掉快照里没有的工具的 L3 文件，
+// 再把恢复后的状态落盘。成功返回恢复的条目数。
+func (rg *Registry) RestoreSnapshot(path string) (int, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return 0, fmt.Errorf("registry restore snapshot: %w", err)
+	}
+	var f registryFile
+	if err := json.Unmarshal(raw, &f); err != nil {
+		return 0, fmt.Errorf("%w: snapshot %s: %v", ErrInvalidRegistry, path, err)
+	}
+	if f.Total != 0 && f.Total != len(f.Entries) {
+		return 0, fmt.Errorf("%w: snapshot total=%d but entries=%d",
+			ErrInvalidRegistry, f.Total, len(f.Entries))
+	}
+	rg.mu.Lock()
+	defer rg.mu.Unlock()
+	oldIDs := map[string]bool{}
+	for id := range rg.byID {
+		oldIDs[id] = true
+	}
+	for i := range f.Entries {
+		if err := validateEntry(&f.Entries[i]); err != nil {
+			return 0, err
+		}
+	}
+	rg.entries = f.Entries
+	rg.version = f.Version
+	rg.generated = f.Generated
+	rg.catMeta = f.Categories
+	rg.subMeta = f.Subcategories
+	rg.byID = make(map[string]*Entry, len(f.Entries))
+	rg.byCat = make(map[string][]*Entry)
+	for i := range rg.entries {
+		e := &rg.entries[i]
+		rg.byID[e.ToolID] = e
+		rg.byCat[e.Category] = append(rg.byCat[e.Category], e)
+	}
+	// 删掉快照里没有的工具的 L3 文件（多余的 L3 会让下次 Load 报错）。
+	for id := range oldIDs {
+		if _, ok := rg.byID[id]; !ok {
+			_ = os.Remove(filepath.Join(rg.dataDir, "index", "L3", id+".md"))
+			delete(rg.verifiedOverride, id)
+			delete(rg.probeFailed, id)
+			delete(rg.entryPointOverride, id)
+		}
+	}
+	if err := rg.persist(); err != nil {
+		return 0, err
+	}
+	return len(rg.entries), nil
+}
+
+// PublicEntries 返回可进公开打包的条目（第 23 步 GPL/AGPL 口径 B 的
+// 硬控制）：带 private_cli_only 标记的工具一律排除。公开库打包流程
+// 必须用它取清单，不许直接读全部条目。
+func (rg *Registry) PublicEntries() []*Entry {
+	rg.mu.RLock()
+	defer rg.mu.RUnlock()
+	var out []*Entry
+	for i := range rg.entries {
+		if rg.entries[i].PrivateCLIOnly {
+			continue
+		}
+		cp := rg.entries[i]
+		out = append(out, &cp)
+	}
+	return out
+}
+
+//   - cli：entry_point 首词是命令（PATH 里找）或路径（文件在位）；
+//     "python3 -c ..." 形式跑一次只读 import 检查（Python API 类工具，
+//     如 camoufox，没有 CLI，LookPath 只能验到 python3 本身）。
+//   - service：entry_point 就是脚本路径（相对部署根目录），查文件在位
+//     且可执行（缺 +x 也失败——执行器直接 exec，没 +x 跑不起来）。
+//
 // ProbeEntry 对一条总账条目做存在性探针（不真跑命令），按 call_type 分流：
 //   - cli：entry_point 首词是命令（PATH 里找）或路径（文件在位）；
 //     "python3 -c ..." 形式跑一次只读 import 检查（Python API 类工具，

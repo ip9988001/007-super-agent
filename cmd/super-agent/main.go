@@ -30,11 +30,13 @@ import (
 	"007-super-agent/internal/backup"
 	"007-super-agent/internal/config"
 	"007-super-agent/internal/executor"
+	"007-super-agent/internal/forge"
 	"007-super-agent/internal/gateway"
 	"007-super-agent/internal/ledger"
 	"007-super-agent/internal/llm"
 	"007-super-agent/internal/memory"
 	"007-super-agent/internal/registry"
+	"007-super-agent/internal/retrieval"
 	"007-super-agent/internal/selfevolve"
 	"007-super-agent/internal/triage"
 	"007-super-agent/internal/watchdog"
@@ -268,6 +270,15 @@ func main() {
 		return
 	}
 
+	// 子命令：forge-run —— 手动跑一次锻造（验收用），跑完退出，不启动守护进程。
+	// 用法：super-agent forge-run [--data-dir DIR] [--gap GAPID] [--check-trials] [--confirm-pending GAPID]
+	// 默认：处理缺口队列 + 检查试用期；--gap 只处理指定缺口；--check-trials 只检查试用期；
+	// --confirm-pending GAPID 人工确认一个 high 风险挂起工具并注册。
+	if flag.NArg() > 0 && flag.Arg(0) == "forge-run" {
+		runForgeCmd(flag.Args()[1:], *dataDirFlag)
+		return
+	}
+
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("config: %v", err)
@@ -415,6 +426,8 @@ func main() {
 		// 决定调哪个工具，不再另配核验模型（reasoner 已摘）；影子模式也接线，
 		// 只做决定、不执行。
 		d.ag = agent.New(lc.CallTask, reg, led, ex, dataDir, d.session)
+		// 第 23 步：缺口检测只写报告（本地写盘），影子模式也开。
+		d.ag.Forge = &forge.Store{DataDir: dataDir}
 		log.Printf("agent ready: worker=%s shadow=%v", cfg.WorkerModel, shadow)
 	}
 	gw := gateway.New(cfg, led, d.handle)
@@ -450,6 +463,14 @@ func main() {
 	}
 	seLoop := selfevolve.New(led, reg, mem, dataDir, d.session, reviewFn, shadow)
 	go seLoop.Run(refineCtx)
+
+	// 第 23 步锻造：非影子模式且有模型时接线进 04:30 自查循环
+	// （处理缺口队列 + 试用期检查，周日复查上游）；影子模式不跑
+	// 锻造（会真调模型、真改注册表）。
+	if !shadow && lc != nil {
+		seLoop.Forge = newForgePipeline(dataDir, reg, led, ex, lc, d.session)
+		log.Printf("forge ready: daily budget 500 milli, max 3 gaps/day")
+	}
 	log.Printf("self-evolve loop started: daily 04:30 Beijing, rebuild Sunday 04:30")
 
 	// 记忆自动备份（第 15 步）：仅非影子模式且 BACKUP_ENABLED=1 时接线，
@@ -496,6 +517,134 @@ func main() {
 	_ = srv.Close()
 	gw.Stop()
 	log.Printf("stopped")
+}
+
+// newForgePipeline 建锻造流水线（守护进程与 forge-run 子命令共用）：
+// 模型走 lc.CallTask（flash），监工走 ex.ReviewDelivery（固定第 1 检查项
+// 由 forge 包自带），执行走 ex，检索走匿名 GitHub 客户端（绝不带 Token）。
+func newForgePipeline(dataDir string, reg *registry.Registry, led *ledger.Ledger, ex *executor.Executor, lc *llm.Client, sessionID string) *forge.Pipeline {
+	store := &forge.Store{DataDir: dataDir}
+	ret := retrieval.New(http.DefaultClient, filepath.Join(dataDir, "forge", "retrieval", "cache"))
+	// 锻造的模型调用（蓝图/分流/测试生成）提示词与输出都比主循环长，
+	// 120 秒默认超时在测试机上两次打爆（2026-11-19 缺口 1 两轮）；
+	// 锻造单独用 300 秒超时的克隆客户端，主循环不动。
+	forgeLC := *lc
+	forgeLC.Timeout = 300 * time.Second
+	model := func(ctx context.Context, taskID, frozen, tail string) (string, error) {
+		reply, _, _, err := forgeLC.CallTask(taskID, frozen, tail)
+		return reply, err
+	}
+	review := func(ctx context.Context, taskID, title, body, workDir string) (string, string, error) {
+		res, err := ex.ReviewDelivery(executor.Task{
+			TaskID: taskID, SessionID: sessionID, ToolID: "forge",
+			Text: title + "\n" + body, Command: "forge review", Draft: body, WorkDir: workDir,
+		})
+		if err != nil && (errors.Is(err, executor.ErrAdvisorHalt) || errors.Is(err, executor.ErrAdvisorHaltFinal)) {
+			// 监工 HALT 是 verdict，不是调用失败。
+			return string(res.Verdict), res.Note, nil
+		}
+		if err != nil {
+			return "", "", err
+		}
+		return string(res.Verdict), res.Note, nil
+	}
+	return &forge.Pipeline{
+		Store: store, Reg: reg, Led: led, Ret: ret,
+		Model: model, Review: review, Run: ex,
+		SessionID:        sessionID,
+		DailyBudgetMilli: 500, MaxGapsPerDay: 3,
+	}
+}
+
+// runForgeCmd 是 `super-agent forge-run` 子命令：手动跑一次锻造后退出。
+func runForgeCmd(args []string, dataDirFlag string) {
+	fs := flag.NewFlagSet("forge-run", flag.ExitOnError)
+	dataDir := fs.String("data-dir", dataDirFlag, "数据目录（覆盖配置）")
+	gapID := fs.String("gap", "", "只处理指定缺口")
+	checkTrials := fs.Bool("check-trials", false, "只检查试用期")
+	confirmPending := fs.String("confirm-pending", "", "人工确认一个 high 风险挂起工具并注册")
+	if err := fs.Parse(args); err != nil {
+		log.Fatalf("forge-run: %v", err)
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatalf("config: %v", err)
+	}
+	if *dataDir != "" {
+		cfg.DataDir = *dataDir
+	}
+	dDir := cfg.ResolveDataDir()
+	if err := os.MkdirAll(dDir, 0700); err != nil {
+		log.Fatalf("mkdir data dir %s: %v", dDir, err)
+	}
+	dbPath := filepath.Join(dDir, "ledger.db")
+	led, err := ledger.Open(dbPath)
+	if err != nil {
+		log.Fatalf("ledger open %s: %v", dbPath, err)
+	}
+	defer ledger.Close(led)
+	reg, err := registry.Load(dDir)
+	if err != nil {
+		log.Fatalf("registry load: %v", err)
+	}
+	apiKey, hasKey := llm.ResolveAPIKey()
+	if !hasKey {
+		log.Fatalf("llm: 未找到 DEEPSEEK_API_KEY（环境变量或 .env）")
+	}
+	lc := llm.New(cfg.WorkerModel, apiKey)
+	lc.Ledger = led
+	sessionID := newSessionID()
+	lc.SessionID = sessionID
+	ex := &executor.Executor{Ledger: led}
+	workDir, _ := os.Getwd()
+	adv, err := advisor.New(dbPath, advisor.AdvisorConfig{
+		Endpoint: strings.TrimRight(llm.DefaultBaseURL, "/") + "/v1/chat/completions",
+		APIKey:   apiKey, Model: cfg.AdvisorModel, Timeout: 120 * time.Second,
+	}, workDir)
+	if err != nil {
+		log.Fatalf("advisor: %v", err)
+	}
+	ex.Advisor = adv
+	adv.Ledger = led
+	fp := newForgePipeline(dDir, reg, led, ex, lc, sessionID)
+	ctx := context.Background()
+	taskID := fp.ForgeTaskID()
+	spentBefore, _ := led.SummarizeExpenseByTask(taskID)
+	switch {
+	case *confirmPending != "":
+		toolID, err := fp.ConfirmPending(ctx, *confirmPending)
+		if err != nil {
+			log.Fatalf("forge-run confirm-pending: %v", err)
+		}
+		log.Printf("forge-run: 已确认并注册 %s", toolID)
+	case *checkTrials:
+		n, err := fp.CheckTrials(ctx)
+		if err != nil {
+			log.Fatalf("forge-run check-trials: %v", err)
+		}
+		log.Printf("forge-run: 检查 %d 个试用期", n)
+	case *gapID != "":
+		g, err := fp.Store.ReadGap(*gapID)
+		if err != nil {
+			log.Fatalf("forge-run: 读缺口 %s: %v", *gapID, err)
+		}
+		if err := fp.ProcessGap(ctx, g); err != nil {
+			log.Fatalf("forge-run: 处理缺口 %s: %v", *gapID, err)
+		}
+		log.Printf("forge-run: 缺口 %s 处理完毕", *gapID)
+	default:
+		n, err := fp.ProcessGaps(ctx)
+		if err != nil {
+			log.Fatalf("forge-run: 处理缺口队列: %v", err)
+		}
+		log.Printf("forge-run: 处理 %d 个缺口", n)
+		if _, err := fp.CheckTrials(ctx); err != nil {
+			log.Fatalf("forge-run: 检查试用期: %v", err)
+		}
+	}
+	spentAfter, _ := led.SummarizeExpenseByTask(taskID)
+	log.Printf("forge-run: 本次费用 %d 毫分（当日锻造任务 %s 累计 %d 毫分）",
+		spentAfter.CostCNYMilli-spentBefore.CostCNYMilli, taskID, spentAfter.CostCNYMilli)
 }
 
 // runIndexMemory 是 `super-agent index-memory` 子命令：重建 data/memory/

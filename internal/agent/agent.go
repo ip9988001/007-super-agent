@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"007-super-agent/internal/executor"
+	"007-super-agent/internal/forge"
 	"007-super-agent/internal/ledger"
 	"007-super-agent/internal/llm"
 	"007-super-agent/internal/registry"
@@ -54,6 +55,7 @@ type Agent struct {
 	Ex         *executor.Executor
 	DataDir    string // 产物落盘根目录（artifacts/<taskID>/）
 	SessionID  string
+	Forge      *forge.Store  // 第 23 步缺口检测：nil 时关闭
 	MaxIter    int           // 0 时用 DefaultMaxIter（最后防线，不是能力上限）
 	TimeBudget time.Duration // 0 时用 DefaultTimeBudget（时间护栏）
 }
@@ -395,6 +397,7 @@ func (a *Agent) Run(ctx context.Context, taskID, taskText, memSummary, feedback 
 	frozen := agentPromptHead + a.categoryList()
 	history := []stepRecord{}
 	completed := 0
+	expandGapReported := false // 规则 1：每任务只报一次
 	// pendingListing：上一轮刚展开的完整列表，只在下一轮的尾巴里出现一次。
 	// 模型看过就能挑工具，之后 history 里只留一行带 ID 的摘要，不再重发全文。
 	pendingListing := ""
@@ -441,12 +444,14 @@ func (a *Agent) Run(ctx context.Context, taskID, taskText, memSummary, feedback 
 				if serr != nil {
 					log.Printf("agent task=%s synthesize: %v", taskID, serr)
 				} else {
+					a.detectGapsAtEnd(taskID, taskText, history, true)
 					return &RunResult{ReplyDraft: report, Status: "done", CompletedSteps: completed}, nil
 				}
 			}
 			if err := os.WriteFile(filepath.Join(artDir, "reply.md"), []byte(act.Text), 0o600); err != nil {
 				return nil, fmt.Errorf("agent: 写 reply.md 失败: %w", err)
 			}
+			a.detectGapsAtEnd(taskID, taskText, history, true)
 			return &RunResult{ReplyDraft: act.Text, Status: "done", CompletedSteps: completed}, nil
 		}
 		if act.Action == "expand" {
@@ -467,6 +472,7 @@ func (a *Agent) Run(ctx context.Context, taskID, taskText, memSummary, feedback 
 				continue
 			}
 			history = append(history, stepRecord{ToolID: "expand", Inputs: []string{act.Category, act.Subcategory}, ExitCode: 0, Status: "success", Output: a.expandSummary(act.Category, act.Subcategory)})
+			a.detectExpandGap(taskID, taskText, history, &expandGapReported)
 			pendingListing = listing // 完整列表只在下一轮展示一次，之后只留摘要
 			continue
 		}
@@ -546,6 +552,7 @@ func (a *Agent) Run(ctx context.Context, taskID, taskText, memSummary, feedback 
 		report, serr := a.synthesize(ctx, taskID, taskText, memSummary, history, artDir)
 		if serr == nil {
 			log.Printf("agent task=%s 停下后综合出报告", taskID)
+			a.detectGapsAtEnd(taskID, taskText, history, true)
 			return &RunResult{ReplyDraft: report, Status: "done", CompletedSteps: completed}, nil
 		}
 		log.Printf("agent task=%s synthesize: %v", taskID, serr)
@@ -559,6 +566,7 @@ func (a *Agent) Run(ctx context.Context, taskID, taskText, memSummary, feedback 
 	if err := os.WriteFile(filepath.Join(artDir, "reply.md"), []byte(b.String()), 0o600); err != nil {
 		log.Printf("agent task=%s 写 reply.md 失败: %v", taskID, err)
 	}
+	a.detectGapsAtEnd(taskID, taskText, history, false)
 	return &RunResult{ReplyDraft: b.String(), Status: "max_iterations", CompletedSteps: completed}, nil
 }
 

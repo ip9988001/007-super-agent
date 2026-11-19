@@ -1,11 +1,21 @@
 package main
+
 import (
-	"context"; "encoding/json"; "fmt"; "net/http"; "net/http/httptest"; "strings"; "time"
 	"007-super-agent/internal/advisor"
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"time"
 )
+
 func main() {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var p struct{ Messages []struct{ Content string } `json:"messages"` }
+		var p struct {
+			Messages []struct{ Content string } `json:"messages"`
+		}
 		_ = json.NewDecoder(r.Body).Decode(&p)
 		v, why := "NOTE", "干净：测试覆盖了改动的字段"
 		for _, m := range p.Messages {

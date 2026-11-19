@@ -221,6 +221,100 @@ func (l *Ledger) ListExecutions(taskID string, limit int) ([]Execution, error) {
 	return out, rows.Err()
 }
 
+// ToolStats 是某工具自 since 以来的调用统计（第 23 步试用期跟踪用）：
+// 总调用数、失败数、末尾连续失败数。since 为零值时不限时间。
+// 只统计 status 为 success/failure 的真实执行行（shadow 行不计）。
+func (l *Ledger) ToolStats(toolID string, since time.Time) (calls, failures, consecutiveFailures int, err error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	var rows *sql.Rows
+	if since.IsZero() {
+		rows, err = l.db.Query(`SELECT status FROM execution_ledger
+			WHERE tool_id = ? AND status IN ('success','failure') ORDER BY id DESC`, toolID)
+	} else {
+		rows, err = l.db.Query(`SELECT status FROM execution_ledger
+			WHERE tool_id = ? AND status IN ('success','failure') AND ts >= ?
+			ORDER BY id DESC`, toolID, since.UTC().Format(time.RFC3339))
+	}
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("ledger tool stats: %w", err)
+	}
+	defer rows.Close()
+	trailing := true
+	for rows.Next() {
+		var status string
+		if err := rows.Scan(&status); err != nil {
+			return 0, 0, 0, fmt.Errorf("ledger tool stats scan: %w", err)
+		}
+		calls++
+		if status == "failure" {
+			failures++
+			if trailing {
+				consecutiveFailures++
+			}
+		} else {
+			trailing = false
+		}
+	}
+	return calls, failures, consecutiveFailures, rows.Err()
+}
+
+// CountUnsupportedFailures 统计某工具近 days 天内因“不支持该操作”类原因
+// 的失败次数（第 23 步缺口检测规则 3 用）：err_head 含 unsupported /
+// not supported / 不支持（大小写不敏感）即算。days<=0 时不限时间。
+func (l *Ledger) CountUnsupportedFailures(toolID string, days int) (int, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	q := `SELECT COUNT(*) FROM execution_ledger
+		WHERE tool_id = ? AND status = 'failure'
+		AND (lower(err_head) LIKE '%unsupported%' OR lower(err_head) LIKE '%not supported%' OR err_head LIKE '%不支持%')`
+	var args []any
+	args = append(args, toolID)
+	if days > 0 {
+		since := time.Now().UTC().Add(-time.Duration(days) * 24 * time.Hour).Format(time.RFC3339)
+		q += ` AND ts >= ?`
+		args = append(args, since)
+	}
+	var n int
+	if err := l.db.QueryRow(q, args...).Scan(&n); err != nil {
+		return 0, fmt.Errorf("ledger count unsupported failures: %w", err)
+	}
+	return n, nil
+}
+
+// FailedInputs 取某工具最近的失败输入（第 23 步：缺口类需求回放真实历史
+// 失败输入用）：返回最近 limit 条 failure 行（最新在前，含 command 与
+// err_head）。limit<=0 时默认取 5 条。
+func (l *Ledger) FailedInputs(toolID string, limit int) ([]Execution, error) {
+	if limit <= 0 {
+		limit = 5
+	}
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	rows, err := l.db.Query(`SELECT id, ts, session_id, task_id, tool_id, command,
+		exit_code, stdout_tail, err_head, duration_ms, status,
+		advisor_verdict, advisor_retry_count, advisor_note,
+		stage_no, artifact_path
+		FROM execution_ledger WHERE tool_id = ? AND status = 'failure'
+		ORDER BY id DESC LIMIT ?`, toolID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("ledger query failed inputs: %w", err)
+	}
+	defer rows.Close()
+	var out []Execution
+	for rows.Next() {
+		var e Execution
+		if err := rows.Scan(&e.ID, &e.TS, &e.SessionID, &e.TaskID, &e.ToolID,
+			&e.Command, &e.ExitCode, &e.StdoutTail, &e.ErrHead, &e.DurationMs,
+			&e.Status, &e.AdvisorVerdict, &e.AdvisorRetryCount, &e.AdvisorNote,
+			&e.StageNo, &e.ArtifactPath); err != nil {
+			return nil, fmt.Errorf("ledger scan failed inputs: %w", err)
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
 // WatermarkRecord 是一行队列水位（queue_watermarks，供网关写）。
 type WatermarkRecord struct {
 	Box               string

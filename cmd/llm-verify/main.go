@@ -1,7 +1,16 @@
 // Command llm-verify 是第 10 步的验证程序（≤30 行）：桩服务器模拟一次模型分诊（应得 DIRECT）与一次参数化调用（只打印命令，不真跑）。
 package main
-import ("fmt"; "net/http"; "net/http/httptest"; "os"
-	"007-super-agent/internal/llm"; "007-super-agent/internal/registry"; "007-super-agent/internal/triage")
+
+import (
+	"007-super-agent/internal/llm"
+	"007-super-agent/internal/registry"
+	"007-super-agent/internal/triage"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+)
+
 func main() {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

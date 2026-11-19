@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"007-super-agent/internal/forge"
 	"007-super-agent/internal/ledger"
 	"007-super-agent/internal/memory"
 	"007-super-agent/internal/registry"
@@ -54,6 +55,7 @@ type Loop struct {
 	dataDir   string
 	sessionID string
 	review    ReviewFunc
+	Forge     *forge.Pipeline // 第 23 步锻造流水线：nil 时不跑缺口处理
 	shadow    bool
 
 	mu        sync.Mutex
@@ -92,6 +94,11 @@ func reviewMarkerFile(dataDir string) string {
 }
 
 // rebuildMarkerFile 是“当天已跑过重建”的标记文件（放数据目录，内容为日期）。
+// forgeMarkerFile 是"当天已跑过缺口处理"的标记文件（放数据目录，内容为日期）。
+func forgeMarkerFile(dataDir string) string {
+	return filepath.Join(dataDir, "forge_last")
+}
+
 func rebuildMarkerFile(dataDir string) string {
 	return filepath.Join(dataDir, "selfevolve_rebuild_last")
 }
@@ -143,6 +150,16 @@ func (l *Loop) maybeRun(now time.Time) {
 			log.Printf("self-evolve loop: 写自查标记失败: %v（下个 60 秒会重跑一次）", err)
 		}
 	}
+	if marker := readMarker(forgeMarkerFile(l.dataDir)); shouldReview(now, marker) {
+		if l.shadow {
+			l.logShadowOnce("forge", date)
+		} else if err := l.runForge(now, date); err != nil {
+			log.Printf("self-evolve loop: 锻造处理失败: %v", err)
+		} else if err := writeMarker(forgeMarkerFile(l.dataDir), date); err != nil {
+			log.Printf("self-evolve loop: 写锻造标记失败: %v（下个 60 秒会重跑一次）", err)
+		}
+	}
+
 	if marker := readMarker(rebuildMarkerFile(l.dataDir)); shouldRebuild(now, marker) {
 		if l.shadow {
 			l.logShadowOnce("rebuild", date)
@@ -189,6 +206,37 @@ type ReviewResult struct {
 	Rejected  int    // 应用失败数（探针未通过等）
 	NoSignals bool   // 近 7 天无信号（未调模型）
 	CostMilli int64  // 当日自进化费用合计（毫分，含汇总行本身不计）
+}
+
+// runForge 跑一次锻造处理（第 23 步，04:30 窗口）：先处理缺口队列
+// （检索 → 分流 → 蓝图/采用 → 监工 → staging → 注册），再检查试用期
+// （转正/熔断/复活）；周日顺带复查已采用工具的上游状态。
+// 预算耗尽时 ProcessGaps 内部记 PAUSED_BUDGET 并停在步骤边界。
+func (l *Loop) runForge(now time.Time, date string) error {
+	if l.Forge == nil {
+		return nil
+	}
+	ctx := context.Background()
+	n, err := l.Forge.ProcessGaps(ctx)
+	if err != nil {
+		return fmt.Errorf("forge process gaps: %w", err)
+	}
+	log.Printf("self-evolve forge: 处理 %d 个缺口（%s）", n, date)
+	if _, err := l.Forge.CheckTrials(ctx); err != nil {
+		return fmt.Errorf("forge check trials: %w", err)
+	}
+	if now.Weekday() == time.Sunday {
+		if _, err := l.Forge.CheckUpstream(ctx); err != nil {
+			log.Printf("self-evolve forge: 上游复查失败: %v", err)
+		}
+	}
+	// §2A.7 升级触发线：14 天内 ≥3 次检索器自身导致的顺延
+	// （self_core_calls ≥40 的 SEARCH_DEFERRED_RATE_LIMIT）——
+	// 触发时只记日志，不自动改策略，留待人工定。
+	if d, err := l.Forge.Store.CountDeferred14d(now); err == nil && d >= 3 {
+		log.Printf("self-evolve forge: 升级触发线——近 14 天检索器自身导致顺延 %d 次（≥3），请人工复核检索策略", d)
+	}
+	return nil
 }
 
 // ReviewDaily 跑一次自查：聚合信号 → 调模型点评 → 教训进 Wiki →

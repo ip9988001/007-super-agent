@@ -1,4 +1,5 @@
 package main
+
 import (
 	"fmt"
 	"os"
@@ -6,7 +7,11 @@ import (
 	"007-super-agent/internal/ledger"
 )
 
-func chk(err error) { if err != nil { panic(err) } }
+func chk(err error) {
+	if err != nil {
+		panic(err)
+	}
+}
 
 func main() {
 	l, err := ledger.Open(os.Args[1])

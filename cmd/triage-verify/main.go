@@ -1,11 +1,12 @@
 package main
+
 import (
+	"007-super-agent/internal/registry"
+	"007-super-agent/internal/triage"
 	"fmt"
 	"log"
 	"os"
 	"strings"
-	"007-super-agent/internal/registry"
-	"007-super-agent/internal/triage"
 )
 
 // stubModelCall 是 Tier-1 的确定性桩：生产上换成真实模型调用。
