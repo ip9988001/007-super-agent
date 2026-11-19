@@ -1,0 +1,18 @@
+[Unit]
+Description=007 Super Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/super-agent-007
+ExecStart=/root/super-agent-007/super-agent
+EnvironmentFile=/etc/super-agent/.env
+Environment=CHROME_PATH=/root/super-agent-007/tools/scripts/chrome-with-nosandbox
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
