@@ -1,7 +1,7 @@
 {
  "version": "v1.7",
- "generated": "2026-11-17 Step 1; 2026-11-18 Step 19 batch 5 (84 entries); 2026-11-18 retaxonomy v1.7: 9 categories / 17 subcategories, all-English descriptions, ops split into security/runtime/media/ops",
- "total": 84,
+ "generated": "2026-11-17 Step 1; 2026-11-18 Step 19 batch 5 (84 entries); 2026-11-18 retaxonomy v1.7: 9 categories / 17 subcategories, all-English descriptions, ops split into security/runtime/media/ops; 2026-11-23 register 2 orphan L3 memory docs (86 entries, memory 16)",
+ "total": 86,
  "entries": [
   {
    "tool_id": "cap-fetch-agent-reach",
@@ -2041,6 +2041,52 @@
    "verified_basis": "第 19 步安装核验（--version 实测，2026-11-18）",
    "note": "apt 装，5.3.0",
    "exact_deepseek_tokens": 402
+  },
+  {
+   "tool_id": "cap-memory-l1-watcher",
+   "category": "memory",
+   "subcategory": "memory-system",
+   "call_type": "doc",
+   "trigger_prefix": null,
+   "pre_command": null,
+   "entry_point": "l1_watcher.py",
+   "param_schema": {},
+   "output_contract": "退出码 0 为成功；失败返回 code 与 stderr 头 600 字；输出截断 8MB",
+   "status_triad": {
+    "installed": false,
+    "runnable": false,
+    "verified": true
+   },
+   "available": false,
+   "last_verified_at": "2026-11-23",
+   "source_file": "CAPABILITIES/06-记忆与知识/L-l1-watcher.md",
+   "one_liner": "L1 watcher (retired Python): resident process scanning sessions/*.jsonl every 200ms, writing matched utterances to memory/l1/<date>.md. Scripts no longer on disk; the Go agent has its own refine loop (daily 04:00 Beijing). Do not invoke the Python entry points.",
+   "verified_basis": "2026-11-17 审计：进程在跑（PID 95）。2026-11-23 复核：/root/.pi/agent/ 与 l1_watcher.py、refine_daily.py 全盘无踪，进程不在跑；Go 版自带精炼循环（启动日志 refine loop daily 04:00 Beijing）。Python 版为旧实现，已退役。",
+   "note": "旧 Python 实现已退役，脚本与进程均不存在；Go 版自带精炼循环。注册为 doc 仅为通过 orphan L3 校验，不可调用。",
+   "exact_deepseek_tokens": 430
+  },
+  {
+   "tool_id": "cap-memory-refine-daily",
+   "category": "memory",
+   "subcategory": "memory-system",
+   "call_type": "doc",
+   "trigger_prefix": null,
+   "pre_command": null,
+   "entry_point": "refine_daily.py",
+   "param_schema": {},
+   "output_contract": "退出码 0 为成功；失败返回 code 与 stderr 头 600 字；输出截断 8MB",
+   "status_triad": {
+    "installed": false,
+    "runnable": false,
+    "verified": true
+   },
+   "available": false,
+   "last_verified_at": "2026-11-23",
+   "source_file": "CAPABILITIES/06-记忆与知识/R-refine-daily.md",
+   "one_liner": "Daily refine daemon (retired Python): 31-line script replacing cron/systemd, calling l1_watcher.py --refine-only daily at 04:00 Beijing. Scripts no longer on disk; the Go agent has its own refine loop (daily 04:00 Beijing). Do not invoke the Python entry points.",
+   "verified_basis": "2026-11-17 审计：进程在跑（PID 96）。2026-11-23 复核：/data/bin/refine_daily.py 与 l1_watcher.py 全盘无踪，进程不在跑；Go 版自带精炼循环（启动日志 refine loop daily 04:00 Beijing）。Python 版为旧实现，已退役。",
+   "note": "旧 Python 实现已退役，脚本与进程均不存在；Go 版自带精炼循环。注册为 doc 仅为通过 orphan L3 校验，不可调用。",
+   "exact_deepseek_tokens": 420
   }
  ],
  "categories": [
@@ -2104,7 +2150,7 @@
    "id": "memory",
    "name": "Memory",
    "description": "Tools and documents describing the memory system: how 007 stores, recalls, and refines knowledge. This is a system category, not a callable tool category: none of its fourteen entries can be executed directly by the model. Instead, the agent loop calls Recall automatically every round to fetch relevant memories, and the memory system handles wiki pages, L1 logs and L3 refined knowledge in the background. The entries here document the four memory layers (fragments, candidates, long-term, structured), the wiki structure (entities, concepts, sources, synthesis), the recall mechanism (semantic, lexical and hybrid search), the write path (wiki_upsert_page for stable knowledge), and the five core skills (long-term library, adjudicator, retrieval, migration, forge) that govern how memory is kept and resolved. Two entries are duplicates under different names (cap-memory-recall-memory and ext-recall-memory share one implementation, as do the two wiki_upsert_page entries); use either, not both. One entry, the playbooks library, is a paper convention with no directory on disk and must not be relied on. This category exists for documentation and auditing, not for tool selection: when a task needs historical context or past experience, Recall handles it without the model picking a memory tool. The agent never picks a memory entry as a tool; Recall runs automatically, and the entries here only document the machinery.",
-   "tool_count": 14,
+   "tool_count": 16,
    "executable_count": 0
   }
  ],
@@ -2179,7 +2225,7 @@
    "category": "memory",
    "id": "memory-system",
    "description": "The memory machinery itself: layers, recall, write path, and self-reporting. Recall is the unified lookup the agent loop calls every round; wiki_upsert_page writes stable knowledge; self-status, usage-report and detect-conflicts report on the system's own state. The long-term and retrieval skills govern storage and lookup. These are system mechanisms, not tools the model picks. Recall is the entry the agent loop calls every round, with hybrid search by default and semantic or lexical modes available. Wiki_upsert_page is the write path for stable knowledge. Self-status reports the agent's own state, usage-report shows which memories are used or dormant, and detect-conflicts surfaces contradictions for review. The long-term and retrieval skills govern storage rules and lookup order.",
-   "tool_count": 9
+   "tool_count": 11
   },
   {
    "category": "ops",
