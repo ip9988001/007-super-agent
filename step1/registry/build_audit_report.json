@@ -1,0 +1,356 @@
+{
+ "step": 1,
+ "name": "静态家底收拢",
+ "date": "2026-11-17",
+ "token_estimator": "实测：DeepSeek 官方 tokenizer.json（deepseek-ai/DeepSeek-V3，vocab 128815），测试机 /tmp/deepseek-tok，2026-11-17。V4.1-Flash-1017 直链未取回可用分词文件，已回落同系列官方 V3 tokenizer。",
+ "gates": {
+  "1_constitution_integrity": {
+   "result": "PASS",
+   "checks": [
+    {
+     "item": "条款编号连续",
+     "detail": "R-01..R-34，共 34 条，无断号、无重号",
+     "ok": true
+    },
+    {
+     "item": "旧信道/双机残留扫描（正文，lx/哨兵/双模式/端口/信道名）",
+     "detail": "零命中",
+     "ok": true
+    },
+    {
+     "item": "派单/二号/三号出现处裁定",
+     "detail": "L11 二号/三号：仅历史沿革表述（融合两者能力），无引用旧机器的规则；L37 派单即返回：单机执行纪律名（执行完立刻回，不轮询），非跨机派单规则；L47 派单即返回：单机执行纪律名（执行完立刻回，不轮询），非跨机派单规则",
+     "ok": true
+    },
+    {
+     "item": "无沙箱铁律",
+     "detail": "R-04：无沙箱/无隔离/无白名单黑名单/无安全断路器；R-05 安全话题静默令；R-27 监工禁当安全警察",
+     "ok": true
+    },
+    {
+     "item": "监工机制",
+     "detail": "R-24 三处关口（交活前/不可逆前/分片边界）+直接回答免审；R-25 独立上下文+五件套证据≤3000 token+抓假测试铁律；R-26 HALT 最多打回 2 轮（同一任务最多 3 次交卷），同因二连叫停早退",
+     "ok": true
+    },
+    {
+     "item": "宪法来源齐全",
+     "detail": "二号 3 份（AGENTS.md 250 行、指挥 222 行、执行 198 行）+ 钢铁意志 AGENTS.md 121 行 + SYSTEM.md 27 行，全部在 src/ 落盘",
+     "ok": true
+    },
+    {
+     "item": "授权与边界完整",
+     "detail": "R-28 最大权限免事前授权；R-29 五条不包括清单；R-30 汇报三档；R-31 记账+每日 09:00 省 token 实测核算",
+     "ok": true
+    }
+   ]
+  },
+  "2_mapping_100pct": {
+   "result": "PASS",
+   "checks": [
+    {
+     "item": "能力库 67 文件全处置",
+     "detail": "60 能力文件 → registry 60 条 cap-*；7 INDEX 文件为分类目录，不单独建条，已核对 6 类 13+6+7+7+20+7=60",
+     "ok": true
+    },
+    {
+     "item": "扩展 37 文件全处置",
+     "detail": "7 在用 → registry 7 条 ext-*；30 停放只记档不进总账（名单见 mapping.extensions.parked_30_archived）",
+     "ok": true
+    },
+    {
+     "item": "steel-will 技能 29 全处置",
+     "detail": "5 条进总账（10 long-term、13 adjudicator、14 retrieval、21 migration、28 forge）；其余 24 条 14 内化 + 10 归档（设计文档 v1.4 附录 A）",
+     "ok": true
+    },
+    {
+     "item": "非 steel-will 技能 11 全处置",
+     "detail": "6 条同筛子核验：5 PASS 中 4 条已被现有 cap-* 覆盖（browser-tools→cap-fetch-browser-stack、edge-tts→cap-ops-edge-tts、github-get→cap-fetch-curl-jq（取数机制）+cap-memory-recall-memory（查重）、tavily-search→cap-fetch-tvly），1 条 hyperframes 无 cap-* 覆盖，已补入总账为 cap-design-hyperframes（72→73 条）；1 归档（pi-web-restart，Windows-only）；另 5 条已说明去向（4 条有能力文件覆盖，1 条 reverse-engineer-anything 无能力文件、不进总账）",
+     "ok": true
+    },
+    {
+     "item": "registry 72 条来源文件全部可落盘核验",
+     "detail": "60 能力 + 7 扩展 + 5 技能 + 1 补入（hyperframes）= 73 条；未落盘来源：无",
+     "ok": true
+    },
+    {
+     "item": "registry 字段完整",
+     "detail": "缺字段：无；状态三联不完整：无",
+     "ok": true
+    },
+    {
+     "item": "available:false 全部有原因",
+     "detail": "[('cap-memory-playbooks', '原文件实测：playbooks 目录不存在，纸面约定零实体；宪法里‘照剧本执行’目前落空，先走工具索引')]",
+     "ok": true
+    }
+   ],
+   "mapping": {
+    "capabilities": {
+     "source_files_total": 67,
+     "index_files": 7,
+     "capability_files": 60,
+     "registry_cap_entries": 60,
+     "index_names": [
+      "01-取数与抓取/INDEX.md",
+      "02-代码与审计/INDEX.md",
+      "03-SEO与内容/INDEX.md",
+      "04-设计与UI/INDEX.md",
+      "05-系统与运维/INDEX.md",
+      "06-记忆与知识/INDEX.md",
+      "INDEX.md"
+     ],
+     "per_category": {
+      "01-取数与抓取": 13,
+      "02-代码与审计": 6,
+      "03-SEO与内容": 7,
+      "04-设计与UI": 7,
+      "05-系统与运维": 20,
+      "06-记忆与知识": 7
+     }
+    },
+    "extensions": {
+     "source_ts_total": 37,
+     "active_7": [
+      "steel-will-30-wiki-engine.ts",
+      "steel-will-33-lint-system.ts",
+      "steel-will-35-self-status.ts",
+      "steel-will-bootstrap.ts",
+      "steel-will-codegraph.ts",
+      "steel-will-l1-logger.ts",
+      "steel-will-recall-tool.ts"
+     ],
+     "registry_ext_entries": 7,
+     "parked_30_archived": [
+      "steel-will-32-auto-trigger.ts",
+      "steel-will-34-temporal.ts",
+      "steel-will-achievement-motivator.ts",
+      "steel-will-adjudicator.ts",
+      "steel-will-auto-promoter.ts",
+      "steel-will-autonomic-nervous.ts",
+      "steel-will-candidate-screener.ts",
+      "steel-will-clone-imprint.ts",
+      "steel-will-experience-injector.ts",
+      "steel-will-failure-learner.ts",
+      "steel-will-forge.ts",
+      "steel-will-gateway.ts",
+      "steel-will-governance.ts",
+      "steel-will-hallucination-eliminator.ts",
+      "steel-will-heartbeat.ts",
+      "steel-will-long-term.ts",
+      "steel-will-memory-skeleton.ts",
+      "steel-will-migration.ts",
+      "steel-will-ontology.ts",
+      "steel-will-reflection.ts",
+      "steel-will-retrieval.ts",
+      "steel-will-scheduler-v2.ts",
+      "steel-will-scheduler.ts",
+      "steel-will-security.ts",
+      "steel-will-sensory.ts",
+      "steel-will-state-control.ts",
+      "steel-will-subconscious.ts",
+      "steel-will-swarm.ts",
+      "steel-will-transcendence.ts",
+      "steel-will-vector-radar.ts"
+     ]
+    },
+    "skills_steel_will": {
+     "source_total": 29,
+     "in_registry_5": [
+      "steel-will-adjudicator",
+      "steel-will-forge",
+      "steel-will-long-term",
+      "steel-will-migration",
+      "steel-will-retrieval"
+     ],
+     "not_in_registry_24": [
+      "steel-will-autonomic-nervous",
+      "steel-will-backwrite",
+      "steel-will-bootstrap",
+      "steel-will-candidate-screener",
+      "steel-will-clone-imprint",
+      "steel-will-experience-injector",
+      "steel-will-failure-learner",
+      "steel-will-gateway",
+      "steel-will-governance",
+      "steel-will-hallucination-eliminator",
+      "steel-will-heartbeat",
+      "steel-will-l1-logger",
+      "steel-will-memory-skeleton",
+      "steel-will-ontology",
+      "steel-will-reflection",
+      "steel-will-scheduler",
+      "steel-will-scheduler-v2",
+      "steel-will-security",
+      "steel-will-semantic-retrieval",
+      "steel-will-sensory",
+      "steel-will-subconscious",
+      "steel-will-swarm",
+      "steel-will-transcendence",
+      "steel-will-vector-radar"
+     ],
+     "split_note": "其余 24 条按设计方案 v1.4 附录 A（第 6 轮 Gemini 修正、用户已接受）：14 条内化为 Go 代码、10 条为空壳或已废止约束，不进 registry；逐条归属见设计文档附录 A，本步不另造名单"
+    },
+    "skills_non_steel_will": {
+     "source_total": 11,
+     "screened_6": {
+      "browser-tools": "PASS，已被 cap-fetch-browser-stack 覆盖（两条真浏览器通道；技能自带 CDP 脚本为薄封装）",
+      "edge-tts": "PASS，已被 cap-ops-edge-tts 覆盖（同一二进制 edge-tts 7.3.1）",
+      "github-get": "PASS，已被 cap-fetch-curl-jq 覆盖（取数机制：curl 直取 raw.githubusercontent 与 api.github）+ cap-memory-recall-memory（阶段零查重）",
+      "hyperframes": "PASS，无 cap-* 覆盖，已补入总账为 cap-design-hyperframes（72→73 条）",
+      "tavily-search": "PASS，已被 cap-fetch-tvly 覆盖（同一 CLI，tvly search --json）",
+      "pi-web-restart": "ARCHIVE（Windows-only BAT，不适用 Linux）"
+     },
+     "extra_5_accounted": {
+      "agent-reach": "有能力文件覆盖（fetch 类，agent-reach 抓取）",
+      "lightpanda": "有能力文件覆盖（fetch 类，lightpanda 渲染）",
+      "scrapling": "有能力文件覆盖（fetch 类，scrapling 抓取）",
+      "impeccable": "有能力文件覆盖（code 类，impeccable 检测）",
+      "reverse-engineer-anything": "无能力文件对应；隔离区渗透技能，不进总账"
+     }
+    }
+   }
+  },
+  "3_symlink_penetration": {
+   "result": "PASS",
+   "checks": [
+    {
+     "item": "src/ 内零符号链接",
+     "detail": "抽包时用 tar -h 解引用；落盘后全树扫描符号链接数 = 0",
+     "ok": true
+    },
+    {
+     "item": "35 条 PI-技能库符号链接已穿透为实体",
+     "detail": "skills/ 下 40 个条目全部为实体目录（非链接），其中空目录：无；三号原机 PI-技能库 35 条符号链接指向 /data/skills/*，解包后内容已实体化",
+     "ok": true
+    },
+    {
+     "item": "抽查实体内容",
+     "detail": "browser-tools/ 实体文件 12 个（含 puppeteer/CDP 脚本）；edge-tts、github-get 等同批核验时已读 SKILL.md 与脚本",
+     "ok": true
+    }
+   ]
+  },
+  "4_l3_format": {
+   "result": "PASS",
+   "checks": [
+    {
+     "item": "L3 固定四段标题 + SOP 三要素",
+     "detail": "72 份全查；不合格：无",
+     "ok": true
+    },
+    {
+     "item": "L1/L2 结构",
+     "detail": "L1 首行：# L1 · 工具总览（常驻）；L2 6 份每份首行均为分类标题 + 每行一条工具",
+     "ok": true
+    }
+   ]
+  },
+  "5_hard_caps": {
+   "result": "PASS",
+   "checks": [
+    {
+     "item": "L1 ≤25 行",
+     "detail": "12 行",
+     "ok": true
+    },
+    {
+     "item": "L2 每类 ≤25 行",
+     "detail": "{'code.md': 10, 'design.md': 11, 'fetch.md': 16, 'memory.md': 19, 'ops.md': 25, 'seo.md': 10}",
+     "ok": true
+    },
+    {
+     "item": "L3 每份 ≤1600 字符",
+     "detail": "最大 1414 字符（cap-seo-claude-seo.md），72 份全部 ≤1600",
+     "ok": true
+    }
+   ]
+  },
+  "6_token_caps_measured": {
+   "result": "PASS",
+   "checks": [
+    {
+     "item": "L1 ≤640 token（实测）",
+     "detail": "214 token",
+     "ok": true
+    },
+    {
+     "item": "L2 每类 ≤850 token（实测）",
+     "detail": "{'code.md': 279, 'design.md': 315, 'fetch.md': 504, 'memory.md': 506, 'ops.md': 760, 'seo.md': 283}",
+     "ok": true
+    },
+    {
+     "item": "L3 每份 ≤960 token（实测）",
+     "detail": "最大 700 token（cap-seo-llms-txt），73 份全部 ≤960",
+     "ok": true
+    }
+   ]
+  }
+ },
+ "gaps": [],
+ "registry_summary": {
+  "total_entries": 73,
+  "by_category": {
+   "fetch": 13,
+   "code": 7,
+   "seo": 7,
+   "design": 8,
+   "ops": 22,
+   "memory": 16
+  },
+  "by_call_type": {
+   "cli": 38,
+   "mcp": 1,
+   "data": 1,
+   "sop": 13,
+   "doc": 8,
+   "service": 2,
+   "tool": 9
+  },
+  "available_false": [
+   {
+    "tool_id": "cap-memory-playbooks",
+    "reason": "原文件实测：playbooks 目录不存在，纸面约定零实体；宪法里‘照剧本执行’目前落空，先走工具索引"
+   }
+  ]
+ },
+ "index_summary": {
+  "L1": {
+   "lines": 12,
+   "tokens_exact": 214
+  },
+  "L2": {
+   "code.md": {
+    "lines": 10,
+    "tokens_exact": 279
+   },
+   "design.md": {
+    "lines": 11,
+    "tokens_exact": 315
+   },
+   "fetch.md": {
+    "lines": 16,
+    "tokens_exact": 504
+   },
+   "memory.md": {
+    "lines": 19,
+    "tokens_exact": 506
+   },
+   "ops.md": {
+    "lines": 25,
+    "tokens_exact": 760
+   },
+   "seo.md": {
+    "lines": 10,
+    "tokens_exact": 283
+   }
+  },
+  "L3_count": 73,
+  "L3_max_chars": 1414,
+  "L3_max_tokens_exact": 700
+ },
+ "constitution": {
+  "file": "prompts/AGENTS.md",
+  "clauses": 34,
+  "bytes": 12146
+ },
+ "overall": "PASS"
+}
