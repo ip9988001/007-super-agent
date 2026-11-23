@@ -61,15 +61,19 @@ const (
 )
 
 // modelPrices 是各模型的非高峰价表（毫分/百万 token）。
-// deepseek-reasoner / deepseek-chat 是已退役旧别名：按 DeepSeek 官方
-// 定价页（2026-11-17），两者已重定向到 V4.1 Flash（思考/非思考模式），
-// 按 Flash 价计费；未知模型名默认按 Flash 价（并在注释里说明，
-// 不要静默按旧 R1 价 $0.55/$2.19 算，那是已下架的历史价）。
+// deepseek-reasoner / deepseek-chat 是已退役旧别名：实测核实（2026-11-23，
+// 直接调 API，model=deepseek-reasoner 返回 200 且响应里 model=deepseek-flash），
+// 两者仍被接受但由 V4.1 Flash 提供服务、按 Flash 价计费；未知模型名默认按
+// Flash 价。不要按旧 R1 价 $0.55/$2.19 算，那是已下架的历史价；也不要按
+// V4 Pro 价算——实测证明 reasoner 调用实际走的是 Flash，不是 Pro。
 func modelPrices(model string) (hit, miss, out int64) {
 	switch model {
 	case "deepseek-v4-pro":
 		return priceProHitMilliPerM, priceProMissMilliPerM, priceProOutMilliPerM
-	default: // deepseek-flash、deepseek-reasoner、deepseek-chat 及其他
+	case "deepseek-reasoner", "deepseek-chat":
+		// 已退役别名，实测由 Flash 提供服务，按 Flash 价计费。
+		return priceHitMilliPerM, priceMissMilliPerM, priceOutMilliPerM
+	default: // deepseek-flash 及其他
 		return priceHitMilliPerM, priceMissMilliPerM, priceOutMilliPerM
 	}
 }

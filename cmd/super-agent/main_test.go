@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"007-super-agent/internal/dispatch"
 	"007-super-agent/internal/executor"
 	"007-super-agent/internal/gateway"
 	"007-super-agent/internal/ledger"
@@ -64,4 +65,29 @@ func TestHandleL1FailureDoesNotBlock(t *testing.T) {
 	}
 	_ = mem
 	d.handle(gateway.Envelope{TaskID: "t3", Text: "你好"})
+}
+
+// fastPathOK 回归测试：TOOL 空参裸调的根因修法（方案 D）。
+// 带参工具与未声明 fast_path 的工具必须走 runAgent；只有显式 fast_path 的
+// 单工具才走 runTool；多工具强制走 runAgent。
+func TestFastPathOK(t *testing.T) {
+	leanCtx := &registry.Entry{ToolID: "cap-ops-lean-ctx", FastPath: false}
+	fastTool := &registry.Entry{ToolID: "cap-ops-fast", FastPath: true}
+	cases := []struct {
+		name string
+		disp *dispatch.Dispatch
+		e    *registry.Entry
+		want bool
+	}{
+		{"带参工具不走快捷路径", &dispatch.Dispatch{Route: "TOOL", ToolIDs: []string{"cap-ops-lean-ctx"}}, leanCtx, false},
+		{"未声明 fast_path 安全默认走 runAgent", &dispatch.Dispatch{Route: "TOOL", ToolIDs: []string{"cap-ops-new"}}, &registry.Entry{ToolID: "cap-ops-new"}, false},
+		{"零参工具单工具走快捷路径", &dispatch.Dispatch{Route: "TOOL", ToolIDs: []string{"cap-ops-fast"}}, fastTool, true},
+		{"零参工具多工具强制走 runAgent", &dispatch.Dispatch{Route: "TOOL", ToolIDs: []string{"cap-ops-fast", "cap-ops-lean-ctx"}}, fastTool, false},
+		{"AGENT 路由不走快捷路径", &dispatch.Dispatch{Route: "AGENT", ToolIDs: []string{"cap-ops-fast"}}, fastTool, false},
+	}
+	for _, c := range cases {
+		if got := fastPathOK(c.disp, c.e); got != c.want {
+			t.Errorf("%s: fastPathOK=%v, want %v", c.name, got, c.want)
+		}
+	}
 }

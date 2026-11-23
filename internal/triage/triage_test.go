@@ -190,13 +190,13 @@ func TestFrozenListDeterministic(t *testing.T) {
 			lines++
 		}
 	}
-	if lines != 47 { // 84 条总账：6 条 available:false 不进清单
-		// （bili/tvly/lean-ctx/llmtrim 4 条 cli + link-selftest 1 条
-		// service + playbooks 1 条 doc）；32 条知识条目
+	if lines != 49 { // 90 条总账：7 条 available:false 不进清单
+		// （bili/tvly/llmtrim + 2 锻造工具 5 条 cli + link-selftest 1 条
+		// service + playbooks 1 条 doc）；35 条知识条目
 		// （doc/sop/tool/mcp/data）不可执行、也不进清单；
-		// 清单只剩 39 cli + 8 service = 47 条可执行工具
+		// 清单只剩 41 cli + 8 service = 49 条可执行工具
 		// （清单行含 cap-/ext-/skill- 三种前缀，不能只数 "- cap-"）
-		t.Errorf("frozen tool list lines = %d, want 47", lines)
+		t.Errorf("frozen tool list lines = %d, want 49", lines)
 	}
 	// 冻结前缀 + 尾部分开发送：天气问题走 DIRECT（清单里没有天气工具，
 	// 模型不许编 tool_id；这里用桩模拟模型回 DIRECT，验证链路本身）。
@@ -233,7 +233,7 @@ func TestParseTriageReply(t *testing.T) {
 		`{"route":"TOOL","tool_id":"no-such-tool","reason":"x"}`,         // tool_id 不存在
 		`{"route":"TOOL","tool_id":"cap-memory-playbooks","reason":"x"}`, // available:false
 		`{"route":"DIRECT","tool_id":"no-such-tool","reason":"x"}`,       // DIRECT 带不存在的 tool_id
-		`{"route":"AGENT","tool_id":"no-such-tool","reason":"x"}`,         // AGENT 带不存在的 tool_id
+		`{"route":"AGENT","tool_id":"no-such-tool","reason":"x"}`,        // AGENT 带不存在的 tool_id
 		`没有 JSON`,          // 无 JSON
 		`{"route":"TOOL",`, // 残缺 JSON
 	}

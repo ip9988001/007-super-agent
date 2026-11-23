@@ -192,7 +192,7 @@ func CompactToolList(reg *registry.Registry, candidates []string) string {
 		listed := 0
 		for _, id := range candidates {
 			e, ok := reg.Entry(id)
-			if !ok || !e.Available || !e.Executable() || reg.ProbeFailed(id) {
+			if !ok || !e.Available || !e.Executable() || e.Hidden || reg.ProbeFailed(id) {
 				continue
 			}
 			fmt.Fprintf(&b, "- %s: %s\n", e.ToolID, truncateRunes(e.OneLiner, 200))
@@ -205,7 +205,7 @@ func CompactToolList(reg *registry.Registry, candidates []string) string {
 	var b strings.Builder
 	for _, cat := range registry.Categories() {
 		for _, e := range reg.EntriesByCategory(cat) {
-			if !e.Available || !e.Executable() || reg.ProbeFailed(e.ToolID) {
+			if !e.Available || !e.Executable() || e.Hidden || reg.ProbeFailed(e.ToolID) {
 				continue
 			}
 			fmt.Fprintf(&b, "- %s: %s\n", e.ToolID, truncateRunes(e.OneLiner, 200))
@@ -310,6 +310,11 @@ func ResolveTool(reg *registry.Registry, toolID string) (*registry.Entry, string
 	}
 	if !e.Available {
 		return nil, "", fmt.Errorf("%w: %q", ErrToolNotAllowed, toolID)
+	}
+	// 默认隐藏的工具（未过试用期的锻造工具）不可派单，验证通过改回
+	// hidden=false 后才能用；分诊阶段就拦住，不进执行。
+	if e.Hidden {
+		return nil, "", fmt.Errorf("%w: %q is hidden (unverified)", ErrToolNotAllowed, toolID)
 	}
 	if reg.NeedsProbe(toolID) {
 		if err := reg.Probe(toolID); err != nil {

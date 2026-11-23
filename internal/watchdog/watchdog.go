@@ -220,10 +220,20 @@ type Savings struct {
 	WarnReason          string  // 告警原因（Warn 为真时非空）
 }
 
-// DailySavings 按账本算当日省 token 核算。只读 ledger.db，不写。
+// DailySavings 按账本算当日（UTC）省 token 核算。只读 ledger.db，不写。
 // 净省为负时 Warn 为真，由调用方决定是否告警。
 func (w *Watchdog) DailySavings() (Savings, error) {
+	return w.DailySavingsFor(time.Now().UTC().Format("2006-01-02"))
+}
+
+// DailySavingsFor 按账本算指定 UTC 日期（YYYY-MM-DD）的省 token 核算。
+// 只读 ledger.db，不写。日期格式非法时报错。
+// 09:00 定时用它算前一天的完整账；DailySavings() 是算当天的快捷入口。
+func (w *Watchdog) DailySavingsFor(date string) (Savings, error) {
 	var sv Savings
+	if _, err := time.Parse("2006-01-02", date); err != nil {
+		return sv, fmt.Errorf("watchdog: 日期格式非法 %q: %w", date, err)
+	}
 	if strings.TrimSpace(w.dbPath) == "" {
 		return sv, errors.New("watchdog: 未指定 ledger.db 路径")
 	}
@@ -232,25 +242,25 @@ func (w *Watchdog) DailySavings() (Savings, error) {
 		return sv, fmt.Errorf("watchdog: open ledger.db: %w", err)
 	}
 	defer db.Close()
-	sv.Date = time.Now().UTC().Format("2006-01-02")
-	today := `date(ts) = date('now')`
+	sv.Date = date
+	day := `date(ts) = '` + date + `'`
 	if err := db.QueryRow(`SELECT COUNT(*),
 		COALESCE(SUM(CASE WHEN tier = 0 THEN 1 ELSE 0 END), 0),
 		COALESCE(SUM(tokens_in), 0), COALESCE(SUM(tokens_out), 0)
-		FROM triage_metrics WHERE `+today).Scan(
+		FROM triage_metrics WHERE `+day).Scan(
 		&sv.TriageCount, &sv.Tier0Count, &sv.TriageTokensIn, &sv.TriageTokensOut); err != nil {
 		return sv, fmt.Errorf("watchdog: summarize triage_metrics: %w", err)
 	}
 	if err := db.QueryRow(`SELECT COALESCE(SUM(tokens_injected), 0),
 		COALESCE(SUM(tokens_saved_vs_full), 0)
-		FROM index_metrics WHERE `+today).Scan(
+		FROM index_metrics WHERE `+day).Scan(
 		&sv.IndexInjected, &sv.IndexSaved); err != nil {
 		return sv, fmt.Errorf("watchdog: summarize index_metrics: %w", err)
 	}
 	if err := db.QueryRow(`SELECT COUNT(*),
 		COALESCE(SUM(prompt_tokens + completion_tokens), 0),
 		COALESCE(SUM(cost_cny_milli), 0)
-		FROM expense_ledger WHERE `+today).Scan(
+		FROM expense_ledger WHERE `+day).Scan(
 		&sv.ExpenseCalls, &sv.ExpenseTokens, &sv.CostCNYMilli); err != nil {
 		return sv, fmt.Errorf("watchdog: summarize expense_ledger: %w", err)
 	}

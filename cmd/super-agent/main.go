@@ -29,8 +29,10 @@ import (
 	"007-super-agent/internal/agent"
 	"007-super-agent/internal/backup"
 	"007-super-agent/internal/config"
+	"007-super-agent/internal/dispatch"
 	"007-super-agent/internal/executor"
 	"007-super-agent/internal/forge"
+	"007-super-agent/internal/front"
 	"007-super-agent/internal/gateway"
 	"007-super-agent/internal/ledger"
 	"007-super-agent/internal/llm"
@@ -59,12 +61,15 @@ func (shadowAdvisor) Check(e executor.Evidence, tr executor.Trigger) (executor.C
 // daemon 是接线后的整机：网关的 handler 就是它的方法。
 type daemon struct {
 	cfg       *config.Config
+	dataDir   string // 已解析的绝对数据目录（cfg.ResolveDataDir() 的结果）
 	led       *ledger.Ledger
 	reg       *registry.Registry
 	mem       *memory.Store
 	ex        *executor.Executor
 	wd        *watchdog.Watchdog
-	ag        *agent.Agent         // 主循环（对齐二号 Step 1+Step 4）；nil 表示未接线（无模型调用）
+	ag        *agent.Agent         // 执行会话主循环；nil 表示未接线（无模型调用）
+	fr        *front.Front         // 前置会话（判断/分诊/派单/回话）；nil 表示未接线
+	ch        *dispatch.Channel    // 前置→执行的内部派单通道
 	modelCall triage.ModelCallFunc // Tier-1 模型调用（llm 客户端）；nil 时 Tier-1 报错
 	session   string
 	shadow    bool
@@ -90,44 +95,43 @@ func (d *daemon) handle(env gateway.Envelope) {
 }
 
 // handleInner 做真正的分诊与执行，返回（route、tool_id、结果状态）供 handle 记 L1。
+// 双会话设计（第 1 项）：入口一律走前置会话（front.Run）——判断、分诊、
+// 派单、回话都在前置；执行会话只接派单干活，不直接见用户原话。
+// 前置派单后等回执，回执状态即本单状态。
 func (d *daemon) handleInner(env gateway.Envelope) (route, toolID, status string) {
-	dec, err := triage.Triage(d.reg, d.led, triage.Input{Text: env.Text, TaskID: env.TaskID, SessionID: d.session}, d.modelCall)
-	if err != nil {
-		// Tier-1 需要模型调用：modelCall 为 nil（影子模式且无密钥）或
-		// 模型调用失败时只记日志，不执行。
-		log.Printf("triage task=%s: %v", env.TaskID, err)
-		return "ERROR", "", "triage_error"
-	}
-	// AGENT 去向走主循环（对齐二号：主模型逐轮调工具，看到结果再决定下一步），
-	// 不再只挑一个工具；单步路径行为不变。
-	if dec.Route == triage.RouteAgent {
-		return string(dec.Route), "", d.runAgent(env)
-	}
-	if dec.Route != triage.RouteTool {
-		log.Printf("task=%s route=%s tier=%d (no tool to run)", env.TaskID, dec.Route, dec.Tier)
+	if d.fr == nil {
+		// 无模型调用（影子模式且无密钥）：前置跑不起来，只走 Tier-0
+		// 前缀直出（0 token），Tier-1 不可用；TOOL 去向只做影子记账。
+		dec, err := triage.Triage(d.reg, d.led, triage.Input{Text: env.Text, TaskID: env.TaskID, SessionID: d.session}, nil)
+		if err != nil {
+			log.Printf("task=%s triage (no model): %v", env.TaskID, err)
+			return "ERROR", "", "triage_error"
+		}
+		if dec.Route != triage.RouteTool {
+			log.Printf("task=%s route=%s tier=%d (no tool to run)", env.TaskID, dec.Route, dec.Tier)
+			return string(dec.Route), dec.ToolID, "no_tool"
+		}
+		e, _, rerr := triage.ResolveTool(d.reg, dec.ToolID)
+		if rerr != nil {
+			log.Printf("task=%s resolve %s: %v", env.TaskID, dec.ToolID, rerr)
+			return string(dec.Route), dec.ToolID, "resolve_error"
+		}
+		if d.shadow {
+			d.shadowRecord(env, e)
+			return string(dec.Route), dec.ToolID, "shadow"
+		}
 		return string(dec.Route), dec.ToolID, "no_tool"
 	}
-	e, _, err := triage.ResolveTool(d.reg, dec.ToolID)
+	// index_metrics 记账打上当前任务号（前置与执行共用一个 Registry，
+	// 网关串行 + 派单 worker 单线程，同一时刻只有一个任务在跑）。
+	d.reg.SetSession(d.session, env.TaskID)
+	res, err := d.fr.Run(context.Background(), env.TaskID, env.Text)
 	if err != nil {
-		log.Printf("task=%s resolve %s: %v", env.TaskID, dec.ToolID, err)
-		// 第 14 步 B-03：预检探针失败要记账（失败行进 execution_ledger），
-		// 不禁用、不静默跳过，任务本身失败返回，不执行。
-		if errors.Is(err, triage.ErrProbeFailed) {
-			if _, rerr := d.led.RecordExecution(ledger.ExecutionRecord{
-				SessionID: d.session, TaskID: env.TaskID, ToolID: dec.ToolID,
-				Command: "probe " + dec.ToolID, ExitCode: 1, Status: "failure",
-				ErrHead: err.Error(),
-			}); rerr != nil {
-				log.Printf("probe record task=%s: %v", env.TaskID, rerr)
-			}
-		}
-		return string(dec.Route), dec.ToolID, "resolve_error"
+		log.Printf("task=%s front run: %v", env.TaskID, err)
+		return "ERROR", "", "front_error"
 	}
-	if d.shadow {
-		d.shadowRecord(env, e)
-		return string(dec.Route), dec.ToolID, "shadow"
-	}
-	return string(dec.Route), dec.ToolID, d.runTool(env, e)
+	toolID = strings.Join(res.ToolIDs, ",")
+	return res.Route, toolID, res.Status
 }
 
 // shadowRecord 只记“影子会跑什么”：先过一遍监工桩（只记 verdict，
@@ -180,7 +184,108 @@ func (d *daemon) runTool(env gateway.Envelope, e *registry.Entry) string {
 		return "background"
 	}
 	log.Printf("task=%s tool=%s exit=%d status=%s", env.TaskID, e.ToolID, res.ExitCode, res.Status)
+	if res.ExitCode != 0 && (strings.Contains(res.ErrHead, "Usage") || strings.Contains(res.ErrHead, "用法")) {
+		log.Printf("task=%s WARN tool=%s 快捷路径非零退出且 stderr 含用法提示，疑似误配 fast_path（该工具可能需要参数），请检查注册表", env.TaskID, e.ToolID)
+	}
+	// 快捷路径没有 agent 写 reply.md：成功时把工具完整输出落盘为 reply.md，
+	// 回执才能带上原始结论，否则只剩一句“执行结束”。
+	if res.ExitCode == 0 && res.StdoutFull != "" {
+		artDir := filepath.Join(d.dataDir, "artifacts", env.TaskID)
+		if err := os.MkdirAll(artDir, 0o700); err == nil {
+			out := res.StdoutFull
+			if rs := []rune(out); len(rs) > 20000 {
+				out = string(rs[:20000]) + "\n……（输出过长，已截断）"
+			}
+			_ = os.WriteFile(filepath.Join(artDir, "reply.md"), []byte(out), 0o600)
+		}
+	}
 	return res.Status
+}
+
+// executeDispatch 是派单 worker 的执行回调（第 1 项）：TOOL 走 runTool（仅 fast_path
+// 工具）或 runAgent（其余），AGENT/META 走 runAgent（带派单）；影子模式只记账不真跑。
+// 返回短回执：状态、结论（reply.md 前 500 字）、产物指针、本单费用。
+func (d *daemon) executeDispatch(ctx context.Context, disp *dispatch.Dispatch) (*dispatch.Receipt, error) {
+	env := gateway.Envelope{TaskID: disp.TaskID, Text: disp.UserText, Source: "dispatch", TS: disp.CreatedAt}
+	var status string
+	if d.shadow {
+		if disp.Route == "TOOL" && len(disp.ToolIDs) > 0 {
+			e, _, err := triage.ResolveTool(d.reg, disp.ToolIDs[0])
+			if err != nil {
+				return nil, err
+			}
+			d.shadowRecord(env, e)
+			status = "shadow"
+		} else {
+			status = d.runAgent(env, disp)
+		}
+	} else if disp.Route == "TOOL" && len(disp.ToolIDs) == 1 {
+		e, _, err := triage.ResolveTool(d.reg, disp.ToolIDs[0])
+		if err != nil {
+			return nil, err
+		}
+		if fastPathOK(disp, e) {
+			status = d.runTool(env, e)
+		} else {
+			status = d.runAgent(env, disp)
+		}
+	} else {
+		status = d.runAgent(env, disp)
+	}
+	return d.buildReceipt(disp, status), nil
+}
+
+// fastPathOK：TOOL 派单是否走 runTool 快捷路径。
+// 只有同时满足单工具、注册表显式 fast_path: true，才放行；其余一律走 runAgent
+//（安全默认），多工具也强制走 runAgent（防静默丢弃 ToolIDs[1:]）。
+func fastPathOK(disp *dispatch.Dispatch, e *registry.Entry) bool {
+	return disp != nil && disp.Route == "TOOL" && len(disp.ToolIDs) == 1 && e != nil && e.FastPath
+}
+
+// buildReceipt 按执行结果拼短回执：结论取 reply.md 前 500 字（没有就
+// 按状态写一句话），产物取 artifacts/<taskID>/ 下的文件，费用按账本
+// 查本单，步数按 execution_ledger 行数计。
+func (d *daemon) buildReceipt(disp *dispatch.Dispatch, status string) *dispatch.Receipt {
+	r := &dispatch.Receipt{
+		DispatchID: disp.ID, TaskID: disp.TaskID, Status: status,
+		ShardNo:   disp.ShardNo,
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+	}
+	artDir := filepath.Join(d.dataDir, "artifacts", disp.TaskID)
+	// 分片任务未做完时，回执带续跑指针（本片产物目录，断点已落盘），
+	// 下一片从这里接续（F-10 刹车交接）。
+	if disp.ShardNo > 0 && status != "done" {
+		r.ResumePointer = artDir
+	}
+	if b, err := os.ReadFile(filepath.Join(artDir, "reply.md")); err == nil {
+		text := strings.TrimSpace(string(b))
+		if rs := []rune(text); len(rs) > 500 {
+			text = string(rs[:500]) + "……"
+		}
+		r.Conclusion = text
+	}
+	if r.Conclusion == "" {
+		r.Conclusion = "执行结束，状态：" + status
+	}
+	if entries, err := os.ReadDir(artDir); err == nil {
+		for _, e := range entries {
+			if !e.IsDir() {
+				r.Artifacts = append(r.Artifacts, filepath.Join(artDir, e.Name()))
+			}
+		}
+	}
+	if calls, cost, err := d.led.TaskExpense(disp.TaskID); err != nil {
+		log.Printf("task=%s 查本单费用失败: %v", disp.TaskID, err)
+	} else {
+		r.CostCNYMilli = cost
+		_ = calls
+	}
+	if execs, err := d.led.ListExecutions(disp.TaskID, 1000); err != nil {
+		log.Printf("task=%s 查本单步数失败: %v", disp.TaskID, err)
+	} else {
+		r.Steps = len(execs)
+	}
+	return r
 }
 
 // memorySummary 给规划器用的相关记忆摘要：Recall 前 3 条（每条 ≤240 字），
@@ -201,16 +306,30 @@ func (d *daemon) memorySummary(text string) string {
 	return b.String()
 }
 
-// runAgent 是 AGENT 去向的真执行：主循环逐轮调工具、看到结果再决定下一步，
+// runAgent 是 AGENT/META 去向的真执行：主循环逐轮调工具、看到结果再决定下一步，
 // 最后交活前审。监工 HALT 时把打回意见喂回主循环再跑一轮（最多 2 次重跑，
 // 与监工的 HALT 上限对齐），让它照着改；影子模式只做一次决定、记一行 shadow
 // 回执，不执行。返回执行结果状态（供 handle 记 L1）。
-func (d *daemon) runAgent(env gateway.Envelope) string {
+// disp 为空时是旧调用口径（直接跑用户原话，现查记忆）；disp 非空时是
+// 派单口径：任务文本按派单拼（用户原话 + 目标 + 验收 + 工具 + 骨架 +
+// 约束 + 指针），记忆用派单带的碎片（不重查），步数上限按派单预估×2
+// （10–50 步，900 秒 / 200 步最后外墙不动）。
+func (d *daemon) runAgent(env gateway.Envelope, disp *dispatch.Dispatch) string {
 	if d.ag == nil {
 		log.Printf("task=%s AGENT but agent not wired (no llm client)", env.TaskID)
 		return "agent_unavailable"
 	}
+	taskText := env.Text
 	memSummary := d.memorySummary(env.Text)
+	if disp != nil {
+		taskText = dispatchTaskText(disp, d.reg)
+		memSummary = dispatchMemorySummary(disp)
+		// 派单步数上限（预估×2，夹在 10–50 步之间）；分片号（第 15 项）；
+		// 执行是串行的，跑完恢复 0，不影响下一单。
+		d.ag.StepCap = clampStepCap(disp.EstSteps)
+		d.ag.ShardNo = disp.ShardNo
+		defer func() { d.ag.StepCap = 0; d.ag.ShardNo = 0 }()
+	}
 	if d.shadow {
 		if _, rerr := d.led.RecordExecution(ledger.ExecutionRecord{
 			SessionID: d.session, TaskID: env.TaskID, ToolID: "agent",
@@ -224,7 +343,7 @@ func (d *daemon) runAgent(env gateway.Envelope) string {
 	}
 	feedback := ""
 	for attempt := 0; attempt <= 2; attempt++ {
-		res, err := d.ag.Run(context.Background(), env.TaskID, env.Text, memSummary, feedback)
+		res, err := d.ag.Run(context.Background(), env.TaskID, taskText, memSummary, feedback)
 		if err != nil {
 			log.Printf("task=%s agent run: %v", env.TaskID, err)
 			return "agent_error"
@@ -255,6 +374,87 @@ func (d *daemon) runAgent(env gateway.Envelope) string {
 		feedback = rres.Note
 	}
 	return "delivery_halt"
+}
+
+// clampStepCap 把派单预估步数换算成执行步数上限：预估×2，夹在 10–50 步。
+// 预估 ≤0 时给默认 10 步。900 秒 / 200 步最后外墙不受影响。
+func clampStepCap(estSteps int) int {
+	cap := estSteps * 2
+	if cap < 10 {
+		cap = 10
+	}
+	if cap > 50 {
+		cap = 50
+	}
+	return cap
+}
+
+// dispatchTaskText 把派单拼成执行会话的任务文本：用户原话打头，
+// 再附目标、验收标准、建议工具、步骤骨架、约束、指针。执行按它干活，
+// 不重分诊、不重查记忆。
+// 建议工具后附 one_liner（调法）：执行模型不展开工具单就看不到 one_liner，
+// 只给工具编号它不知道 inputs 格式，会传空 inputs 调失败（2026-11-24
+// 验证任务 002/003/004 教训）；把 one_liner 贴进任务文本，模型照抄调法。
+func dispatchTaskText(disp *dispatch.Dispatch, reg *registry.Registry) string {
+	var b strings.Builder
+	b.WriteString("用户原话：\n" + disp.UserText + "\n")
+	if strings.TrimSpace(disp.Goal) != "" {
+		b.WriteString("目标：" + disp.Goal + "\n")
+	}
+	if strings.TrimSpace(disp.Criteria) != "" {
+		b.WriteString("验收标准：" + disp.Criteria + "\n")
+	}
+	if len(disp.ToolIDs) > 0 {
+		b.WriteString("建议工具（已分诊，不重分诊）：\n")
+		for _, id := range disp.ToolIDs {
+			line := "- " + id
+			if reg != nil {
+				if e, ok := reg.Entry(id); ok && e.OneLiner != "" {
+					line += "：" + e.OneLiner
+				}
+			}
+			b.WriteString(line + "\n")
+		}
+	}
+	if len(disp.PlanSkeleton) > 0 {
+		b.WriteString("步骤骨架：\n")
+		for i, s := range disp.PlanSkeleton {
+			fmt.Fprintf(&b, "%d. %s\n", i+1, s)
+		}
+	}
+	if len(disp.Constraints) > 0 {
+		b.WriteString("约束：\n")
+		for _, s := range disp.Constraints {
+			b.WriteString("- " + s + "\n")
+		}
+	}
+	if len(disp.Pointers) > 0 {
+		b.WriteString("指针（路径/链接/记忆 ID，不贴全文）：\n")
+		for _, s := range disp.Pointers {
+			b.WriteString("- " + s + "\n")
+		}
+	}
+	if disp.ShardNo > 0 {
+		fmt.Fprintf(&b, "分片：本片是第 %d 片（每片独立 900 秒预算）。\n", disp.ShardNo)
+	}
+	if strings.TrimSpace(disp.ResumeFrom) != "" {
+		b.WriteString("续跑起点（上一片的断点，已落盘，从这里接续，不要从头重做）：\n" + disp.ResumeFrom + "\n")
+	}
+	return b.String()
+}
+
+// dispatchMemorySummary 把派单带的记忆碎片拼成执行会话的记忆摘要
+// （前置已查过，执行不重查；碎片为空返回空串）。
+func dispatchMemorySummary(disp *dispatch.Dispatch) string {
+	if len(disp.Memory) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("相关记忆摘要（前置已查，不在其中不要编造）：\n")
+	for _, m := range disp.Memory {
+		b.WriteString("- " + m + "\n")
+	}
+	return b.String()
 }
 
 func main() {
@@ -319,7 +519,19 @@ func main() {
 	defer ledger.Close(led)
 	log.Printf("ledger ready: %s", dbPath)
 
-	reg, err := registry.Load(dataDir)
+	// index_metrics 记录器（第 6 项）：懒加载每次读索引都记一行
+	// （注入 token 与相对全量省下的 token），供每日 09:00 核算。
+	// 打不开时只记日志、不致命——核算只是少了索引这一项，服务照常跑。
+	// 注意：记录器为 nil 时绝不传 WithMetricsRecorder（nil 指针装进
+	// 接口后非空，调用会 panic）；只有成功打开才接线。
+	var loadOpts []registry.Option
+	if rec, err := registry.NewLedgerFileRecorder(dbPath); err != nil {
+		log.Printf("registry metrics: 打不开 index_metrics 记录器：%v（索引记账关闭）", err)
+	} else {
+		defer rec.Close()
+		loadOpts = append(loadOpts, registry.WithMetricsRecorder(rec))
+	}
+	reg, err := registry.Load(dataDir, loadOpts...)
 	if err != nil {
 		log.Fatalf("registry load: %v", err)
 	}
@@ -399,7 +611,7 @@ func main() {
 		log.Printf("watchdog savings: date=%s triage=%d tier0=%.0f%% net_saved=%d warn=%v", sv.Date, sv.TriageCount, sv.Tier0Ratio*100, sv.NetSavedTokens, sv.Warn)
 	}
 
-	d := &daemon{cfg: cfg, led: led, reg: reg, mem: mem, ex: ex, wd: wd, session: newSessionID(), shadow: shadow}
+	d := &daemon{cfg: cfg, dataDir: dataDir, led: led, reg: reg, mem: mem, ex: ex, wd: wd, session: newSessionID(), shadow: shadow}
 	// DeepSeek 客户端接线（第 10 步）：模型名从配置读，密钥只读键名
 	// DEEPSEEK_API_KEY。非影子模式下无密钥明确报错退出，不悄悄降级
 	// 成 Tier-0-only；影子模式下无密钥只记日志（Tier-1 会报 ErrNoModel）。
@@ -437,6 +649,11 @@ func main() {
 		// 第 23 步：缺口检测只写报告（本地写盘），影子模式也开。
 		d.ag.Forge = &forge.Store{DataDir: dataDir}
 		log.Printf("agent ready: worker=%s shadow=%v", cfg.WorkerModel, shadow)
+		// 前置会话接线（第 1 项）：判断/分诊/派单/回话，只用 worker 模型
+		// （flash）；派单通道是前置→执行的内部通道。
+		d.ch = dispatch.New(dataDir)
+		d.fr = front.New(lc.CallTask, reg, mem, d.ch, dataDir, d.session)
+		log.Printf("front ready: worker=%s", cfg.WorkerModel)
 	}
 	gw := gateway.New(cfg, led, d.handle)
 	gw.SetSession(d.session)
@@ -448,17 +665,33 @@ func main() {
 	}
 	gw.Start()
 
+	// 派单 worker（第 1 项）：前置→执行的内部通道常驻执行循环。
+	// 只在前置已接线时起（无模型调用时没有派单，worker 不起）。
+	// 启动时先把落盘未回执的派单重入队（不丢单）。
+	refineCtx, refineCancel := context.WithCancel(context.Background())
+	defer refineCancel()
+	if d.ch != nil {
+		go dispatch.Worker(refineCtx, d.ch, d.executeDispatch)
+		log.Printf("dispatch worker started")
+	}
+
 	// 每日精炼（第 12 步）：影子模式不启动（精炼会真写 Wiki）；
 	// 非影子模式下模型已接线则起常驻循环，每天北京时间 04:00–04:15
 	// 精炼前一天的 L1。模型不可用时循环内每天只记一条日志，不报错。
-	refineCtx, refineCancel := context.WithCancel(context.Background())
-	defer refineCancel()
+	// （refineCtx 在派单 worker 启动处已建好，这里复用。）
 	if !shadow && lc != nil {
 		go wd.RefineLoop(refineCtx, mem, dataDir, lc.RefineL1)
 		log.Printf("refine loop started: daily 04:00 Beijing, model=%s", cfg.WorkerModel)
 	} else if !shadow {
 		log.Printf("refine loop disabled: no llm client")
 	}
+
+	// 每日 09:00 省 token 核算（第 6 项）：把 R-31 的假规则变成真定时。
+	// 常驻循环每天北京时间 09:00–09:15 核算前一天的完整账，落盘到
+	// data/daily-savings/<日期>.json，净省为负记告警日志。纯算术，
+	// 不调模型。影子模式也起（只读账本，不写库）。
+	go wd.SavingsLoop(refineCtx, dataDir)
+	log.Printf("savings loop started: daily 09:00 Beijing")
 
 	// 自进化闭环（第 20 步）：非影子模式起常驻循环，每天北京时间 04:30
 	// 自查、每周日 04:30 重建注册表；影子模式也起循环，但只记

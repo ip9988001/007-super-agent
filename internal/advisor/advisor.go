@@ -48,10 +48,11 @@ type EvidenceBundle struct {
 }
 
 type AdvisorConfig struct {
-	Endpoint string
-	APIKey   string
-	Model    string
-	Timeout  time.Duration
+	Endpoint  string
+	APIKey    string
+	Model     string
+	Timeout   time.Duration
+	SysPrompt string // 监工提示词（定稿 A-01..A-06）；为空时用内置 advisorFixedSysPrompt 兜底
 }
 
 type AdvisorDecision struct {
@@ -142,10 +143,16 @@ func CollectEvidenceBundle(ctx context.Context, db *sql.DB, req EvidenceRequest)
 // RunAdvisorCheck 带独立固定前缀发一次无工具权限只读请求，解析三级便签并执行 HALT 最多 2 轮控制
 func RunAdvisorCheck(ctx context.Context, cfg AdvisorConfig, bundle EvidenceBundle, retryCount int, prevHaltReason string) (AdvisorDecision, error) {
 	evBytes, _ := json.Marshal(bundle)
+	// 监工提示词：优先用定稿文件（cfg.SysPrompt，由 New 从
+	// data/prompts/advisor-PROMPT.md 加载），为空时用内置兜底。
+	sysPrompt := cfg.SysPrompt
+	if strings.TrimSpace(sysPrompt) == "" {
+		sysPrompt = advisorFixedSysPrompt
+	}
 	payload := map[string]any{
 		"model": cfg.Model,
 		"messages": []map[string]string{
-			{"role": "system", "content": advisorFixedSysPrompt},
+			{"role": "system", "content": sysPrompt},
 			{"role": "user", "content": string(evBytes)},
 		},
 		"response_format": map[string]string{"type": "json_object"},

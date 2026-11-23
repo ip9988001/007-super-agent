@@ -1,0 +1,12 @@
+[Unit]
+Description=007 weekly vulnerability audit (read-only, zero LLM tokens)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root/super-agent-007
+ExecStart=/opt/007-venv/bin/python3 /root/super-agent-007/ops/security/weekly_vuln_scan.py
+StandardOutput=append:/var/log/super-agent-vuln-audit.log
+StandardError=append:/var/log/super-agent-vuln-audit.log

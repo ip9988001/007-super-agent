@@ -63,6 +63,10 @@ type StatusTriad struct {
 // Forged 表示由锻造流程注册；Experimental 表示仍在试用期；
 // BlueprintID 是来源蓝图；Risk 是风险分级 low/medium/high；
 // PrivateCLIOnly 表示 GPL/AGPL 口径 B 的独立 CLI 工具，公开打包须跳过。
+// Hidden 表示默认隐藏（第 16 项）：未过试用期 / 未验证的锻造工具先藏起来，
+// 不进任何工具清单、不可派单；验证通过后把 hidden 改回 false 即可放行。
+// FastPath 表示该工具确实零 CLI 参数且原始输出可直接作回执，TOOL 派单才走
+// runTool 快捷路径；默认 false（安全默认走 runAgent），防空参裸调。
 type Entry struct {
 	ToolID         string         `json:"tool_id"`
 	Category       string         `json:"category"`
@@ -85,6 +89,8 @@ type Entry struct {
 	BlueprintID    string         `json:"blueprint_id,omitempty"`
 	Risk           string         `json:"risk,omitempty"`
 	PrivateCLIOnly bool           `json:"private_cli_only,omitempty"`
+	Hidden         bool           `json:"hidden,omitempty"`
+	FastPath       bool           `json:"fast_path,omitempty"`
 }
 
 type registryFile struct {
@@ -155,6 +161,11 @@ type Registry struct {
 	verifiedOverride   map[string]bool
 	probeFailed        map[string]string
 	entryPointOverride map[string]string
+
+	// fullIndexOnce/fullIndexTokensVal：全量索引基线（懒加载省下的 token
+	// 相对它算），只算一次、缓存起来。见 fullIndexTokens。
+	fullIndexOnce      sync.Once
+	fullIndexTokensVal int
 }
 
 // Load 读 DATA_DIR/registry/registry.json 并全量校验：
@@ -322,11 +333,12 @@ func (e *Entry) Executable() bool {
 	return e.CallType == "cli" || e.CallType == "service"
 }
 
-// Callable 是一条工具能不能被派单执行：在册、可用、且可执行。
+// Callable 是一条工具能不能被派单执行：在册、可用、可执行、且未默认隐藏。
 // 只看 available 不够：知识条目也标 available:true，但跑不起来。
+// Hidden 的工具（未过试用期的锻造工具）一律不可派单，直到验证通过改回 false。
 func (rg *Registry) Callable(toolID string) bool {
 	e, ok := rg.byID[toolID]
-	return ok && e.Available && e.Executable()
+	return ok && e.Available && e.Executable() && !e.Hidden
 }
 
 // NeedsProbe 判断一条工具在调用前是否需要先跑预检探针（第 14 步 B-03）：
@@ -851,6 +863,59 @@ func (rg *Registry) recordViolation(level, toolID string, size, tokens int) {
 		SessionID: rg.sessionID, TaskID: rg.taskID,
 		Level: level, ToolID: toolID, Hit: false,
 		TokensInjected: tokens,
+	})
+}
+
+// SetSession 给记账行换上当前会话/任务标识（前置与执行共用一个 Registry
+// 时，每单开始前调一次；没接记录器时无操作）。
+func (rg *Registry) SetSession(sessionID, taskID string) {
+	rg.mu.Lock()
+	defer rg.mu.Unlock()
+	rg.sessionID, rg.taskID = sessionID, taskID
+}
+
+// fullIndexTokens 是全量索引基线：把注册表里全部大类说明、子类说明、
+// 工具 one-liner 与 tool_id 全摊开要注入的 token 估算（EstimateTokens
+// 口径）。懒加载每次只注入其中一小片，省下的数 = 基线 − 本次注入。
+// 保守口径：未计 L3 工具全文（不在注册表里），故省下的数是下限。
+// 只算一次，缓存起来。
+func (rg *Registry) fullIndexTokens() int {
+	rg.fullIndexOnce.Do(func() {
+		total := 0
+		for _, c := range rg.catMeta {
+			total += EstimateTokens(c.ID + c.Name + c.Description)
+		}
+		for _, s := range rg.subMeta {
+			total += EstimateTokens(s.ID + s.Description)
+		}
+		for _, e := range rg.entries {
+			total += EstimateTokens(e.ToolID + e.OneLiner)
+		}
+		rg.fullIndexTokensVal = total
+	})
+	return rg.fullIndexTokensVal
+}
+
+// RecordIndexLoad 把一次懒加载读索引记进 index_metrics（第 6 项）：
+// level 是 L1/L2/L3，toolID 是 L3 时的子类（L1/L2 传空串），
+// tokensInjected 是本次实际注入的 token 估算。
+// TokensSavedVsFull = 全量基线 − 本次注入（不小于 0），Hit 记 true。
+// 没接记录器时静默跳过（生产 main.go 负责接 LedgerFileRecorder）。
+func (rg *Registry) RecordIndexLoad(level, toolID string, tokensInjected int) {
+	if rg.metrics == nil {
+		return
+	}
+	saved := rg.fullIndexTokens() - tokensInjected
+	if saved < 0 {
+		saved = 0
+	}
+	rg.mu.RLock()
+	sid, tid := rg.sessionID, rg.taskID
+	rg.mu.RUnlock()
+	_ = rg.metrics.RecordIndexMetric(IndexMetric{
+		SessionID: sid, TaskID: tid,
+		Level: level, ToolID: toolID, Hit: true,
+		TokensInjected: tokensInjected, TokensSavedVsFull: saved,
 	})
 }
 

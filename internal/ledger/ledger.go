@@ -400,6 +400,19 @@ func (l *Ledger) SummarizeExpense(sessionID string) (ExpenseSummary, error) {
 	return s, nil
 }
 
+// TaskExpense 汇总某任务的模型调用次数与费用（供派单回执用）。
+// 无记录时返回全零，不报错。只读，不写库。
+func (l *Ledger) TaskExpense(taskID string) (calls, costCNYMilli int64, err error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	err = l.db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(cost_cny_milli),0)
+		FROM expense_ledger WHERE task_id = ?`, taskID).Scan(&calls, &costCNYMilli)
+	if err != nil {
+		return 0, 0, fmt.Errorf("ledger task expense: %w", err)
+	}
+	return calls, costCNYMilli, nil
+}
+
 // ---- inbox_queue：网关持久化入队队列（第 14 步 B-02）----
 
 // InboxStatus 是 inbox_queue 一行的状态。

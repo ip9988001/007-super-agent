@@ -67,30 +67,37 @@ func copyFile(src, dst string) error {
 	return err
 }
 
-// 1. 加载 86 条（v1.7，2026-11-18 最新注册数）。2026-11-19 提到的三个设计
-// skill（hallmark / taste-skill / hyperframes-skill）当时只写进了测试注释，
-// 从未注册进 registry.json（hyperframes 的 skill 定义存在但未注册为工具，
-// hallmark 与 taste-skill 连定义都没有），故期望值按实际注册数 86 计；
-// 三者正式注册后再把期望值改到 89。2026-11-23 补注册两份孤儿 L3 记忆文档
-//（cap-memory-l1-watcher、cap-memory-refine-daily，均为已退役 Python 实现，
-// 记为 doc、available=false），总条数 84→86，memory 14→16。
-func TestLoad86Entries(t *testing.T) {
+// 1. 加载 90 条（84 + 2026-11-19 三个设计 skill：hallmark / taste-skill / hyperframes-skill；
+// 再 + 2026-11-23 改革同步的两个锻造工具：mailbox-provisioner / seo-site-audit，默认隐藏；
+// 再 + 2026-11-23 第 4 阶段 dispatch-guard）。
+func TestLoad90Entries(t *testing.T) {
 	rg, err := Load(fixture(t))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if got := rg.Count(); got != 86 {
-		t.Fatalf("Count = %d, want 86", got)
+	if got := rg.Count(); got != 90 {
+		t.Fatalf("Count = %d, want 90", got)
 	}
 	if got := len(Categories()); got != 9 {
 		t.Fatalf("Categories = %d, want 9", got)
 	}
-	// 各类条数之和 86；design 为 8（不是 11），因 2026-11-19 提到的三个设计
-	// skill 未注册（见上），注册后 design 改回 11、总条数改到 89。
-	want := map[string]int{"fetch": 13, "code": 8, "seo": 7, "design": 8, "security": 5, "runtime": 7, "media": 6, "ops": 16, "memory": 16}
+	want := map[string]int{"fetch": 13, "code": 8, "seo": 8, "design": 11, "security": 5, "runtime": 7, "media": 6, "ops": 18, "memory": 14}
 	for cat, n := range want {
 		if got := len(rg.EntriesByCategory(cat)); got != n {
 			t.Errorf("category %s = %d entries, want %d", cat, got, n)
+		}
+	}
+	// 两个锻造工具默认隐藏（第 16 项）：在册、不可派单。
+	for _, id := range []string{"forge-cloudflare-email-mailbox-provisioner", "forge-seo-site-audit"} {
+		e, ok := rg.Entry(id)
+		if !ok {
+			t.Fatalf("锻造工具 %s 不在册", id)
+		}
+		if !e.Hidden {
+			t.Errorf("锻造工具 %s 应默认隐藏", id)
+		}
+		if rg.Callable(id) {
+			t.Errorf("锻造工具 %s 默认隐藏时不应可派单", id)
 		}
 	}
 }
@@ -395,8 +402,9 @@ func TestProbeEntryByCallType(t *testing.T) {
 }
 
 // TestL2OpsSingleFile 是 v1.7 重新分类后的 ops：34 条拆走 18 条
-// （security 5、runtime 7、media 6）后剩 16 条，一份 ops.md 放得下
-// （3 行头 + 16 条 = 19 行），不再拆 ops-2.md；新三类各有单份 L2。
+// （security 5、runtime 7、media 6）后剩 16 条；2026-11-23 第 4 阶段
+// +dispatch-guard 后剩 17 条，一份 ops.md 放得下
+// （3 行头 + 17 条 = 20 行），不再拆 ops-2.md；新三类各有单份 L2。
 func TestL2OpsSingleFile(t *testing.T) {
 	rg, err := Load(fixture(t))
 	if err != nil {
@@ -417,8 +425,8 @@ func TestL2OpsSingleFile(t *testing.T) {
 			t.Fatalf("L2(ops) should not contain moved tool %q", gone)
 		}
 	}
-	if n := countLines(l2); n != 19 {
-		t.Fatalf("L2(ops) lines = %d, want 19 (3+16)", n)
+	if n := countLines(l2); n != 20 {
+		t.Fatalf("L2(ops) lines = %d, want 20 (3+17)", n)
 	}
 	// 新三类各有单份 L2，且包含各自的工具。
 	for cat, tool := range map[string]string{"security": "cap-ops-bandit", "runtime": "cap-ops-python", "media": "cap-ops-ffmpeg"} {
@@ -638,8 +646,8 @@ func TestSnapshotRestoreRollback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if rg.Count() != 86 {
-		t.Fatalf("fixture 应为 86 条，得到 %d", rg.Count())
+	if rg.Count() != 90 {
+		t.Fatalf("fixture 应为 90 条，得到 %d", rg.Count())
 	}
 	snap := filepath.Join(t.TempDir(), "before.json")
 	if err := rg.Snapshot(snap); err != nil {
@@ -654,26 +662,26 @@ func TestSnapshotRestoreRollback(t *testing.T) {
 	if err := rg.AddEntry(forged); err != nil {
 		t.Fatalf("AddEntry: %v", err)
 	}
-	if rg.Count() != 87 {
-		t.Fatalf("加后应为 87 条，得到 %d", rg.Count())
+	if rg.Count() != 91 {
+		t.Fatalf("加后应为 91 条，得到 %d", rg.Count())
 	}
 	n, err := rg.RestoreSnapshot(snap)
 	if err != nil {
 		t.Fatalf("RestoreSnapshot: %v", err)
 	}
-	if n != 86 || rg.Count() != 86 {
-		t.Fatalf("回滚后应为 86 条，得到 restored=%d count=%d", n, rg.Count())
+	if n != 90 || rg.Count() != 90 {
+		t.Fatalf("回滚后应为 90 条，得到 restored=%d count=%d", n, rg.Count())
 	}
 	if _, ok := rg.Entry("forge-snapshot-test"); ok {
 		t.Fatalf("回滚后锻造工具仍在注册表里")
 	}
-	// 磁盘上的 registry.json 也回到了 86 条。
+	// 磁盘上的 registry.json 也回到了 90 条。
 	rg2, err := Load(dir)
 	if err != nil {
 		t.Fatalf("回滚后重载: %v", err)
 	}
-	if rg2.Count() != 86 {
-		t.Fatalf("磁盘 registry.json 回滚后应为 86 条，得到 %d", rg2.Count())
+	if rg2.Count() != 90 {
+		t.Fatalf("磁盘 registry.json 回滚后应为 90 条，得到 %d", rg2.Count())
 	}
 	// 锻造工具的 L3 文件也被清掉（否则下次 Load 会报孤儿 L3）。
 	if _, err := os.Stat(filepath.Join(dir, "index", "L3", "forge-snapshot-test.md")); !os.IsNotExist(err) {

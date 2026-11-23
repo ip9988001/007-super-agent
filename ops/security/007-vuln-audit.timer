@@ -1,0 +1,11 @@
+[Unit]
+Description=Run 007 weekly vulnerability audit every Sunday 03:00
+
+[Timer]
+OnCalendar=Sun 03:00
+Persistent=true
+RandomizedDelaySec=15m
+Unit=007-vuln-audit.service
+
+[Install]
+WantedBy=timers.target

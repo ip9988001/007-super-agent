@@ -62,9 +62,19 @@ else
   echo "deps.sh: $REPO_ROOT/install-toolchain.sh not found, toolchain step skipped" >&2
 fi
 
+echo "=== deps.sh: Python venv /opt/007-venv (isolated, system Python untouched) ==="
+# Debian 12 系统 Python 里 11 个包是 apt 装的，pip 升不动（PEP 668），
+# 007 的 Python 工具全走这个 venv。build-venv.sh 自带“已建好就跳过”逻辑。
+if [ -x "$REPO_ROOT/deploy/build-venv.sh" ]; then
+  bash "$REPO_ROOT/deploy/build-venv.sh"
+else
+  echo "deps.sh: $REPO_ROOT/deploy/build-venv.sh not found, venv step skipped" >&2
+fi
+
 echo "=== deps.sh: verify ==="
 go version
 python3 --version
+/opt/007-venv/bin/python3 --version 2>/dev/null || echo "venv python missing!"
 node --version
 java --version 2>&1 | head -1
 git --version

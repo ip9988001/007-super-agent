@@ -38,6 +38,19 @@ type Advisor struct {
 	lastSession string            // 最近一次收证据的任务所属会话
 }
 
+// loadAdvisorPrompt 读监工提示词定稿（A-01..A-06）。文件缺失返回空串，
+// 调用方用内置 advisorFixedSysPrompt 兜底并记日志。
+// dbPath 是 <dataDir>/ledger.db，dataDir 取它的父目录。
+func loadAdvisorPrompt(dbPath string) string {
+	p := filepath.Join(filepath.Dir(dbPath), "prompts", "advisor-PROMPT.md")
+	b, err := os.ReadFile(p)
+	if err != nil {
+		log.Printf("advisor: 读监工提示词 %s 失败，用内置提示词兜底: %v", p, err)
+		return ""
+	}
+	return string(b)
+}
+
 // New 打开 ledger.db 的只读连接（看护包同款 mode=ro，不写库）。
 func New(dbPath string, cfg AdvisorConfig, workDir string) (*Advisor, error) {
 	db, err := sql.Open("sqlite", "file:"+dbPath+"?mode=ro")
@@ -49,6 +62,11 @@ func New(dbPath string, cfg AdvisorConfig, workDir string) (*Advisor, error) {
 		return nil, fmt.Errorf("advisor ping ledger: %w", err)
 	}
 	db.SetMaxOpenConns(1)
+	// 监工提示词优先用定稿文件；未指定时 New 在这里加载，
+	// 文件缺失则留空，RunAdvisorCheck 用内置兜底。
+	if strings.TrimSpace(cfg.SysPrompt) == "" {
+		cfg.SysPrompt = loadAdvisorPrompt(dbPath)
+	}
 	return &Advisor{db: db, cfg: cfg, workDir: workDir,
 		retry: map[string]int{}, prevReason: map[string]string{}}, nil
 }

@@ -10,6 +10,8 @@ WorkingDirectory=/root/super-agent-007
 ExecStart=/root/super-agent-007/super-agent
 EnvironmentFile=/etc/super-agent/.env
 Environment=CHROME_PATH=/root/super-agent-007/tools/scripts/chrome-with-nosandbox
+Environment="VIRTUAL_ENV=/opt/007-venv"
+Environment="PATH=/opt/007-venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 Restart=always
 RestartSec=5
 LimitNOFILE=65536
