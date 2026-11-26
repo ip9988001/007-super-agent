@@ -78,30 +78,39 @@ func collectDocs(root string) ([]indexDoc, error) {
 			Mtime:  info.ModTime().UnixNano(),
 		})
 	}
-	// L3 参考：每文件一文，展示文本取 ## 内容 节（无则取正文前几行）。
-	refRoot := filepath.Join(root, "reference")
-	_ = filepath.WalkDir(refRoot, func(path string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() || !strings.HasSuffix(path, ".md") {
+	// 参考类目录：每文件一文，展示文本取 ## 内容 节（无则取正文前几行）。
+	// reference/（稳定协议与参考资料）、l3/（1180 篇教训/案例/套路，
+	// 2026-11-24 由 reference/agent/ 搬入）、l2/（待审核候选，现为空）。
+	// 三路共用同一扫描逻辑；下次 Rebuild 才会重建向量库，本阶段不动
+	// 旧 vectors.db，库里残留的 reference/agent/ 旧源届时由 Rebuild 清掉。
+	for _, refRoot := range []string{
+		filepath.Join(root, "reference"),
+		filepath.Join(root, "l3"),
+		filepath.Join(root, "l2"),
+	} {
+		_ = filepath.WalkDir(refRoot, func(path string, d os.DirEntry, err error) error {
+			if err != nil || d.IsDir() || !strings.HasSuffix(path, ".md") {
+				return nil
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return nil
+			}
+			rel, _ := filepath.Rel(root, path)
+			rel = strings.TrimSuffix(rel, ".md")
+			text := contentSection(string(data))
+			if text == "" {
+				text = firstBodyText(string(data))
+			}
+			if text == "" {
+				return nil
+			}
+			embed := truncateRunes(text, IndexEmbedMaxRunes)
+			info, _ := d.Info()
+			docs = append(docs, indexDoc{Source: rel, Text: text, Embed: embed, Mtime: info.ModTime().UnixNano()})
 			return nil
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return nil
-		}
-		rel, _ := filepath.Rel(root, path)
-		rel = strings.TrimSuffix(rel, ".md")
-		text := contentSection(string(data))
-		if text == "" {
-			text = firstBodyText(string(data))
-		}
-		if text == "" {
-			return nil
-		}
-		embed := truncateRunes(text, IndexEmbedMaxRunes)
-		info, _ := d.Info()
-		docs = append(docs, indexDoc{Source: rel, Text: text, Embed: embed, Mtime: info.ModTime().UnixNano()})
-		return nil
-	})
+		})
+	}
 	return docs, nil
 }
 

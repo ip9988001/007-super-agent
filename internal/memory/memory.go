@@ -71,17 +71,34 @@ type Store struct {
 	mu       sync.Mutex
 	seq      int
 	semantic SemanticSearchFunc
+
+	// 简介主库（线 B 第二阶段第 3 棒）：接上后 memorySummary /
+	// front.doRecall 在 TwoStageRecallEnabled 时走新两阶段召回，
+	// 否则走旧 Recall 路径（回滚对照）。未接时新路径不可用。
+	summaryStore *SummaryStore
+	summaryEmbed EmbedFunc
+
+	// 全文快照缓存（两阶段召回用）：指纹命中复用，写操作改指纹后失效。
+	corpusMu    sync.Mutex
+	corpusCache *corpusSnapshot
 }
 
-// Open 创建记忆目录（l1/、wiki/四类、carryover/）并返回 Store。
+// L3Categories 是 l3/ 下的七个分类目录（2026-11-24 由 reference/agent/ 搬入）。
+var L3Categories = []string{"lessons", "cases", "patterns", "decisions", "procedures", "anti-patterns", "system"}
+
+// Open 创建记忆目录（l1/、l2/、l3/ 七类、wiki/四类、carryover/）并返回 Store。
 // root 不存在时自动创建。
 func Open(root string) (*Store, error) {
 	dirs := []string{
 		filepath.Join(root, "l1"),
+		filepath.Join(root, "l2"),
 		filepath.Join(root, "carryover"),
 	}
 	for _, k := range []WikiKind{KindEntities, KindConcepts, KindSources, KindSynthesis} {
 		dirs = append(dirs, filepath.Join(root, "wiki", string(k)))
+	}
+	for _, c := range L3Categories {
+		dirs = append(dirs, filepath.Join(root, "l3", c))
 	}
 	for _, d := range dirs {
 		if err := os.MkdirAll(d, 0o700); err != nil {
@@ -89,6 +106,35 @@ func Open(root string) (*Store, error) {
 		}
 	}
 	return &Store{root: root}, nil
+}
+
+// SemanticEnabled 是语义臂总开关（线 B 第二阶段第 1 步，临时措施）：
+// 现有 vectors.db 里约 70% 向量指向已删的 reference/agent/ 旧路径，语义臂
+// 当前是净负收益（70 条评测：Recall@3 从 54% 跌到 32%），简介向量未建好
+// 之前先停用，Recall 只走纯词法。恢复只需把本行改回 true；不删向量库、
+// 不删语义代码、不动磁盘记忆文件。注意：recall-eval 的 -semantic 开关只
+// 决定是否注入语义函数，本开关关闭时即使注入了也不走语义腿。
+//
+// 线 B 第二阶段第 3 棒：本开关同时管新简介向量语义腿（两阶段召回
+// 的简介语义一路，见 retrieval.go summarySemantic）：简介向量建好
+// 后，把语义腿从旧 vectors.db 切换到新简介向量库，恢复/停用一处改动。
+// 若新语义腿实测不增益，保持关闭并如实汇报，不要硬开。
+var SemanticEnabled = false
+
+// TwoStageRecallEnabled 是两阶段召回总开关（线 B 第二阶段第 3 棒）：
+// true 且已接简介主库（WithSummaryStore）时，memorySummary /
+// front.doRecall 走新两阶段召回；false 或未接主库时走旧 Recall
+// 路径（回滚对照，旧代码一字不删）。默认 true——但生产守护进程
+// 在简介主库文件不存在时不接线，故默认仍走旧路径，直到部署时
+// 把主库文件放到位（见 docs/line-b-phase2-stage3-deploy-notes.md）。
+var TwoStageRecallEnabled = true
+
+// WithSummaryStore 接入简介主库与问句向量函数（新两阶段召回用）。
+// embed 为 nil 时语义腿跳过（只走词法 + 全文腿），不报错。
+func (s *Store) WithSummaryStore(st *SummaryStore, embed EmbedFunc) *Store {
+	s.summaryStore = st
+	s.summaryEmbed = embed
+	return s
 }
 
 // WithSemantic 注入语义检索函数（链式配置，未注入则纯词法）。
@@ -176,6 +222,14 @@ func (s *Store) WriteWiki(e WikiEntry) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// 脱敏口径（用户 2026-11-24 09:12 纠正，覆盖 v2.1 §6 旧文）：
+	// 密钥必须保持可用，007 要用密钥调 API 才能干活——WriteWiki
+	// 落盘前不再掩码（旧节点 1 已取消），已有含密钥文件保持原样。
+	// 掩码只留在“会留存的东西”上：简介生成输入/输出检查
+	// （internal/summary）、召回账本写前（ledger.RecordRecall）、
+	// 最终 reply.md 落盘 / 回传网关前（internal/sanitize.ScrubOutbound
+	// 出站硬扫描，线 B 修复轮第 3 棒；软规矩“报告不贴原文”已改硬防线）；
+	// 交付给模型前（卡片/全文）绝不掩码。
 	content := "# " + e.Title + "\n\nSummary: " + strings.TrimSpace(e.Summary) + "\n\n" + e.Body + "\n"
 	path := filepath.Join(s.root, "wiki", string(e.Kind), e.Title+".md")
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
@@ -299,9 +353,11 @@ func contentSection(data string) string {
 	return strings.TrimSpace(b.String())
 }
 
-// Recall 混合检索：词法必查 L1、Wiki 与 L3 参考（二号记忆文件）；语义已注入时合并（同源取
-// 最高分），未注入时只用词法。结果按分数降序取前 3 条，每条 ≤240 字符。
-func (s *Store) Recall(query string) ([]Result, error) {
+// recallAll 混合检索的完整排序候选（不截 TopK）：词法必查 L1、Wiki、
+// reference、l3、l2；语义已注入时合并（同源取最高分），未注入时只用
+// 词法。Recall 与 RecallCandidates 共用；生产交付语义（TopK=3、
+// 每条 ≤240 字符）不变。
+func (s *Store) recallAll(query string) ([]Result, error) {
 	kws := keywords(query)
 	if len(kws) == 0 {
 		return nil, fmt.Errorf("memory recall: 查询无有效关键词")
@@ -358,32 +414,21 @@ func (s *Store) Recall(query string) ([]Result, error) {
 		}
 	}
 
-	// 词法：L3 参考（二号记忆文件，按分类保存）：读 ## 内容 节。
-	refRoot := filepath.Join(s.root, "reference")
-	_ = filepath.WalkDir(refRoot, func(path string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() || !strings.HasSuffix(path, ".md") {
-			return nil
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return nil
-		}
-		if sc := score(string(data), kws); sc > 0 {
-			rel, _ := filepath.Rel(s.root, path)
-			rel = strings.TrimSuffix(rel, ".md")
-			text := contentSection(string(data))
-			if text == "" {
-				text = firstBodyText(string(data))
-			}
-			if old, ok := bySource[rel]; !ok || sc > old.Score {
-				bySource[rel] = Result{Source: rel, Text: truncateRunes(text, MaxResultRunes), Score: sc}
-			}
-		}
-		return nil
-	})
+	// 词法：参考类目录全文计分，展示取 ## 内容 节：reference/（稳定
+	// 协议与参考资料）、l3/（1180 篇教训/案例/套路，2026-11-24 由
+	// reference/agent/ 搬入）、l2/（待审核候选，现为空）。三路共用同一
+	// 扫描函数，目录不存在时静默跳过。
+	for _, dir := range []string{
+		filepath.Join(s.root, "reference"),
+		filepath.Join(s.root, "l3"),
+		filepath.Join(s.root, "l2"),
+	} {
+		s.lexicalScanDir(dir, kws, bySource)
+	}
 
-	// 语义：已注入才合并，未注入不伪造。
-	if s.semantic != nil {
+	// 语义：开关打开且已注入才合并，未注入不伪造。
+	// SemanticEnabled=false 时跳过本腿（临时停用，见开关处注释）。
+	if SemanticEnabled && s.semantic != nil {
 		sem, err := s.semantic(query)
 		if err != nil {
 			return nil, fmt.Errorf("memory recall semantic: %w", err)
@@ -406,8 +451,66 @@ func (s *Store) Recall(query string) ([]Result, error) {
 		}
 		return all[i].Source < all[j].Source
 	})
+	return all, nil
+}
+
+// lexicalScanDir 词法扫描一个参考类目录（reference/、l3/、l2/ 共用）：
+// 全文按关键词计分，展示文本取 ## 内容 节，缺失时用正文前几行兜底。
+// 同源多次命中只留最高分。目录不存在或不可读时静默跳过，不报错。
+func (s *Store) lexicalScanDir(dir string, kws []string, bySource map[string]Result) {
+	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(path, ".md") {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+		if sc := score(string(data), kws); sc > 0 {
+			rel, _ := filepath.Rel(s.root, path)
+			rel = strings.TrimSuffix(rel, ".md")
+			text := contentSection(string(data))
+			if text == "" {
+				text = firstBodyText(string(data))
+			}
+			if old, ok := bySource[rel]; !ok || sc > old.Score {
+				bySource[rel] = Result{Source: rel, Text: truncateRunes(text, MaxResultRunes), Score: sc}
+			}
+		}
+		return nil
+	})
+}
+
+// Recall 混合检索：词法必查 L1、Wiki、reference、l3、l2；语义已注入时
+// 合并（同源取最高分），未注入时只用词法。结果按分数降序取前 3 条，
+// 每条 ≤240 字符。生产交付只走这一口，语义不变。
+func (s *Store) Recall(query string) ([]Result, error) {
+	all, err := s.recallAll(query)
+	if err != nil {
+		return nil, err
+	}
 	if len(all) > TopK {
 		all = all[:TopK]
+	}
+	return all, nil
+}
+
+// RecallCandidates 评测专用入口：返回按分排序的前 limit 名候选
+// （limit<=0 返回全部，上限 200），仅供黄金评测集跑 Recall@40 等
+// 指标用；生产交付一律走 Recall（TopK=3），交付语义与截断口径不变。
+func (s *Store) RecallCandidates(query string, limit int) ([]Result, error) {
+	all, err := s.recallAll(query)
+	if err != nil {
+		return nil, err
+	}
+	if limit <= 0 {
+		return all, nil
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	if len(all) > limit {
+		all = all[:limit]
 	}
 	return all, nil
 }

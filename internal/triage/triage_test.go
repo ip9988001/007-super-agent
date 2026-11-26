@@ -190,13 +190,13 @@ func TestFrozenListDeterministic(t *testing.T) {
 			lines++
 		}
 	}
-	if lines != 49 { // 90 条总账：7 条 available:false 不进清单
-		// （bili/tvly/llmtrim + 2 锻造工具 5 条 cli + link-selftest 1 条
-		// service + playbooks 1 条 doc）；35 条知识条目
-		// （doc/sop/tool/mcp/data）不可执行、也不进清单；
-		// 清单只剩 41 cli + 8 service = 49 条可执行工具
+	if lines != 50 { // 94 条总账：10 条 available:false 不进清单
+		// （bili/playbooks/llmtrim/link-selftest + 2 个旧锻造工具
+		// + 4 个新 forge 工具；tvly 在 live 里已翻为可用，不再扣）；
+		// 35 条知识条目（doc/sop/tool/mcp/data）不可执行、也不进清单；
+		// 清单只剩 42 cli + 8 service = 50 条可执行工具
 		// （清单行含 cap-/ext-/skill- 三种前缀，不能只数 "- cap-"）
-		t.Errorf("frozen tool list lines = %d, want 49", lines)
+		t.Errorf("frozen tool list lines = %d, want 50", lines)
 	}
 	// 冻结前缀 + 尾部分开发送：天气问题走 DIRECT（清单里没有天气工具，
 	// 模型不许编 tool_id；这里用桩模拟模型回 DIRECT，验证链路本身）。

@@ -125,7 +125,95 @@ func TestRecallReferenceContent(t *testing.T) {
 	}
 }
 
-// 3c. 无 Summary 行 / 无 ## 内容 节的高分命中，展示文本兜底取正文前几行，不回空。
+// 3d. 线 B 第一阶段：l3/ 进入召回扫描根，l3 文件能被词法召回；
+// l2/ 为空也不影响召回；Open 建出 l3 七类与 l2 目录。
+func TestRecallL3Lessons(t *testing.T) {
+	st := openTest(t)
+	for _, c := range L3Categories {
+		if _, err := os.Stat(filepath.Join(st.root, "l3", c)); err != nil {
+			t.Fatalf("Open 应建出 l3/%s: %v", c, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(st.root, "l2")); err != nil {
+		t.Fatalf("Open 应建出 l2: %v", err)
+	}
+	l3Dir := filepath.Join(st.root, "l3", "lessons")
+	body := "# [教训] 抓验证页教训\n\n## 来源\n- **日期**: 2026-11-18\n\n## 内容\n抓验证页要用反检测浏览器，普通 curl 只回空壳。\n\n## 状态\n- **状态**: active\n"
+	if err := os.WriteFile(filepath.Join(l3Dir, "lesson-l3-test.md"), []byte(body), 0o644); err != nil {
+		t.Fatalf("WriteFile l3: %v", err)
+	}
+	res, err := st.Recall("验证页反检测浏览器")
+	if err != nil {
+		t.Fatalf("Recall: %v", err)
+	}
+	found := false
+	for _, r := range res {
+		if r.Source == "l3/lessons/lesson-l3-test" {
+			found = true
+			if !strings.Contains(r.Text, "反检测浏览器") {
+				t.Fatalf("l3 文本应取 ## 内容 节，实为 %q", r.Text)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("l3 文件应进召回候选，实为 %v", res)
+	}
+}
+
+// 3e. 线 B 第一阶段：RecallCandidates 是评测专用入口，返回完整排序候选；
+// Recall 仍只交付前 3 条，生产交付语义不变。
+func TestRecallCandidatesDoesNotChangeDelivery(t *testing.T) {
+	st := openTest(t)
+	for _, title := range []string{"甲词条", "乙词条", "丙词条", "丁词条", "戊词条"} {
+		if err := st.WriteWiki(WikiEntry{Kind: KindConcepts, Title: title,
+			Summary: "候选测试摘要", Body: "候选测试正文"}); err != nil {
+			t.Fatalf("WriteWiki %s: %v", title, err)
+		}
+	}
+	all, err := st.RecallCandidates("候选测试", 40)
+	if err != nil {
+		t.Fatalf("RecallCandidates: %v", err)
+	}
+	if len(all) != 5 {
+		t.Fatalf("RecallCandidates(40) 应返回全部 5 条候选，实为 %d", len(all))
+	}
+	top, err := st.Recall("候选测试")
+	if err != nil {
+		t.Fatalf("Recall: %v", err)
+	}
+	if len(top) != 3 {
+		t.Fatalf("Recall 仍应只交付 3 条，实为 %d", len(top))
+	}
+	for i := range top {
+		if top[i] != all[i] {
+			t.Fatalf("交付前 3 条须与候选排序一致：%v vs %v", top, all)
+		}
+	}
+}
+
+// 1b. 线 B 第二阶段第 3 棒（用户 2026-11-24 09:12 纠正）：
+// WriteWiki 落盘前不再掩码（旧节点 1 已取消）——密钥必须保持可用，
+// 007 要用密钥调 API 才能干活。合成假密钥原样落盘，模型照常用。
+func TestWriteWikiKeepsSecretsUsable(t *testing.T) {
+	st := openTest(t)
+	// 合成假密钥，只用于验证落盘口径。
+	fake := "sk-FAKEKEY1234567890abcdef"
+	err := st.WriteWiki(WikiEntry{Kind: KindConcepts, Title: "脱敏词条",
+		Summary: "测试摘要", Body: "调用时用的 key 是 " + fake + "，用完即换。"})
+	if err != nil {
+		t.Fatalf("WriteWiki: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(st.root, "wiki", "concepts", "脱敏词条.md"))
+	if err != nil {
+		t.Fatalf("wiki 文件未落盘: %v", err)
+	}
+	if !strings.Contains(string(data), fake) {
+		t.Fatalf("假密钥原文应原样落盘（09:12 纠正：密钥保持可用）：%q", string(data))
+	}
+	if strings.Contains(string(data), "[REDACTED]") {
+		t.Fatalf("落盘文件不应含掩码：%q", string(data))
+	}
+}
 func TestRecallFallbackText(t *testing.T) {
 	st := openTest(t)
 	refDir := filepath.Join(st.root, "reference", "protocols")
@@ -203,6 +291,8 @@ func TestWriteWikiRejectBadTitle(t *testing.T) {
 }
 
 // 附加：未注入语义时只用词法；注入后合并去重。
+// SemanticEnabled 默认关闭（线 B 第二阶段第 1 步临时停用），本测试为验证
+// 合并逻辑，临时打开开关、测完恢复。
 func TestRecallSemanticOptional(t *testing.T) {
 	st := openTest(t)
 	if err := st.WriteWiki(WikiEntry{Kind: KindEntities, Title: "向量词条", Summary: "向量测试摘要", Body: "向量测试正文"}); err != nil {
@@ -212,6 +302,9 @@ func TestRecallSemanticOptional(t *testing.T) {
 	if err != nil || len(res) == 0 {
 		t.Fatalf("纯词法应命中：res=%v err=%v", res, err)
 	}
+	oldEnabled := SemanticEnabled
+	SemanticEnabled = true
+	defer func() { SemanticEnabled = oldEnabled }()
 	st.WithSemantic(func(q string) ([]Result, error) {
 		return []Result{{Source: "wiki/entities/向量词条", Text: "语义结果", Score: 99}}, nil
 	})

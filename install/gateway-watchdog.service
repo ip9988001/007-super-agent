@@ -1,0 +1,15 @@
+[Unit]
+Description=007 Gateway Watchdog (Line A P0)
+Documentation=https://github.com/ip9988001/007-super-agent
+After=network-online.target super-agent.service
+Wants=network-online.target
+
+[Service]
+# P0 修复：User 必须与 super-agent.service 完全一致（root，无 Group 行）。
+# 看门狗与主服务共享同一个 ledger.db（WAL 模式）：若以不同用户运行，
+# 看门狗新建的 -wal/-shm 或补写的 reply.md 会归属错用户，导致主服务
+# 后续写库/写文件报 permission denied。
+Type=oneshot
+User=root
+WorkingDirectory=/root/super-agent-007
+ExecStart=/root/super-agent-007/gateway-watchdog --data-dir /root/super-agent-007/data

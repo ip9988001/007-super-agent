@@ -67,21 +67,21 @@ func copyFile(src, dst string) error {
 	return err
 }
 
-// 1. 加载 90 条（84 + 2026-11-19 三个设计 skill：hallmark / taste-skill / hyperframes-skill；
+// 1. 加载 94 条（84 + 2026-11-19 三个设计 skill：hallmark / taste-skill / hyperframes-skill；
 // 再 + 2026-11-23 改革同步的两个锻造工具：mailbox-provisioner / seo-site-audit，默认隐藏；
-// 再 + 2026-11-23 第 4 阶段 dispatch-guard）。
-func TestLoad90Entries(t *testing.T) {
+// 再 + 2026-11-23 第 4 阶段 dispatch-guard；再 + 2026-11-26 从 live 同步的 4 个 forge 工具）。
+func TestLoad94Entries(t *testing.T) {
 	rg, err := Load(fixture(t))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if got := rg.Count(); got != 90 {
-		t.Fatalf("Count = %d, want 90", got)
+	if got := rg.Count(); got != 94 {
+		t.Fatalf("Count = %d, want 94", got)
 	}
 	if got := len(Categories()); got != 9 {
 		t.Fatalf("Categories = %d, want 9", got)
 	}
-	want := map[string]int{"fetch": 13, "code": 8, "seo": 8, "design": 11, "security": 5, "runtime": 7, "media": 6, "ops": 18, "memory": 14}
+	want := map[string]int{"fetch": 13, "code": 8, "seo": 8, "design": 11, "security": 5, "runtime": 7, "media": 6, "ops": 22, "memory": 14}
 	for cat, n := range want {
 		if got := len(rg.EntriesByCategory(cat)); got != n {
 			t.Errorf("category %s = %d entries, want %d", cat, got, n)
@@ -403,8 +403,9 @@ func TestProbeEntryByCallType(t *testing.T) {
 
 // TestL2OpsSingleFile 是 v1.7 重新分类后的 ops：34 条拆走 18 条
 // （security 5、runtime 7、media 6）后剩 16 条；2026-11-23 第 4 阶段
-// +dispatch-guard 后剩 17 条，一份 ops.md 放得下
-// （3 行头 + 17 条 = 20 行），不再拆 ops-2.md；新三类各有单份 L2。
+// +dispatch-guard 后剩 17 条；2026-11-26 从 live 同步 +4 forge 工具后
+// 剩 21 条，一份 ops.md 放得下（3 行头 + 21 条 = 24 行），不再拆
+// ops-2.md；新三类各有单份 L2。
 func TestL2OpsSingleFile(t *testing.T) {
 	rg, err := Load(fixture(t))
 	if err != nil {
@@ -425,8 +426,8 @@ func TestL2OpsSingleFile(t *testing.T) {
 			t.Fatalf("L2(ops) should not contain moved tool %q", gone)
 		}
 	}
-	if n := countLines(l2); n != 20 {
-		t.Fatalf("L2(ops) lines = %d, want 20 (3+17)", n)
+	if n := countLines(l2); n != 24 {
+		t.Fatalf("L2(ops) lines = %d, want 24 (3+21)", n)
 	}
 	// 新三类各有单份 L2，且包含各自的工具。
 	for cat, tool := range map[string]string{"security": "cap-ops-bandit", "runtime": "cap-ops-python", "media": "cap-ops-ffmpeg"} {
@@ -646,8 +647,8 @@ func TestSnapshotRestoreRollback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if rg.Count() != 90 {
-		t.Fatalf("fixture 应为 90 条，得到 %d", rg.Count())
+	if rg.Count() != 94 {
+		t.Fatalf("fixture 应为 94 条，得到 %d", rg.Count())
 	}
 	snap := filepath.Join(t.TempDir(), "before.json")
 	if err := rg.Snapshot(snap); err != nil {
@@ -662,26 +663,26 @@ func TestSnapshotRestoreRollback(t *testing.T) {
 	if err := rg.AddEntry(forged); err != nil {
 		t.Fatalf("AddEntry: %v", err)
 	}
-	if rg.Count() != 91 {
-		t.Fatalf("加后应为 91 条，得到 %d", rg.Count())
+	if rg.Count() != 95 {
+		t.Fatalf("加后应为 95 条，得到 %d", rg.Count())
 	}
 	n, err := rg.RestoreSnapshot(snap)
 	if err != nil {
 		t.Fatalf("RestoreSnapshot: %v", err)
 	}
-	if n != 90 || rg.Count() != 90 {
-		t.Fatalf("回滚后应为 90 条，得到 restored=%d count=%d", n, rg.Count())
+	if n != 94 || rg.Count() != 94 {
+		t.Fatalf("回滚后应为 94 条，得到 restored=%d count=%d", n, rg.Count())
 	}
 	if _, ok := rg.Entry("forge-snapshot-test"); ok {
 		t.Fatalf("回滚后锻造工具仍在注册表里")
 	}
-	// 磁盘上的 registry.json 也回到了 90 条。
+	// 磁盘上的 registry.json 也回到了 94 条。
 	rg2, err := Load(dir)
 	if err != nil {
 		t.Fatalf("回滚后重载: %v", err)
 	}
-	if rg2.Count() != 90 {
-		t.Fatalf("磁盘 registry.json 回滚后应为 90 条，得到 %d", rg2.Count())
+	if rg2.Count() != 94 {
+		t.Fatalf("磁盘 registry.json 回滚后应为 94 条，得到 %d", rg2.Count())
 	}
 	// 锻造工具的 L3 文件也被清掉（否则下次 Load 会报孤儿 L3）。
 	if _, err := os.Stat(filepath.Join(dir, "index", "L3", "forge-snapshot-test.md")); !os.IsNotExist(err) {

@@ -13,6 +13,7 @@ package watchdog
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -21,6 +22,7 @@ import (
 	"time"
 
 	"007-super-agent/internal/ledger"
+	"007-super-agent/internal/memlock"
 	"007-super-agent/internal/memory"
 )
 
@@ -112,6 +114,10 @@ func beijingNow() time.Time {
 	return time.Now().In(loc)
 }
 
+// refineLongDuration 是精炼耗时告警线（20 分钟）：精炼与 04:30 自进化
+// 只隔 30 分钟，超 20 分钟记一条告警，提醒留意窗口挤占。
+const refineLongDuration = 20 * time.Minute
+
 // shouldRefine 判断现在是否该跑精炼：北京时间 04:00–04:15，
 // 且标记文件里的日期不是今天（当天未跑过）。
 func shouldRefine(now time.Time, marker string) bool {
@@ -124,6 +130,9 @@ func shouldRefine(now time.Time, marker string) bool {
 // RefineLoop 常驻轻量循环：每 60 秒检查一次，北京时间 04:00–04:15 且
 // 当天未跑过（标记文件）才跑一次 RefineDaily（精炼前一天的 L1）。
 // 跑完才写当天标记；ctx 取消时退出。模型不可用时每天只记一条日志。
+// 精炼全程持有记忆写锁（与 04:30 自进化共用，见 internal/memlock）：
+// 自进化正在写时本次精炼跳过、标记不写，下个 60 秒再试；精炼耗时
+// 超 20 分钟记一条告警（与自进化只隔 30 分钟）。
 func (w *Watchdog) RefineLoop(ctx context.Context, mem *memory.Store, dataDir string, refine RefineFunc) {
 	tick := time.NewTicker(60 * time.Second)
 	defer tick.Stop()
@@ -150,15 +159,35 @@ func (w *Watchdog) RefineLoop(ctx context.Context, mem *memory.Store, dataDir st
 			continue
 		}
 		yesterday := now.AddDate(0, 0, -1).Format("2006-01-02")
-		if _, err := w.RefineDaily(ctx, mem, yesterday, refine); err != nil {
-			log.Printf("refine loop: %v", err)
+		start := time.Now()
+		ok := func() bool {
+			lk, err := memlock.TryLock(dataDir)
+			if err != nil {
+				if errors.Is(err, memlock.ErrLocked) {
+					log.Printf("refine loop: 记忆写锁被占用（自进化正在写），本次精炼跳过，下个 60 秒再试")
+				} else {
+					log.Printf("refine loop: 取记忆写锁失败: %v（本次精炼跳过）", err)
+				}
+				return false
+			}
+			defer lk.Unlock()
+			if _, err := w.RefineDaily(ctx, mem, yesterday, refine); err != nil {
+				log.Printf("refine loop: %v", err)
+				return false
+			}
+			if err := os.WriteFile(refineMarkerFile(dataDir), []byte(now.Format("2006-01-02")+"\n"), 0o600); err != nil {
+				log.Printf("refine loop: 写标记文件失败: %v（下个 60 秒会重跑一次）", err)
+			}
+			// 第 15 步：精炼成功后调记忆备份钩子（失败只记日志，不阻塞循环）。
+			w.afterRefine(ctx, yesterday)
+			return true
+		}()
+		if dur := time.Since(start); dur > refineLongDuration {
+			log.Printf("refine loop: 本次精炼耗时 %s，超 %s 告警（与 04:30 自进化只隔 30 分钟）", dur, refineLongDuration)
+		}
+		if !ok {
 			continue
 		}
-		if err := os.WriteFile(refineMarkerFile(dataDir), []byte(now.Format("2006-01-02")+"\n"), 0o600); err != nil {
-			log.Printf("refine loop: 写标记文件失败: %v（下个 60 秒会重跑一次）", err)
-		}
-		// 第 15 步：精炼成功后调记忆备份钩子（失败只记日志，不阻塞循环）。
-		w.afterRefine(ctx, yesterday)
 		// 第 22 步：精炼成功后后台跑语义索引增量重建（只嵌新增/改动
 		// 过的文档，日常只有几篇；跑在后台，不阻塞精炼循环）。
 		w.afterRefineSemantic(ctx)

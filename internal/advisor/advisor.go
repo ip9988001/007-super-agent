@@ -140,6 +140,16 @@ func CollectEvidenceBundle(ctx context.Context, db *sql.DB, req EvidenceRequest)
 	return b, nil
 }
 
+// ensureJSONWord 保证 json_object 模式可用：system 或 user 任一消息含
+// "json"（不分大小写）即不动；都没有时在 system 末尾补一句。
+func ensureJSONWord(sysPrompt, userContent string) string {
+	if strings.Contains(strings.ToLower(sysPrompt), "json") ||
+		strings.Contains(strings.ToLower(userContent), "json") {
+		return sysPrompt
+	}
+	return sysPrompt + "\n请以 JSON 格式回复。"
+}
+
 // RunAdvisorCheck 带独立固定前缀发一次无工具权限只读请求，解析三级便签并执行 HALT 最多 2 轮控制
 func RunAdvisorCheck(ctx context.Context, cfg AdvisorConfig, bundle EvidenceBundle, retryCount int, prevHaltReason string) (AdvisorDecision, error) {
 	evBytes, _ := json.Marshal(bundle)
@@ -149,6 +159,11 @@ func RunAdvisorCheck(ctx context.Context, cfg AdvisorConfig, bundle EvidenceBund
 	if strings.TrimSpace(sysPrompt) == "" {
 		sysPrompt = advisorFixedSysPrompt
 	}
+	// DeepSeek 的 json_object 模式要求消息里出现 "json" 这个词
+	// （API 侧校验，缺了直接 400）；定稿提示词文件里
+	// 没有这个词时，在消息末尾补一句，否则监工
+	// 每次调询都会失败、形同虚设（2026-11-24 线 B 验收发现）。
+	sysPrompt = ensureJSONWord(sysPrompt, string(evBytes))
 	payload := map[string]any{
 		"model": cfg.Model,
 		"messages": []map[string]string{

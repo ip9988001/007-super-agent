@@ -1,0 +1,19 @@
+2026-11-24T00:14:14+08:00	task verify-20261124-ctxread-001 route=ERROR tool= status=front_error duration_ms=22676
+2026-11-24T00:18:21+08:00	task verify-20261124-ctxread-002 route=TOOL tool=cap-ops-lean-ctx status=failure duration_ms=8764
+2026-11-24T00:22:34+08:00	task verify-20261124-ctxread-003 route=TOOL tool=cap-ops-lean-ctx status=failure duration_ms=3481
+2026-11-24T00:26:47+08:00	task verify-20261124-ctxread-004 route=TOOL tool=cap-ops-lean-ctx status=failure duration_ms=4067
+2026-11-24T00:31:39+08:00	task verify-20261124-ctxread-005 route=TOOL tool=cap-ops-lean-ctx status=failure duration_ms=4280
+2026-11-24T00:52:18+08:00	task verify-20261124-ctxread-006 route=TOOL tool=cap-ops-lean-ctx status=failure duration_ms=3947
+2026-11-24T01:11:32+08:00	task verify-20261124-ctxread-007 route=TOOL tool=cap-ops-lean-ctx status=done duration_ms=86618
+2026-11-24T01:22:26+08:00	task verify-20261124-fp-pipaudit route=TOOL tool=cap-ops-pip-audit status=failure duration_ms=4792
+2026-11-24T01:23:19+08:00	task verify-20261124-fp-ctxread route=TOOL tool=cap-ops-lean-ctx status=done duration_ms=57158
+2026-11-24T01:27:59+08:00	task verify-20261124-fp-pipaudit2 route=TOOL tool=cap-ops-pip-audit status=max_iterations duration_ms=200650
+2026-11-24T02:28:06+08:00	task verify-20261124-venv-env route=TOOL tool=cap-ops-python status=done duration_ms=42733
+2026-11-24T02:29:32+08:00	task verify-20261124-venv-tools route=ERROR tool= status=front_error duration_ms=7146
+2026-11-24T02:43:02+08:00	task verify-20261124-venv-tools2 route=AGENT tool=cap-fetch-yt-dlp,cap-fetch-playwright-cli,cap-seo-content-scorers,cap-fetch-scrapling status=max_iterations duration_ms=124463
+2026-11-24T03:13:21+08:00	task test-20261124-work-001 route=AGENT tool=cap-ops-lean-ctx,cap-ops-script-inventory status=done duration_ms=156601
+2026-11-24T03:20:08+08:00	task cf-register-gonglue-001 route=ERROR tool= status=front_error duration_ms=20245
+2026-11-24T03:22:29+08:00	task cf-register-gonglue-002 route=ERROR tool= status=front_error duration_ms=28192
+2026-11-24T04:01:03+08:00	wiki write concepts/Agent 任务路由与状态分类
+2026-11-24T04:31:10+08:00	wiki write synthesis/自进化自查 2026-11-24
+2026-11-24T08:16:43+08:00	task line-a-smoke-001 route=DIRECT tool= status=done duration_ms=1108

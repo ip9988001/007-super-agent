@@ -1,1 +1,28 @@
-{"ignores":[{"ecosystem":"python","expires_at":"2027-02-24","package":"soupsieve","reason":"PyPI 最新版 2.10 尚无修复版；007 仅内部固定选择器且有超时保护","reopen_when_fixed":true,"vuln_id":"CVE-2026-126190"},{"ecosystem":"python","expires_at":"2027-02-24","package":"soupsieve","reason":"PyPI 最新版 2.10 尚无修复版；007 仅内部固定选择器且有超时保护","reopen_when_fixed":true,"vuln_id":"CVE-2026-126191"},{"ecosystem":"python","expires_at":"2027-02-24","package":"soupsieve","reason":"PyPI 最新版 2.10 尚无修复版；007 仅内部固定选择器且有超时保护","reopen_when_fixed":true,"vuln_id":"CVE-2026-126193"}]}
+{
+  "ignores": [
+    {
+      "ecosystem": "python",
+      "package": "soupsieve",
+      "vuln_id": "CVE-2026-126190",
+      "reason": "PyPI 最新版 2.10 尚无修复版；007 仅内部固定选择器且有超时保护",
+      "expires_at": "2027-02-24",
+      "reopen_when_fixed": true
+    },
+    {
+      "ecosystem": "python",
+      "package": "soupsieve",
+      "vuln_id": "CVE-2026-126191",
+      "reason": "PyPI 最新版 2.10 尚无修复版；007 仅内部固定选择器且有超时保护",
+      "expires_at": "2027-02-24",
+      "reopen_when_fixed": true
+    },
+    {
+      "ecosystem": "python",
+      "package": "soupsieve",
+      "vuln_id": "CVE-2026-126193",
+      "reason": "PyPI 最新版 2.10 尚无修复版；007 仅内部固定选择器且有超时保护",
+      "expires_at": "2027-02-24",
+      "reopen_when_fixed": true
+    }
+  ]
+}

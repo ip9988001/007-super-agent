@@ -12,3 +12,10 @@
 .env
 *.key
 *.pem
+
+# Private-only dirs (never commit to public repo)
+credentials/
+secrets/
+memories/
+tools-seed/
+pilot-summaries/

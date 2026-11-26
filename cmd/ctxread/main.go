@@ -4,10 +4,11 @@
 // 不走这个命令行。
 //
 // 用法：
-//   ctxread <path>                     # 自动分档压缩读（默认）
-//   ctxread lines <start> <end> <path> # 读指定行号窗口（end<=0 表示读到末尾）
-//   ctxread mode <mode> <path>         # 强制分档：map / signatures / full / raw
-//   ctxread status                     # 探针：打印版本与 OK
+//
+//	ctxread <path>                     # 自动分档压缩读（默认）
+//	ctxread lines <start> <end> <path> # 读指定行号窗口（end<=0 表示读到末尾）
+//	ctxread mode <mode> <path>         # 强制分档：map / signatures / full / raw
+//	ctxread status                     # 探针：打印版本与 OK
 //
 // 输出：读到的内容 + 脚注（Compressed X → Y tokens (-Z%)）。
 // 失败：stderr 打印原因，退出码 1。

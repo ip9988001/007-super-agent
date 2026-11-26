@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -23,10 +24,11 @@ type recorder struct {
 	got []string
 }
 
-func (r *recorder) handle(e Envelope) {
+func (r *recorder) handle(e Envelope) Outcome {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.got = append(r.got, e.TaskID)
+	return Outcome{State: OutcomeDone}
 }
 
 func (r *recorder) list() []string {
@@ -388,18 +390,19 @@ func TestDualLane(t *testing.T) {
 	release := make(chan struct{})
 	var mu sync.Mutex
 	var order []string
-	handler := func(e Envelope) {
+	handler := func(e Envelope) Outcome {
 		if e.TaskID == "long" {
 			select {
 			case started <- struct{}{}:
 			default:
 			}
 			<-release // 长活一直堵着，直到测试放行
-			return
+			return Outcome{State: OutcomeDone}
 		}
 		mu.Lock()
 		order = append(order, e.TaskID)
 		mu.Unlock()
+		return Outcome{State: OutcomeDone}
 	}
 	gw := New(cfg, l, handler)
 	gw.Start()
@@ -455,15 +458,16 @@ func TestDualLaneMigration(t *testing.T) {
 	release := make(chan struct{})
 	var mu sync.Mutex
 	var done []string
-	handler := func(e Envelope) {
+	handler := func(e Envelope) Outcome {
 		if e.TaskID == "short3" {
 			mu.Lock()
 			done = append(done, e.TaskID)
 			mu.Unlock()
-			return
+			return Outcome{State: OutcomeDone}
 		}
 		started <- e.TaskID
 		<-release
+		return Outcome{State: OutcomeDone}
 	}
 	gw := New(cfg, l, handler)
 	gw.SetLaneMigration(200 * time.Millisecond) // 测试用小阈值
@@ -525,7 +529,7 @@ func TestSweepStale(t *testing.T) {
 	release := make(chan struct{})
 	var mu sync.Mutex
 	calls := 0
-	handler := func(e Envelope) {
+	handler := func(e Envelope) Outcome {
 		mu.Lock()
 		calls++
 		first := calls == 1
@@ -537,6 +541,7 @@ func TestSweepStale(t *testing.T) {
 			}
 			<-release // 第一次执行一直堵着，模拟超期未确认
 		}
+		return Outcome{State: OutcomeDone}
 	}
 	gw := New(cfg, l, handler)
 	gw.Start()
@@ -632,4 +637,349 @@ func backdateInboxRow(t *testing.T, dbPath string, id int64, d time.Duration) er
 	old := time.Now().UTC().Add(-d).Format(time.RFC3339)
 	_, err = db.Exec(`UPDATE inbox_queue SET updated_ts = ? WHERE id = ?`, old, id)
 	return err
+}
+
+// waitInboxStatus 等某任务的行进入指定状态之一（终态断言用，防竞态）。
+func waitInboxStatus(t *testing.T, l *ledger.Ledger, taskID string, want ...string) string {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		for _, s := range want {
+			rows, err := l.ListInboxByStatus(s)
+			if err != nil {
+				t.Fatalf("list %s: %v", s, err)
+			}
+			for _, r := range rows {
+				if r.TaskID == taskID {
+					return s
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timeout waiting for task %s in %v", taskID, want)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestFinishTerminalStates 是线 A 的四终态收口：handler 报告什么终态，
+// inbox 行就标什么；空终态（执行仍在继续）不标终态、行保持 RUNNING；
+// handler 崩溃一律 FAILED；未知终态一律按 FAILED 处理，绝不默认 DONE。
+func TestFinishTerminalStates(t *testing.T) {
+	cases := []struct {
+		name    string
+		outcome Outcome
+		panic   bool
+		want    string // "" 表示应保持 RUNNING
+	}{
+		{"done", Outcome{State: OutcomeDone}, false, ledger.InboxDone},
+		{"failed", Outcome{State: OutcomeFailed}, false, ledger.InboxFailed},
+		{"rejected", Outcome{State: OutcomeRejected}, false, ledger.InboxRejected},
+		{"still-running", Outcome{}, false, ""},
+		{"unknown", Outcome{State: "BOGUS"}, false, ledger.InboxFailed},
+		{"panic", Outcome{State: OutcomeDone}, true, ledger.InboxFailed},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			cfg := config.Defaults()
+			cfg.DataDir = dir
+			cfg.MergeWindow = time.Minute
+			cfg.ForcedWake = 3 * time.Minute
+			cfg.Debounce = 50 * time.Millisecond
+			cfg.MaxPending = 100
+			l, err := ledger.Open(filepath.Join(dir, "ledger.db"))
+			if err != nil {
+				t.Fatalf("ledger.Open: %v", err)
+			}
+			defer ledger.Close(l)
+			task := "term-" + c.name
+			handler := func(e Envelope) Outcome {
+				if c.panic {
+					panic("test panic")
+				}
+				return c.outcome
+			}
+			gw := New(cfg, l, handler)
+			gw.Start()
+			defer gw.Stop()
+			srv := httptest.NewServer(gw)
+			defer srv.Close()
+			if code, _ := postEnvelope(t, srv, task, "x"); code != 200 {
+				t.Fatalf("post: got %d", code)
+			}
+			if c.want == "" {
+				// 应保持 RUNNING：等 2 秒，确认没有终态行。
+				time.Sleep(2 * time.Second)
+				for _, s := range []string{ledger.InboxDone, ledger.InboxFailed, ledger.InboxRejected, ledger.InboxTimeout} {
+					rows, err := l.ListInboxByStatus(s)
+					if err != nil {
+						t.Fatalf("list %s: %v", s, err)
+					}
+					for _, r := range rows {
+						if r.TaskID == task {
+							t.Fatalf("未终结的任务不应标 %s", s)
+						}
+					}
+				}
+				rows, err := l.ListInboxByStatus(ledger.InboxRunning)
+				if err != nil || len(rows) != 1 || rows[0].TaskID != task {
+					t.Fatalf("未终结的任务应保持 RUNNING，得到 %+v, err=%v", rows, err)
+				}
+				// 行上应已写 deadline（取走时写）。
+				if rows[0].Deadline == "" {
+					t.Fatal("RUNNING 行应已写 deadline")
+				}
+				return
+			}
+			if got := waitInboxStatus(t, l, task, c.want); got != c.want {
+				t.Fatalf("终态 = %s, want %s", got, c.want)
+			}
+		})
+	}
+}
+
+// TestWatchdogSweep 是线 A 的外部看门狗：超期行置 TIMEOUT 并补发失败回信；
+// 产物已落袋的超期行标 DONE；未超期的行不动；无 deadline 的旧行按
+// updated_ts + 1800 秒兜底。
+func TestWatchdogSweep(t *testing.T) {
+	dir := t.TempDir()
+	l, err := ledger.Open(filepath.Join(dir, "ledger.db"))
+	if err != nil {
+		t.Fatalf("ledger.Open: %v", err)
+	}
+	defer ledger.Close(l)
+
+	// t-overdue：deadline 已过，无产物 → TIMEOUT + 补发回信。
+	idOverdue, _, err := l.EnqueueInbox(ledger.InboxRecord{SessionID: "s", TaskID: "t-overdue", Text: "x"})
+	if err != nil {
+		t.Fatalf("enqueue overdue: %v", err)
+	}
+	// t-overdue-done：deadline 已过，但产物新鲜 → DONE。
+	idDone, _, err := l.EnqueueInbox(ledger.InboxRecord{SessionID: "s", TaskID: "t-overdue-done", Text: "x"})
+	if err != nil {
+		t.Fatalf("enqueue done: %v", err)
+	}
+	// t-fresh：deadline 在未来 → 不动。
+	idFresh, _, err := l.EnqueueInbox(ledger.InboxRecord{SessionID: "s", TaskID: "t-fresh", Text: "x"})
+	if err != nil {
+		t.Fatalf("enqueue fresh: %v", err)
+	}
+	// t-legacy：无 deadline，updated_ts 拨到 3 小时前 → 兜底超期 → TIMEOUT。
+	idLegacy, _, err := l.EnqueueInbox(ledger.InboxRecord{SessionID: "s", TaskID: "t-legacy", Text: "x"})
+	if err != nil {
+		t.Fatalf("enqueue legacy: %v", err)
+	}
+	// t-blank：deadline 已过，reply.md 只有空白字符 → 不算产物 → TIMEOUT。
+	idBlank, _, err := l.EnqueueInbox(ledger.InboxRecord{SessionID: "s", TaskID: "t-blank", Text: "x"})
+	if err != nil {
+		t.Fatalf("enqueue blank: %v", err)
+	}
+	// t-tolerance：deadline 已过，产物 mtime 比入队时间早 1 秒
+	// （文件系统精度/时钟微调）→ 2 秒容差内仍算新鲜 → DONE。
+	idTolerance, _, err := l.EnqueueInbox(ledger.InboxRecord{SessionID: "s", TaskID: "t-tolerance", Text: "x"})
+	if err != nil {
+		t.Fatalf("enqueue tolerance: %v", err)
+	}
+	for _, id := range []int64{idOverdue, idDone, idFresh, idLegacy, idBlank, idTolerance} {
+		if err := l.MarkInboxRunning(id); err != nil {
+			t.Fatalf("mark RUNNING %d: %v", id, err)
+		}
+	}
+	if err := l.SetInboxDeadline(idOverdue, time.Now().Add(-time.Hour)); err != nil {
+		t.Fatalf("set deadline overdue: %v", err)
+	}
+	if err := l.SetInboxDeadline(idDone, time.Now().Add(-time.Hour)); err != nil {
+		t.Fatalf("set deadline done: %v", err)
+	}
+	if err := l.SetInboxDeadline(idFresh, time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("set deadline fresh: %v", err)
+	}
+	if err := l.SetInboxDeadline(idBlank, time.Now().Add(-time.Hour)); err != nil {
+		t.Fatalf("set deadline blank: %v", err)
+	}
+	if err := l.SetInboxDeadline(idTolerance, time.Now().Add(-time.Hour)); err != nil {
+		t.Fatalf("set deadline tolerance: %v", err)
+	}
+	if err := backdateInboxRow(t, filepath.Join(dir, "ledger.db"), idLegacy, 3*time.Hour); err != nil {
+		t.Fatalf("backdate legacy: %v", err)
+	}
+	// 给 t-overdue-done 写新鲜产物（入队之后写，mtime 不早于入队时间）。
+	artDir := filepath.Join(dir, "artifacts", "t-overdue-done")
+	if err := os.MkdirAll(artDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(artDir, "reply.md"), []byte("做完了"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// 给 t-blank 写只有空白字符的 reply.md（不算产物）。
+	blankDir := filepath.Join(dir, "artifacts", "t-blank")
+	if err := os.MkdirAll(blankDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(blankDir, "reply.md"), []byte("\n   \n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// 给 t-tolerance 写真实产物，再把 mtime 拨到入队时间前 1 秒。
+	tolDir := filepath.Join(dir, "artifacts", "t-tolerance")
+	if err := os.MkdirAll(tolDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tolDir, "reply.md"), []byte("做完了（容差）"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := l.ListInboxByStatus(ledger.InboxRunning)
+	if err != nil {
+		t.Fatalf("list running: %v", err)
+	}
+	var tolTS string
+	for _, r := range rows {
+		if r.TaskID == "t-tolerance" {
+			tolTS = r.TS
+		}
+	}
+	if tolTS == "" {
+		t.Fatal("找不到 t-tolerance 的入队时间")
+	}
+	enqueued, err := time.Parse(time.RFC3339, tolTS)
+	if err != nil {
+		t.Fatalf("parse ts: %v", err)
+	}
+	mtime := enqueued.Add(-time.Second)
+	if err := os.Chtimes(filepath.Join(tolDir, "reply.md"), mtime, mtime); err != nil {
+		t.Fatalf("chtimes tolerance: %v", err)
+	}
+
+	timedOut, recovered, err := WatchdogSweep(l, dir, time.Now())
+	if err != nil {
+		t.Fatalf("WatchdogSweep: %v", err)
+	}
+	if timedOut != 3 || recovered != 2 {
+		t.Fatalf("sweep = (%d timeout, %d recovered), want (3, 2)", timedOut, recovered)
+	}
+	if got := waitInboxStatus(t, l, "t-overdue", ledger.InboxTimeout); got != ledger.InboxTimeout {
+		t.Fatalf("t-overdue 应为 TIMEOUT")
+	}
+	if got := waitInboxStatus(t, l, "t-overdue-done", ledger.InboxDone); got != ledger.InboxDone {
+		t.Fatalf("t-overdue-done 应为 DONE")
+	}
+	if got := waitInboxStatus(t, l, "t-legacy", ledger.InboxTimeout); got != ledger.InboxTimeout {
+		t.Fatalf("t-legacy 应为 TIMEOUT")
+	}
+	if got := waitInboxStatus(t, l, "t-blank", ledger.InboxTimeout); got != ledger.InboxTimeout {
+		t.Fatalf("t-blank（空白产物）应为 TIMEOUT")
+	}
+	if got := waitInboxStatus(t, l, "t-tolerance", ledger.InboxDone); got != ledger.InboxDone {
+		t.Fatalf("t-tolerance（mtime 早 1 秒在容差内）应为 DONE")
+	}
+	rows, err = l.ListInboxByStatus(ledger.InboxRunning)
+	if err != nil || len(rows) != 1 || rows[0].TaskID != "t-fresh" {
+		t.Fatalf("t-fresh 应保持 RUNNING，得到 %+v, err=%v", rows, err)
+	}
+	// 超时回信已补发，内容含 TIMEOUT。
+	b, err := os.ReadFile(filepath.Join(dir, "artifacts", "t-overdue", "reply.md"))
+	if err != nil {
+		t.Fatalf("超时回信未写：%v", err)
+	}
+	if !strings.Contains(string(b), "TIMEOUT") {
+		t.Fatalf("超时回信应含 TIMEOUT，得到 %q", string(b))
+	}
+	// 空白产物已被超时回信替换，内容含 TIMEOUT。
+	b, err = os.ReadFile(filepath.Join(dir, "artifacts", "t-blank", "reply.md"))
+	if err != nil {
+		t.Fatalf("t-blank 超时回信未写：%v", err)
+	}
+	if !strings.Contains(string(b), "TIMEOUT") {
+		t.Fatalf("t-blank 超时回信应含 TIMEOUT，得到 %q", string(b))
+	}
+	// 容差内的产物没被覆盖。
+	b, err = os.ReadFile(filepath.Join(tolDir, "reply.md"))
+	if err != nil || string(b) != "做完了（容差）" {
+		t.Fatalf("容差内产物不应被覆盖，得到 %q, err=%v", string(b), err)
+	}
+	// 新鲜产物没被覆盖。
+	b, err = os.ReadFile(filepath.Join(artDir, "reply.md"))
+	if err != nil || string(b) != "做完了" {
+		t.Fatalf("新鲜产物不应被覆盖，得到 %q, err=%v", string(b), err)
+	}
+	// 账本里应有两行 watchdog_timeout 事件。
+	events, err := l.ListDispatchEvents("t-overdue")
+	if err != nil || len(events) != 1 || events[0].Kind != ledger.DispatchEventWatchdogTimeout {
+		t.Fatalf("t-overdue 超时事件 = %+v, err=%v", events, err)
+	}
+}
+
+// TestSweepStaleExhausted 是 P0 修复的重排上限：超期 RUNNING 行重排
+// 满 2 次后仍超期，第 3 次扫荡直接置 FAILED 并写失败回信，绝不无限重排。
+func TestSweepStaleExhausted(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.Defaults()
+	cfg.DataDir = dir
+	cfg.MergeWindow = time.Minute
+	cfg.ForcedWake = 3 * time.Minute
+	cfg.Debounce = 50 * time.Millisecond
+	cfg.MaxPending = 100
+	l, err := ledger.Open(filepath.Join(dir, "ledger.db"))
+	if err != nil {
+		t.Fatalf("ledger.Open: %v", err)
+	}
+	defer ledger.Close(l)
+	gw := New(cfg, l, func(e Envelope) Outcome { return Outcome{State: OutcomeDone} })
+	gw.SetDataDir(dir)
+
+	id, _, err := l.EnqueueInbox(ledger.InboxRecord{SessionID: "s", TaskID: "t-exhausted", Text: "x"})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	// 两次重排都走扫荡本身（重排事件由 sweepStale 的 recordRequeue 记账）：
+	// 回到 RUNNING 再拨早时间，扫荡应重排并把 retry_count +1。
+	for want := 1; want <= ledger.MaxInboxRequeues; want++ {
+		if err := l.MarkInboxRunning(id); err != nil {
+			t.Fatalf("mark RUNNING: %v", err)
+		}
+		if err := backdateInboxRow(t, filepath.Join(dir, "ledger.db"), id, 3*time.Hour); err != nil {
+			t.Fatalf("backdate: %v", err)
+		}
+		gw.sweepStale()
+		rows, err := l.ListInboxByStatus(ledger.InboxPending)
+		if err != nil || len(rows) != 1 || rows[0].RetryCount != want {
+			t.Fatalf("第 %d 次扫荡后应为 PENDING 且 retry_count=%d，得到 %+v, err=%v", want, want, rows, err)
+		}
+	}
+	// 第 3 次超期：回到 RUNNING 再拨早，扫荡应置 FAILED 而不是重排。
+	if err := l.MarkInboxRunning(id); err != nil {
+		t.Fatalf("mark RUNNING: %v", err)
+	}
+	if err := backdateInboxRow(t, filepath.Join(dir, "ledger.db"), id, 3*time.Hour); err != nil {
+		t.Fatalf("backdate: %v", err)
+	}
+	gw.sweepStale()
+	if got := waitInboxStatus(t, l, "t-exhausted", ledger.InboxFailed); got != ledger.InboxFailed {
+		t.Fatalf("重排耗尽应为 FAILED")
+	}
+	// 失败回信已写，内容含 FAILED。
+	b, err := os.ReadFile(filepath.Join(dir, "artifacts", "t-exhausted", "reply.md"))
+	if err != nil {
+		t.Fatalf("耗尽失败回信未写：%v", err)
+	}
+	if !strings.Contains(string(b), "FAILED") {
+		t.Fatalf("耗尽失败回信应含 FAILED，得到 %q", string(b))
+	}
+	// 记账：恰好 2 行重排 + 1 行耗尽，没有第 3 次重排。
+	rows, err := l.ListExecutions("t-exhausted", 10)
+	if err != nil {
+		t.Fatalf("ListExecutions: %v", err)
+	}
+	requeues, exhausted := 0, 0
+	for _, r := range rows {
+		if r.ToolID == "watchdog-requeue" {
+			requeues++
+		}
+		if r.ToolID == "watchdog-requeue-exhausted" {
+			exhausted++
+		}
+	}
+	if requeues != 2 || exhausted != 1 {
+		t.Fatalf("重排行 = %d（want 2），耗尽行 = %d（want 1），rows=%+v", requeues, exhausted, rows)
+	}
 }

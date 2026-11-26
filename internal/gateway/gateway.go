@@ -57,6 +57,10 @@ type Envelope struct {
 	Source string `json:"source"`        // 来源，如 muse-link
 	TS     string `json:"ts"`            // RFC3339 UTC
 	Seq    int64  `json:"seq,omitempty"` // 发信方给的入站序号；0 表示没给，不做去重
+	// SessionID 是会话号（P2-a，可空）：为空时默认等于 TaskID。
+	// 会话是跨任务的长期上下文载体（plan_state + 步历史按它落盘）；
+	// 进程级会话号（daemon.session）与它是两回事，别混。
+	SessionID string `json:"session_id,omitempty"`
 }
 
 // Receipt 是立即返回的回执（不等待执行结果）。
@@ -66,6 +70,32 @@ type Receipt struct {
 	TS       string `json:"ts"`
 	Merged   bool   `json:"merged,omitempty"`
 }
+
+// Outcome 是 handler 向网关报告的终态（线 A：四终态收口）。
+// State 为空表示“尚未终结”（执行仍在后台继续，前置等回执超时），
+// 网关不标终态，行保持 RUNNING，由看门狗 deadline 兜底。
+// 其余一切未知值一律按 FAILED 处理，绝不默认 DONE。
+type Outcome struct {
+	State  string // DONE / FAILED / REJECTED / ""（未终结）
+	Reason string // 人话原因（记日志）
+}
+
+// 终态取值（与 ledger inbox_queue 的终态同值）。
+const (
+	OutcomeDone     = ledger.InboxDone     // 真完成且有产物（handler 须先验收产物）
+	OutcomeFailed   = ledger.InboxFailed   // 执行失败
+	OutcomeRejected = ledger.InboxRejected // 前置校验拒绝（派单核心指令超限等）
+	OutcomeTimeout  = ledger.InboxTimeout  // 看门狗超时置位（只由看门狗写，handler 不返回）
+)
+
+// WatchdogDeadline 是 RUNNING 行的终结期限（线 A）：取走时写 deadline，
+// 超过仍未收到终态回执的，由网关外部看门狗置为 TIMEOUT。
+// 与水位重排阈值 staleThreshold 同值 1800 秒（前置等回执 960 秒 +
+// 执行 900 秒预算 + 余量），合法长任务跑不完这个数。
+const WatchdogDeadline = staleThreshold
+
+// HandlerFunc 是网关 worker 调的任务处理函数：返回终态 Outcome。
+type HandlerFunc func(Envelope) Outcome
 
 // Watermark 是队列三水位快照（seen/acked/最久未确认）。
 type Watermark struct {
@@ -89,7 +119,10 @@ type pendingItem struct {
 type Gateway struct {
 	cfg     *config.Config
 	led     *ledger.Ledger
-	handler func(Envelope)
+	handler HandlerFunc
+	// dataDir 是数据目录（artifacts/<taskID>/reply.md 落盘处），
+	// 供水位扫荡给重排耗尽的任务写失败回信；为空时只标 FAILED、不写回信。
+	dataDir string
 
 	mu      sync.Mutex
 	pending map[string]*pendingItem
@@ -113,7 +146,9 @@ type Gateway struct {
 
 // New 建网关。handler 由双车道 worker 并发调用，调用方须保证 handler
 // 自身并发安全（memory.Store、ledger、executor 均已串行化）。
-func New(cfg *config.Config, led *ledger.Ledger, handler func(Envelope)) *Gateway {
+// handler 返回终态 Outcome：DONE 须先验收产物；空 Outcome 表示执行
+// 仍在后台继续，网关不标终态（看门狗 deadline 兜底）。
+func New(cfg *config.Config, led *ledger.Ledger, handler HandlerFunc) *Gateway {
 	return &Gateway{
 		cfg: cfg, led: led, handler: handler,
 		pending:  map[string]*pendingItem{},
@@ -129,6 +164,14 @@ func (g *Gateway) SetSession(sessionID string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.sessionID = sessionID
+}
+
+// SetDataDir 设数据目录（main.go 在 Start 前调）：水位扫荡给重排耗尽的
+// 任务写失败回信用；测试里不设则只标 FAILED、不写回信。
+func (g *Gateway) SetDataDir(dir string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.dataDir = dir
 }
 
 // debounce 返回首封防抖时长（配置缺失时默认 3 秒）。
@@ -301,6 +344,8 @@ func (g *Gateway) pick() *pendingItem {
 }
 
 // take 把一条从待处理里摘出来（调用方须持有锁），并把它的 inbox 行标 RUNNING。
+// 标 RUNNING 的同时写 deadline（线 A：取走时刻 + WatchdogDeadline），
+// 超期未终结的由网关外部看门狗置为 TIMEOUT。
 func (g *Gateway) take(id string) *pendingItem {
 	it := g.pending[id]
 	delete(g.pending, id)
@@ -313,6 +358,8 @@ func (g *Gateway) take(id string) *pendingItem {
 	if it != nil && g.led != nil && it.rowID > 0 && !it.running {
 		if err := g.led.MarkInboxRunning(it.rowID); err != nil {
 			log.Printf("gateway take task=%s: 标 RUNNING 失败: %v", it.env.TaskID, err)
+		} else if err := g.led.SetInboxDeadline(it.rowID, time.Now().Add(WatchdogDeadline)); err != nil {
+			log.Printf("gateway take task=%s: 写 deadline 失败: %v", it.env.TaskID, err)
 		}
 		it.running = true
 	}
@@ -357,6 +404,7 @@ func (g *Gateway) processLane(it *pendingItem) {
 	defer g.inflight.Done()
 	done := make(chan struct{})
 	var panicked bool
+	var outcome Outcome
 	go func() {
 		defer close(done)
 		defer func() {
@@ -365,7 +413,7 @@ func (g *Gateway) processLane(it *pendingItem) {
 				log.Printf("gateway handler panic task=%s: %v", it.env.TaskID, r)
 			}
 		}()
-		g.handler(it.env)
+		outcome = g.handler(it.env)
 	}()
 	timer := time.NewTimer(g.laneMigrationOrDefault())
 	defer timer.Stop()
@@ -375,7 +423,7 @@ func (g *Gateway) processLane(it *pendingItem) {
 		// 一个槽位后永不释放，从第三条起 tryDispatch 永远走 putBack，
 		// 循环里反复取回又放回，队列彻底堵死（2026-11-17 实测）。
 		<-g.fastSem
-		g.finish(it, panicked)
+		g.finish(it, outcome, panicked)
 		return
 	case <-timer.C:
 		// 长任务：释放 Fast 槽位，转 Heavy 车道记账。
@@ -386,13 +434,17 @@ func (g *Gateway) processLane(it *pendingItem) {
 			<-g.heavySem
 		case <-done:
 		}
-		g.finish(it, panicked)
+		g.finish(it, outcome, panicked)
 		return
 	}
 }
 
-// finish 收尾：写回执文件 → 记 acked 与水位 → inbox 行标 DONE/FAILED。
-func (g *Gateway) finish(it *pendingItem, panicked bool) {
+// finish 收尾：写回执文件 → 记 acked 与水位 → inbox 行按 handler 报告的
+// 终态标 DONE/FAILED/REJECTED（线 A：四终态收口）。
+// 默认判定为 FAILED，只有 handler 明确报告 DONE（且已验收产物）才标 DONE；
+// handler 崩溃一律 FAILED；终态为空（执行仍在后台继续）时不标终态，
+// 行保持 RUNNING，由看门狗 deadline 兜底。
+func (g *Gateway) finish(it *pendingItem, outcome Outcome, panicked bool) {
 	now := time.Now().UTC()
 	rec := map[string]any{
 		"received": now.Format(time.RFC3339),
@@ -408,16 +460,33 @@ func (g *Gateway) finish(it *pendingItem, panicked bool) {
 	if b, err := json.Marshal(rec); err == nil {
 		_ = os.WriteFile(filepath.Join(dir, name), b, 0600)
 	}
-	g.mu.Lock()
-	g.acked++
-	g.mu.Unlock()
-	g.recordWatermark(false)
 	if g.led != nil && it.rowID > 0 {
 		var err error
-		if panicked {
+		terminal := true
+		switch {
+		case panicked:
 			err = g.led.MarkInboxFailed(it.rowID)
-		} else {
+		case outcome.State == OutcomeRejected:
+			err = g.led.MarkInboxRejected(it.rowID)
+		case outcome.State == OutcomeDone:
 			err = g.led.MarkInboxDone(it.rowID)
+		case outcome.State == OutcomeFailed:
+			err = g.led.MarkInboxFailed(it.rowID)
+		case outcome.State == "":
+			// 执行仍在后台继续，不标终态、不记 acked，
+			// 行保持 RUNNING，看门狗 deadline 到时再置位。
+			log.Printf("gateway finish task=%s: 执行仍在继续，不标终态（看门狗 deadline 兜底）", it.env.TaskID)
+			terminal = false
+		default:
+			// 未知终态一律按 FAILED 处理，绝不默认 DONE。
+			log.Printf("gateway finish task=%s: 未知终态 %q，按 FAILED 处理", it.env.TaskID, outcome.State)
+			err = g.led.MarkInboxFailed(it.rowID)
+		}
+		if terminal {
+			g.mu.Lock()
+			g.acked++
+			g.mu.Unlock()
+			g.recordWatermark(false)
 		}
 		if err != nil {
 			// “不是 RUNNING 行”是预期竞态：水位重排的副本已先确认，
@@ -425,10 +494,15 @@ func (g *Gateway) finish(it *pendingItem, panicked bool) {
 			if strings.Contains(err.Error(), "不是 RUNNING 行") {
 				log.Printf("gateway finish task=%s: inbox 行已由重排副本确认，忽略", it.env.TaskID)
 			} else {
-				log.Printf("gateway finish task=%s: 标 DONE/FAILED 失败: %v", it.env.TaskID, err)
+				log.Printf("gateway finish task=%s: 标终态失败: %v", it.env.TaskID, err)
 			}
 		}
+		return
 	}
+	g.mu.Lock()
+	g.acked++
+	g.mu.Unlock()
+	g.recordWatermark(false)
 }
 
 // enqueueReplay 把一行 inbox 行重新推进内存队列（启动重放 / 水位重排用）。
@@ -485,7 +559,10 @@ func (g *Gateway) ReplayInbox() (int, error) {
 }
 
 // sweepStale 每 60 秒扫荡水位（第 14 步 B-06）：
-// (a) 超 1800 秒未确认且 retry_count==0 的 RUNNING 行自动重排 1 次并记账；
+// (a) 超 1800 秒未确认且重排次数未用完（retry_count < MaxInboxRequeues，
+// 最多重排 2 次）的 RUNNING 行自动重排并记账；
+// (a2) 超 1800 秒未确认且重排次数已用完的行直接置 FAILED 并写失败回信，
+// 绝不让“重排 → 重写 deadline”无限死循环；
 // (b) 补捞内存里没有的 PENDING 行（崩溃重放的边角、合并丢行后的自愈）。
 func (g *Gateway) sweepStale() {
 	if g.led == nil {
@@ -504,6 +581,28 @@ func (g *Gateway) sweepStale() {
 			r.RetryCount++
 			g.enqueueReplay(r)
 			g.recordRequeue(r)
+		}
+	}
+	// 重排次数已用完仍超期的行：不再重排，直接 FAILED + 失败回信。
+	exhausted, err := g.led.ListExhaustedStaleInbox(staleThreshold)
+	if err != nil {
+		log.Printf("gateway sweep exhausted: %v", err)
+	} else {
+		for _, r := range exhausted {
+			if err := g.led.MarkInboxFailed(r.ID); err != nil {
+				log.Printf("gateway sweep task=%s: 耗尽置 FAILED 失败: %v", r.TaskID, err)
+				continue
+			}
+			g.mu.Lock()
+			dataDir := g.dataDir
+			g.mu.Unlock()
+			if dataDir != "" {
+				reason := fmt.Sprintf("任务多次重排仍未确认（已重排 %d 次，超 %d 次上限），网关已将其置为 FAILED；如需重试，请重新派单。", r.RetryCount, ledger.MaxInboxRequeues)
+				if werr := writeFailureReply(dataDir, r, reason); werr != nil {
+					log.Printf("gateway sweep task=%s: 耗尽失败回信写失败: %v", r.TaskID, werr)
+				}
+			}
+			g.recordExhausted(r)
 		}
 	}
 	pending, err := g.led.ListInboxByStatus(ledger.InboxPending)
@@ -533,11 +632,31 @@ func (g *Gateway) recordRequeue(r ledger.InboxRow) {
 		Command:   "requeue stale inbox",
 		ExitCode:  0,
 		Status:    "success",
-		ErrHead: fmt.Sprintf("task=%s seq=%d 1800 秒未确认，自动重排 1 次（retry_count 0→1）",
-			r.TaskID, r.Seq),
+		ErrHead: fmt.Sprintf("task=%s seq=%d 1800 秒未确认，自动重排（retry_count %d→%d，上限 %d 次）",
+			r.TaskID, r.Seq, r.RetryCount-1, r.RetryCount, ledger.MaxInboxRequeues),
 	})
 	if err != nil {
 		log.Printf("gateway requeue record task=%s: %v", r.TaskID, err)
+	}
+}
+
+// recordExhausted 把一次重排耗尽置 FAILED 写进 execution_ledger。
+func (g *Gateway) recordExhausted(r ledger.InboxRow) {
+	if g.led == nil {
+		return
+	}
+	_, err := g.led.RecordExecution(ledger.ExecutionRecord{
+		SessionID: g.sessionID,
+		TaskID:    r.TaskID,
+		ToolID:    "watchdog-requeue-exhausted",
+		Command:   "fail exhausted stale inbox",
+		ExitCode:  0,
+		Status:    "failed",
+		ErrHead: fmt.Sprintf("task=%s seq=%d 1800 秒未确认且已重排 %d 次（达 %d 次上限），直接置 FAILED 并写失败回信",
+			r.TaskID, r.Seq, r.RetryCount, ledger.MaxInboxRequeues),
+	})
+	if err != nil {
+		log.Printf("gateway exhausted record task=%s: %v", r.TaskID, err)
 	}
 }
 

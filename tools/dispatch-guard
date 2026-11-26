@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""dispatch-guard（007 独立版）：GitHub 批量采集防重守卫。
+
+E-20：触发 GitHub 批量采集前必跑；有在跑/排队或同版本同层指纹一律禁发，
+查表输出贴回执。007 本机独立实现，不跨机调三号的 dispatch-guard.sh。
+
+用法：
+  dispatch-guard check --repo OWNER/REPO --workflow collect-full.yml \
+      --layers "layer1,layer2" [--ref main]
+      # 检查后打印查表；退出码 0=放行（ALLOW），1=禁发（BLOCK），2=查不到（ERROR，按禁发处理）
+  dispatch-guard record --repo OWNER/REPO --workflow collect-full.yml \
+      --layers "layer1,layer2" [--ref main] --run-id 123456
+      # 派单成功后登记指纹（供下次 check 比对）；打印登记的指纹
+
+指纹 = sha256(工作流 + ref + 层列表）前 16 位。
+禁发条件（二者任一即禁发）：
+  1）该工作流有在跑（in_progress）或排队（queued）的 run；
+  2）同一指纹 24 小时内已登记过（同版本同层重复派单）。
+台账：/root/super-agent-007/data/dispatch-guard/fingerprints.jsonl（一行一条）。
+"""
+import argparse
+import hashlib
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+
+LEDGER_DIR = '/root/super-agent-007/data/dispatch-guard'
+LEDGER_FILE = os.path.join(LEDGER_DIR, 'fingerprints.jsonl')
+FINGERPRINT_WINDOW_HOURS = 24
+
+
+def fingerprint(workflow: str, ref: str, layers: str) -> str:
+    raw = f"{workflow}|{ref}|{layers}".encode('utf-8')
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def gh_runs(repo: str, workflow: str, status: str):
+    """列某工作流某状态的 run；返回 [(run_id, 状态， 分支， 创建时间）]。"""
+    cmd = ['gh', 'run', 'list', '--repo', repo, '--workflow', workflow,
+           '--status', status, '--limit', '10',
+           '--json', 'databaseId,status,headBranch,createdAt']
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    err = p.stderr.strip()
+    # gh 对不存在的工作流返回退出码 0，但 stderr 有 HTTP 404、stdout 为空；
+    # 必须按失败处理，否则工作流名写错也会被当成“无在跑”而放行。
+    if p.returncode != 0 or 'HTTP 404' in err or 'not found' in err.lower():
+        raise RuntimeError(f"gh run list 失败（{status}）: {err[:300]}")
+    rows = json.loads(p.stdout or '[]')
+    return [(str(r.get('databaseId')), r.get('status'), r.get('headBranch'),
+             r.get('createdAt')) for r in rows]
+
+
+def read_ledger():
+    if not os.path.exists(LEDGER_FILE):
+        return []
+    out = []
+    with open(LEDGER_FILE, encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                out.append(json.loads(line))
+    return out
+
+
+def cmd_check(args) -> int:
+    fp = fingerprint(args.workflow, args.ref, args.layers)
+    # 先查本地指纹台账（不依赖 gh），再查线上在跑/排队。
+    now = datetime.now(timezone.utc)
+    recent = []
+    for rec in read_ledger():
+        if rec.get('fingerprint') != fp:
+            continue
+        try:
+            t = datetime.fromisoformat(rec['dispatched_at'].replace('Z', '+00:00'))
+        except (KeyError, ValueError):
+            continue
+        if now - t < timedelta(hours=FINGERPRINT_WINDOW_HOURS):
+            recent.append(rec)
+    # 再查线上
+    gh_error = None
+    running, queued = [], []
+    try:
+        running = gh_runs(args.repo, args.workflow, 'in_progress')
+        queued = gh_runs(args.repo, args.workflow, 'queued')
+    except RuntimeError as e:
+        gh_error = str(e)
+    active = running + queued
+    verdict = 'ALLOW'
+    reasons = []
+    if active:
+        verdict = 'BLOCK'
+        reasons.append(f"有 {len(active)} 个 run 在跑/排队")
+    if recent:
+        verdict = 'BLOCK'
+        reasons.append(f"同指纹 {fp} 在 {FINGERPRINT_WINDOW_HOURS} 小时内已登记 {len(recent)} 次")
+    if gh_error is not None:
+        # 查不到线上状态，按禁发处理（fail-closed）。
+        verdict = 'BLOCK'
+        reasons.append(f"线上状态查不到（{gh_error}），先修好 gh 再派单")
+
+    print("dispatch-guard 查表")
+    print(f"  仓库：{args.repo}")
+    print(f"  工作流：{args.workflow}（分支 {args.ref}）")
+    print(f"  层列表：{args.layers}")
+    print(f"  指纹：{fp}")
+    print(f"  在跑：{len(running)} 个" + (f"（{', '.join(r[0] for r in running)}）" if running else ""))
+    print(f"  排队：{len(queued)} 个" + (f"（{', '.join(r[0] for r in queued)}）" if queued else ""))
+    print(f"  同指纹 24 小时内登记：{len(recent)} 次")
+    print(f"  结论：{verdict}" + (f"（{'; '.join(reasons)}）" if reasons else ""))
+    if gh_error is not None:
+        return 2
+    return 0 if verdict == 'ALLOW' else 1
+
+
+def cmd_record(args) -> int:
+    fp = fingerprint(args.workflow, args.ref, args.layers)
+    os.makedirs(LEDGER_DIR, exist_ok=True)
+    rec = {
+        'fingerprint': fp,
+        'repo': args.repo,
+        'workflow': args.workflow,
+        'ref': args.ref,
+        'layers': args.layers,
+        'run_id': args.run_id,
+        'dispatched_at': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+    }
+    with open(LEDGER_FILE, 'a', encoding='utf-8') as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + '\n')
+    print(f"已登记指纹 {fp}（run {args.run_id}）")
+    return 0
+
+
+def main(argv) -> int:
+    ap = argparse.ArgumentParser(prog='dispatch-guard',
+                                 description='007 GitHub 批量采集防重守卫')
+    sub = ap.add_subparsers(dest='cmd', required=True)
+    for name in ('check', 'record'):
+        sp = sub.add_parser(name)
+        sp.add_argument('--repo', required=True, help='OWNER/REPO')
+        sp.add_argument('--workflow', required=True, help='工作流文件名，如 collect-full.yml')
+        sp.add_argument('--layers', required=True, help='层列表，逗号分隔')
+        sp.add_argument('--ref', default='main', help='分支，默认 main')
+        if name == 'record':
+            sp.add_argument('--run-id', required=True, help='派单后返回的 run id')
+    args = ap.parse_args(argv[1:])
+    if args.cmd == 'check':
+        return cmd_check(args)
+    return cmd_record(args)
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))

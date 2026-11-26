@@ -22,7 +22,10 @@ func main() {
 	}
 	defer ledger.Close(l)
 	var done []string
-	gw := gateway.New(cfg, l, func(e gateway.Envelope) { done = append(done, e.TaskID) })
+	gw := gateway.New(cfg, l, func(e gateway.Envelope) gateway.Outcome {
+		done = append(done, e.TaskID)
+		return gateway.Outcome{State: gateway.OutcomeDone}
+	})
 	gw.Start()
 	s := httptest.NewServer(gw)
 	for _, task := range []string{"t1", "t1", "t2"} {

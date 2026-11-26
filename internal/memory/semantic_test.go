@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // stubEmbeder 按文本返回固定向量：含 "甲" 的返回 [1,0,0,0]，含 "乙" 返回 [0,1,0,0]，
@@ -115,6 +116,13 @@ func TestSemanticRebuildIncremental(t *testing.T) {
 	// 改一页：只重嵌这一页。
 	if err := os.WriteFile(filepath.Join(memRoot, "wiki", "concepts", "甲页.md"),
 		[]byte("# 甲页\nSummary: 甲的摘要改过了\n\n甲的新正文。\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// 显式拨 mtime：本机文件 mtime 约 4ms 一跳（实测），无间隔连续写
+	// 可能落在同一刻度里、改动被误判为未改；WAL + synchronous=NORMAL
+	// 后重建变快更容易撞上。测试只验证“改动被检出”，mtime 由测试保证。
+	mtime := time.Now().Add(10 * time.Second)
+	if err := os.Chtimes(filepath.Join(memRoot, "wiki", "concepts", "甲页.md"), mtime, mtime); err != nil {
 		t.Fatal(err)
 	}
 	n, err = s.Rebuild(memRoot)

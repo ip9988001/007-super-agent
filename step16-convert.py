@@ -210,7 +210,7 @@ def write_docs(manifest_lines):
 - `wiki/playbooks/`：5 个剧本，同格式；Recall 可召回，WriteWiki 不写此类。
 - `wiki/index.md`、`registry.md`、`log.md`、`lint-report.md` 与
   `wiki/_archive-index-pages/`：原样。
-- `reference/agent/`：1180 个执行经验（lessons/decisions/patterns/cases 等），原样。
+- `l3/`：1180 个执行经验（lessons/decisions/patterns/cases 等），原样。
 - `reference/protocols/`：108 个钢铁意志协议，原样。
 - `reference/governance/`、`goals/`、`user/`、`reflections/`、
   `reference/CONTINUITY_SNAPSHOT.md`：小件参考，原样。

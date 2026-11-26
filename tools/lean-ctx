@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""lean-ctx（007 独立版）：终端降噪/压缩读工具。
+
+实现注册表 L3/cap-ops-lean-ctx.md 文档的接口子集（够执行端用）：
+  lean-ctx read <file>        压缩式读文件（<=8KB 全文；>8KB 头+结构+尾）
+  lean-ctx -c "<cmd>"         跑命令 + 压缩输出
+  lean-ctx grep <pat> [file]  压缩式搜索（默认当前目录递归太慢，只搜指定文件或 .）
+  lean-ctx status             判活：打印版本与 OK
+  lean-ctx --help             用法
+
+不实现：serve 守护进程、gain、tools health、doctor（pi 专属/不需要）。
+来源：007 改革 2026-11-23 第 4 阶段（第 8 项）。pi-lean-ctx 是 pi 框架插件，
+007 是 Go 二进制不能直接装，按 lean-ctx 思路独立实现。
+"""
+import os
+import re
+import subprocess
+import sys
+
+VERSION = "007-standalone-1.0"
+SMALL_FILE_BYTES = 8 * 1024          # <=8KB 全文（与 E-12 R1 对齐）
+HEAD_LINES = 40                        # 大文件取头 40 行
+TAIL_LINES = 20                        # 大文件取尾 20 行
+MAX_GREP_MATCHES = 50
+MAX_OUTPUT_LINES = 200                 # -c 输出超过此行数才压缩
+
+
+def estimate_tokens(text: str) -> int:
+    """与 Go 端 registry.EstimateTokens 同口径：中文 0.6/字，非中文 0.25/字。"""
+    cjk = sum(1 for ch in text if '\u4e00' <= ch <= '\u9fff' or '\u3400' <= ch <= '\u4dbf')
+    return int(cjk * 0.6 + (len(text) - cjk) * 0.25)
+
+
+def is_text(path: str) -> bool:
+    try:
+        with open(path, 'rb') as f:
+            chunk = f.read(4096)
+        return b'\x00' not in chunk
+    except OSError:
+        return False
+
+
+def structure_lines(lines):
+    """抽结构：代码的函数/类定义、Markdown/文本的标题行。"""
+    pats = [
+        re.compile(r'^\s*(func|def|class|fn|func\s+\w+)\b.*'),
+        re.compile(r'^\s*(export\s+)?(function|const|let|var)\s+\w+'),
+        re.compile(r'^#{1,6}\s+.*'),
+        re.compile(r'^\s*//\s*[A-Z\u4e00-\u9fff].{0,60}$'),
+    ]
+    out = []
+    for i, ln in enumerate(lines, 1):
+        s = ln.rstrip('\n')
+        if len(s) > 120:
+            continue
+        for p in pats:
+            if p.match(s):
+                out.append(f"  L{i}: {s.strip()}")
+                break
+    return out[:60]
+
+
+def cmd_read(path: str) -> int:
+    if not os.path.exists(path):
+        print(f"lean-ctx: 文件不存在: {path}", file=sys.stderr)
+        return 1
+    if not os.path.isfile(path):
+        print(f"lean-ctx: 不是文件: {path}", file=sys.stderr)
+        return 1
+    if not is_text(path):
+        print(f"lean-ctx: 二进制文件不读: {path}", file=sys.stderr)
+        return 1
+    size = os.path.getsize(path)
+    with open(path, encoding='utf-8', errors='replace') as f:
+        text = f.read()
+    lines = text.splitlines()
+    print(f"# {path}  ({size} 字节，{len(lines)} 行）")
+    if size <= SMALL_FILE_BYTES:
+        print(text, end='' if text.endswith('\n') else '\n')
+        print(f"\n[lean-ctx: {size} 字节全文，约 {estimate_tokens(text)} tok]")
+        return 0
+    # 大文件：头 + 结构 + 尾
+    head = lines[:HEAD_LINES]
+    tail = lines[-TAIL_LINES:] if len(lines) > TAIL_LINES else []
+    omitted = len(lines) - len(head) - len(tail)
+    print("--- 头 %d 行 ---" % len(head))
+    print('\n'.join(head))
+    struct = structure_lines(lines)
+    if struct:
+        print("--- 结构（函数/类/标题）---")
+        print('\n'.join(struct))
+    print(f"--- … 中间省略 {omitted} 行 … ---")
+    if tail:
+        print("--- 尾 %d 行 ---" % len(tail))
+        print('\n'.join(tail))
+    shown = '\n'.join(head + tail)
+    print(f"\n[lean-ctx: {size} 字节 → 约 {estimate_tokens(shown)} tok（全文约 "
+          f"{estimate_tokens(text)} tok，省约 {100 * (1 - estimate_tokens(shown) / max(estimate_tokens(text), 1)):.0f}%）]")
+    return 0
+
+
+def compress_output(text: str, label: str) -> str:
+    """压缩一段命令输出：小输出原样；大输出头+尾+计数。"""
+    lines = text.splitlines()
+    if len(lines) <= MAX_OUTPUT_LINES:
+        return text
+    head = lines[:30]
+    tail = lines[-10:]
+    omitted = len(lines) - len(head) - len(tail)
+    body = '\n'.join(head) + f"\n… 中间省略 {omitted} 行 …\n" + '\n'.join(tail)
+    return (body + f"\n[lean-ctx: {label} 共 {len(lines)} 行 → 约 "
+            f"{estimate_tokens(body)} tok（全文约 {estimate_tokens(text)} tok）]")
+
+
+def cmd_run(cmd: str) -> int:
+    try:
+        p = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                           timeout=120, errors='replace')
+    except subprocess.TimeoutExpired:
+        print("lean-ctx: 命令超时（120 秒）", file=sys.stderr)
+        return 124
+    out = p.stdout
+    err = p.stderr
+    if out:
+        print(compress_output(out, "stdout"), end='' if out.endswith('\n') else '\n')
+    if err:
+        sys.stderr.write(compress_output(err, "stderr"))
+    print(f"[lean-ctx: 退出码 {p.returncode}]")
+    return 0
+
+
+def cmd_grep(pat: str, files) -> int:
+    args = ['grep', '-n', '--', pat]
+    if files:
+        args += files
+    else:
+        args.append('.')
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=60,
+                           errors='replace')
+    except subprocess.TimeoutExpired:
+        print("lean-ctx: grep 超时（60 秒）", file=sys.stderr)
+        return 124
+    out = p.stdout
+    lines = out.splitlines()
+    if len(lines) > MAX_GREP_MATCHES:
+        print('\n'.join(lines[:MAX_GREP_MATCHES]))
+        print(f"[lean-ctx: 共 {len(lines)} 处匹配，只列前 {MAX_GREP_MATCHES} 处]")
+    else:
+        print(out, end='' if out.endswith('\n') else '\n')
+        print(f"[lean-ctx: {len(lines)} 处匹配]")
+    return 0
+
+
+def main(argv) -> int:
+    if len(argv) < 2 or argv[1] in ('--help', '-h', 'help'):
+        print(__doc__)
+        return 0
+    if argv[1] == 'status':
+        print(f"lean-ctx {VERSION} OK")
+        return 0
+    if argv[1] == 'read' and len(argv) >= 3:
+        return cmd_read(argv[2])
+    if argv[1] == '-c' and len(argv) >= 3:
+        return cmd_run(argv[2])
+    if argv[1] == 'grep' and len(argv) >= 3:
+        return cmd_grep(argv[2], argv[3:])
+    print("lean-ctx: 用法不对，见 lean-ctx --help", file=sys.stderr)
+    return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))

@@ -409,3 +409,142 @@ func TestReviewSelfEvolve(t *testing.T) {
 		t.Error("ReviewSelfEvolve empty signals: want error, got nil")
 	}
 }
+
+// TestCallTaskFullRoleRecordsRole（规划 v2）：按指定角色记账——
+// CallTaskFullRole 的费用行带 role；原客户端的 Role 不变（浅拷贝，
+// 并发任务各用各的拷贝，不串角色）。
+func TestCallTaskFullRoleRecordsRole(t *testing.T) {
+	srv := stubServer(t, http.StatusOK, chatOKBody("hello", 1000, 500, 200))
+	defer srv.Close()
+	db := t.TempDir() + "/ledger.db"
+	led, err := ledger.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ledger.Close(led)
+	c := New("deepseek-flash", "test-key")
+	c.BaseURL = srv.URL
+	c.Ledger = led
+	c.SessionID = "s1"
+	c.TaskID = "t1"
+	if c.Role != "" {
+		t.Fatalf("新建客户端 Role 应为空，得到 %q", c.Role)
+	}
+	if _, _, _, _, err := c.CallTaskFullRole("t1", "frozen", "tail", nil, nil, ledger.ExpenseRoleFrontJudge); err != nil {
+		t.Fatalf("CallTaskFullRole: %v", err)
+	}
+	// 原客户端的 Role 不变（withRole 是浅拷贝）。
+	if c.Role != "" {
+		t.Fatalf("CallTaskFullRole 后原客户端 Role 应仍为空，得到 %q", c.Role)
+	}
+	rows, err := led.ListExpenseByTask("t1", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("费用行应为 1 行，得到 %d", len(rows))
+	}
+	if rows[0].Role != ledger.ExpenseRoleFrontJudge {
+		t.Fatalf("费用行 role=%q, want %q", rows[0].Role, ledger.ExpenseRoleFrontJudge)
+	}
+	// 再调一次 front_plan：两行各带各的 role，互不串。
+	if _, _, _, _, err := c.CallTaskFullRole("t1", "frozen", "tail", nil, nil, ledger.ExpenseRoleFrontPlan); err != nil {
+		t.Fatalf("CallTaskFullRole front_plan: %v", err)
+	}
+	if cost, err := led.TaskCostByRoles("t1", ledger.ExpenseRoleFrontJudge); err != nil || cost != rows[0].CostCNYMilli {
+		t.Fatalf("front_judge 费用=%d, want %d, err=%v", cost, rows[0].CostCNYMilli, err)
+	}
+	if cost, err := led.TaskCostByRoles("t1", ledger.ExpenseRoleFrontPlan, ledger.ExpenseRoleFrontJudge); err != nil || cost != 2*rows[0].CostCNYMilli {
+		t.Fatalf("front_plan+front_judge 费用=%d, want %d, err=%v", cost, 2*rows[0].CostCNYMilli, err)
+	}
+}
+
+// TestMessageEmptyContentSerialized：空正文消息序列化一定带 "content":""。
+// 对齐二号三号回归（cf-register-gonglue-010）：判卷自查时模型回一条
+// 只有工具调用、没有正文的 assistant 消息，Content="" 被 omitempty 省掉，
+// DeepSeek 整单报 422（messages[N] missing field `content`），
+// 前置连着 3 次判不了、烧光 ¥0.05 预算。Content 永不省略。
+func TestMessageEmptyContentSerialized(t *testing.T) {
+	// assistant 消息：只有工具调用，正文为空。
+	m := Message{Role: "assistant", ToolCalls: []ToolCall{{ID: "call-1", Type: "function"}}}
+	m.ToolCalls[0].Function.Name = "read"
+	m.ToolCalls[0].Function.Arguments = "{}"
+	b, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"content":""`) {
+		t.Fatalf("空正文消息应带 \"content\":\"\"，实际 %s", string(b))
+	}
+	// 整单请求体里也一样：user + assistant（空正文带工具调用）+ tool。
+	req := chatRequest{Model: "deepseek-flash", Messages: []Message{
+		{Role: "user", Content: "判这步"},
+		m,
+		{Role: "tool", Content: "文件内容", ToolCallID: "call-1"},
+	}}
+	rb, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(rb), `"content":""`) {
+		t.Fatalf("请求体里空正文消息应带 \"content\":\"\"，实际 %s", string(rb))
+	}
+	// 反序列化回来的空正文仍是 ""（不丢字段）。
+	var back chatRequest
+	if err := json.Unmarshal(rb, &back); err != nil {
+		t.Fatal(err)
+	}
+	if back.Messages[1].Content != "" || len(back.Messages[1].ToolCalls) != 1 {
+		t.Fatalf("反序列化后 assistant 消息不对：%+v", back.Messages[1])
+	}
+}
+
+// TestToolMessageEmptyContent（M-4 回归）：tool 角色消息内容为空时
+// 保底填 "(empty output)"，不发空 content（部分网关会拒收）。
+func TestToolMessageEmptyContent(t *testing.T) {
+	m := ToolMessage("call-1", "")
+	if m.Role != "tool" || m.ToolCallID != "call-1" || m.Content != "(empty output)" {
+		t.Fatalf("空内容应保底填 (empty output)，得到 %+v", m)
+	}
+	m2 := ToolMessage("call-2", "  ")
+	if m2.Content != "(empty output)" {
+		t.Fatalf("空白内容应保底填 (empty output)，得到 %+v", m2)
+	}
+	m3 := ToolMessage("call-3", "文件内容")
+	if m3.Content != "文件内容" {
+		t.Fatalf("非空内容应原样保留，得到 %+v", m3)
+	}
+	// 保底后的消息序列化一定带 content 字段。
+	b, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"content":"(empty output)"`) {
+		t.Fatalf("序列化应带 content，实际 %s", string(b))
+	}
+}
+
+// TestChatEmptyArgumentsNormalized（M-4 回归）：模型回的 tool_call
+// 若 Arguments 为空串 ""（不是 "{}"），统一保底填 "{}"，
+// 否则 DeepSeek 报 422，调用方解析也报错。
+func TestChatEmptyArgumentsNormalized(t *testing.T) {
+	body := `{"choices":[{"message":{"content":"","tool_calls":[{"id":"call-1","type":"function","function":{"name":"read","arguments":""}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`
+	srv := stubServer(t, http.StatusOK, body)
+	defer srv.Close()
+	c := New("deepseek-flash", "test-key")
+	c.BaseURL = srv.URL
+	c.TaskID = "t1"
+	m, fr, _, err := c.chatWithTaskMetaTools(t.Context(), []Message{{Role: "user", Content: "判这步"}}, "t1", nil)
+	if err != nil {
+		t.Fatalf("chatWithTaskMetaTools: %v", err)
+	}
+	if fr != "tool_calls" {
+		t.Fatalf("finish_reason = %q, want tool_calls", fr)
+	}
+	if len(m.ToolCalls) != 1 {
+		t.Fatalf("应有 1 次工具调用，得到 %+v", m.ToolCalls)
+	}
+	if m.ToolCalls[0].Function.Arguments != "{}" {
+		t.Fatalf("空 Arguments 应保底填 {}，得到 %q", m.ToolCalls[0].Function.Arguments)
+	}
+}

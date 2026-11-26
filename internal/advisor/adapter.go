@@ -57,6 +57,12 @@ func New(dbPath string, cfg AdvisorConfig, workDir string) (*Advisor, error) {
 	if err != nil {
 		return nil, fmt.Errorf("advisor open ledger: %w", err)
 	}
+	// 只读连接：journal_mode/synchronous 是写侧设置，对 mode=ro 无意义；
+	// busy_timeout 照样设，读遇到写锁时等 5 秒而不是立刻报 database is locked。
+	if _, err := db.Exec(`PRAGMA busy_timeout=5000`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("advisor pragma busy_timeout: %w", err)
+	}
 	if err := db.Ping(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("advisor ping ledger: %w", err)
@@ -171,9 +177,23 @@ func (a *Advisor) Check(evidence executor.Evidence, trigger executor.Trigger) (e
 		res.Note = fmt.Sprintf("监工回了无法识别的 verdict %q，按 CONCERN 处理；原因：%s", dec.Verdict, dec.Reason)
 		return res, nil
 	}
+	// HALT 却没给原因与改法：打回意见是空的，干活模型没法针对性改，
+	// 只会盲目重跑烧钱；按 CONCERN 处理并写明，信号进账本与最终汇报
+	// 的风险栏，不悄悄放行也不空转重跑。
+	// （2026-11-24 线 B 验收 s5-s2：模型两次 HALT 均 reason 为空，
+	// 导致两轮盲目重跑才交活。）
+	if dec.Verdict == "HALT" && strings.TrimSpace(dec.Reason) == "" && strings.TrimSpace(dec.FixDirective) == "" {
+		res.Verdict = executor.VerdictConcern
+		res.Note = "监工回了 HALT 但未给原因与改法，按 CONCERN 处理；请在最终汇报的已知风险栏写明此次监工叫停无原因"
+		return res, nil
+	}
 	res.Note = dec.Reason
 	if dec.FixDirective != "" {
-		res.Note = dec.Reason + " | 改法：" + dec.FixDirective
+		if strings.TrimSpace(res.Note) == "" {
+			res.Note = "改法：" + dec.FixDirective
+		} else {
+			res.Note = dec.Reason + " | 改法：" + dec.FixDirective
+		}
 	}
 	if dec.Verdict == "HALT" {
 		a.mu.Lock()
@@ -200,6 +220,9 @@ func (a *Advisor) recordAdvisorExpense(taskID string, u llm.Usage) {
 	cost := llm.CostMilliForModel(a.cfg.Model, u.CacheHitTokens, u.CacheMissTokens, u.CompletionTokens, false)
 	_, err := a.Ledger.RecordExpense(ledger.ExpenseRecord{
 		SessionID: sessionID, TaskID: taskID, Model: a.cfg.Model,
+		// H-3：监工调用按 advisor 角色记账——以前 Role 为空，
+		// 全任务总费用算不全（prod-real-002 里 6 次无标签调用占 ¥0.107）。
+		Role:         ledger.ExpenseRoleAdvisor,
 		PromptTokens: u.PromptTokens, CacheHitTokens: u.CacheHitTokens,
 		CacheMissTokens: u.CacheMissTokens, CompletionTokens: u.CompletionTokens,
 		CostCNYMilli: cost,

@@ -272,3 +272,16 @@ func TestReviewShardHaltDoesNotRecordStage(t *testing.T) {
 		t.Fatalf("LastStage = %d, err = %v, want 0 (no stage recorded)", n, err)
 	}
 }
+
+// TestExecutorNoAdvisorByDefault（监工下线回归）：Executor 不接 Advisor
+// 时 Advisor 为 nil，ReviewDelivery 返回 ErrNoAdvisor——
+// 监工已彻底去掉，任何路径都不再调它、不再为它花一分钱。
+func TestExecutorNoAdvisorByDefault(t *testing.T) {
+	ex := &Executor{}
+	if ex.Advisor != nil {
+		t.Fatal("新建 Executor 的 Advisor 应为 nil（不接监工）")
+	}
+	if _, err := ex.ReviewDelivery(Task{TaskID: "t-noadv", SessionID: "s", ToolID: "agent", Text: "x", Draft: "y"}); !errors.Is(err, ErrNoAdvisor) {
+		t.Fatalf("无监工时 ReviewDelivery 应返回 ErrNoAdvisor，实际 err=%v", err)
+	}
+}

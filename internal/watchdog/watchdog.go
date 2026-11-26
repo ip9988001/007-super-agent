@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"007-super-agent/internal/ledger"
@@ -57,6 +58,9 @@ type Watchdog struct {
 	// 精炼循环；失败只记日志。重建只嵌新增/改动过的文档，日常只有
 	// 几篇，几秒完成。
 	semanticHook func(ctx context.Context) error
+	// patrolMu 是增量巡检与全量巡检共用的进程内互斥锁（线 B 修复轮）：
+	// 全量巡检持有锁时，增量巡检 TryLock 失败直接跳过，不排队。
+	patrolMu sync.Mutex
 }
 
 // SetBackupHook 接入精炼成功后的记忆备份钩子（第 15 步）。
@@ -242,6 +246,11 @@ func (w *Watchdog) DailySavingsFor(date string) (Savings, error) {
 		return sv, fmt.Errorf("watchdog: open ledger.db: %w", err)
 	}
 	defer db.Close()
+	// 只读连接：journal_mode/synchronous 是写侧设置，对 mode=ro 无意义；
+	// busy_timeout 照样设，读遇到写锁时等 5 秒而不是立刻报 database is locked。
+	if _, err := db.Exec(`PRAGMA busy_timeout=5000`); err != nil {
+		return sv, fmt.Errorf("watchdog: pragma busy_timeout: %w", err)
+	}
 	sv.Date = date
 	day := `date(ts) = '` + date + `'`
 	if err := db.QueryRow(`SELECT COUNT(*),

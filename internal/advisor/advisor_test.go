@@ -302,3 +302,102 @@ func TestDeliveryBundleCarriesWorkDirListing(t *testing.T) {
 		t.Errorf("delivery ArtifactFingerprint %q must mark missing workdir", ev2.ArtifactFingerprint)
 	}
 }
+
+// TestEnsureJSONWord: json_object 模式要求消息里出现 "json" 这个词
+// （DeepSeek API 侧校验，缺了直接 400）；2026-11-24 验收发现定稿
+// 提示词文件里没有这个词，监工每次调用都失败。
+func TestEnsureJSONWord(t *testing.T) {
+	if got := ensureJSONWord("你是监工。", `{"task_and_criteria":"x"}`); !strings.Contains(strings.ToLower(got), "json") {
+		t.Fatalf("无 json 词时应补一句，得到 %q", got)
+	}
+	in := "只输出合法 JSON：{}"
+	if got := ensureJSONWord(in, "{}"); got != in {
+		t.Fatalf("已有 JSON 词时不应动，得到 %q", got)
+	}
+	if got := ensureJSONWord("你是监工。", `{"note":"json"}`); got != "你是监工。" {
+		t.Fatalf("user 里有 json 词时不应动，得到 %q", got)
+	}
+}
+
+// TestRunAdvisorCheckSendsJSONWord: 即使配置的 SysPrompt 里没有
+// "json"，发出的请求也必须含这个词（否则真实 DeepSeek API 会拒绝
+// json_object 模式），且 response_format 保持不变。
+func TestRunAdvisorCheckSendsJSONWord(t *testing.T) {
+	var gotSys, gotFmt string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			Messages []struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"messages"`
+			ResponseFormat map[string]string `json:"response_format"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("解请求失败: %v", err)
+		}
+		for _, m := range payload.Messages {
+			if m.Role == "system" {
+				gotSys = m.Content
+			}
+		}
+		gotFmt = payload.ResponseFormat["type"]
+		fmt.Fprintf(w, `{"choices":[{"message":{"content":%q}}],"usage":{"prompt_tokens":10,"prompt_cache_hit_tokens":0,"prompt_cache_miss_tokens":10,"completion_tokens":5}}`, `{"verdict":"NOTE","reason":"ok","fix_directive":""}`)
+	}))
+	defer srv.Close()
+	cfg := AdvisorConfig{Endpoint: srv.URL, APIKey: "x", Model: "deepseek-flash", Timeout: 10 * time.Second, SysPrompt: "你是监工，只核查逻辑真伪。"}
+	dec, err := RunAdvisorCheck(context.Background(), cfg, EvidenceBundle{TaskAndCriteria: "做一件事", ProposedOutput: "已做完"}, 0, "")
+	if err != nil {
+		t.Fatalf("RunAdvisorCheck: %v", err)
+	}
+	if dec.Verdict != "NOTE" {
+		t.Fatalf("预期 NOTE，得到 %q", dec.Verdict)
+	}
+	if !strings.Contains(strings.ToLower(gotSys), "json") {
+		t.Fatalf("system 消息缺 json 词：%q", gotSys)
+	}
+	if gotFmt != "json_object" {
+		t.Fatalf("response_format 应保持 json_object，得到 %q", gotFmt)
+	}
+}
+
+// TestAdapterHaltWithoutReasonDowngradesToConcern：监工回 HALT 但
+// reason 与 fix_directive 均为空时，不能拿空意见打回重跑（模型只能
+// 盲目重跑烧钱），应降级为 CONCERN 并写明原因，信号进账本。
+// （2026-11-24 线 B 验收 s5-s2：两次空原因 HALT 导致两轮盲目重跑。）
+func TestAdapterHaltWithoutReasonDowngradesToConcern(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"choices":[{"message":{"content":%q}}],"usage":{"prompt_tokens":100,"prompt_cache_hit_tokens":0,"prompt_cache_miss_tokens":100,"completion_tokens":10}}`,
+			`{"verdict":"HALT","reason":"","fix_directive":""}`)
+	}))
+	defer srv.Close()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "ledger.db")
+	led, err := ledger.Open(dbPath)
+	if err != nil {
+		t.Fatalf("ledger open: %v", err)
+	}
+	defer ledger.Close(led)
+	adv, err := New(dbPath, AdvisorConfig{Endpoint: srv.URL, APIKey: "test-key", Model: "stub", Timeout: 10 * time.Second}, dir)
+	if err != nil {
+		t.Fatalf("advisor new: %v", err)
+	}
+	defer adv.Close()
+	task := executor.Task{TaskID: "t-noreason", Text: "修 bug", Draft: "已修"}
+	ev, err := adv.CollectEvidenceBundle(task, executor.TriggerDelivery)
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	res, err := adv.Check(ev, executor.TriggerDelivery)
+	if err != nil {
+		t.Fatalf("check: %v", err)
+	}
+	if res.Verdict != executor.VerdictConcern {
+		t.Fatalf("空原因 HALT 应降级为 CONCERN，got verdict=%s note=%q", res.Verdict, res.Note)
+	}
+	if !strings.Contains(res.Note, "未给原因") {
+		t.Fatalf("note 应写明未给原因，got %q", res.Note)
+	}
+	if res.RetryCount != 0 {
+		t.Fatalf("降级后不应计 HALT 次数，got retry=%d", res.RetryCount)
+	}
+}

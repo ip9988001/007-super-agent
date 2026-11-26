@@ -98,9 +98,68 @@ func CostMilli(hit, miss, out int64, peak bool) int64 {
 }
 
 // Message 是一条聊天消息（OpenAI 兼容格式）。
+// P1：原生工具调用——assistant 消息可带 ToolCalls；tool 角色的消息
+// 用 ToolCallID 指回它回答的那次调用，Content 是工具返回的结果。
+// 对齐二号三号（2026-11-25）：Content 永远带上（空正文发 ""），
+// 绝不用 omitempty——DeepSeek 要求每条消息都有 content 字段，
+// 空正文被省掉会整单报 422（cf-register-gonglue-010 连着 3 次）。
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role       string     `json:"role"`
+	Content    string     `json:"content"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
+	Name       string     `json:"name,omitempty"`
+}
+
+// ToolMessage 组装一条 tool 角色的结果消息：内容为空时保底填
+// "(empty output)"（M-4：只读 bash 执行成功但无任何输出时，如 grep
+// 无匹配、ls 空目录，Content 为 ""；部分 OpenAI 兼容网关/代理会
+// 拒收空 content 或导致模型行为异常，保底填一句占位）。
+func ToolMessage(toolCallID, content string) Message {
+	if strings.TrimSpace(content) == "" {
+		content = "(empty output)"
+	}
+	return Message{Role: "tool", ToolCallID: toolCallID, Content: content}
+}
+
+// ToolCall 是一次原生工具调用（模型返回的）：ID 供 tool 消息指回，
+// Function.Name 是工具编号，Function.Arguments 是 JSON 字符串。
+type ToolCall struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
+// ToolDefinition 是声明给模型的一个工具（发给 API 的 tools 参数）：
+// 每个工具一个 function，参数统一只留 inputs 字符串数组（与现有
+// BuildArgv 的 argv 模型一致，模型不用学每把工具的私有参数表）。
+type ToolDefinition struct {
+	Type     string `json:"type"`
+	Function struct {
+		Name        string          `json:"name"`
+		Description string          `json:"description,omitempty"`
+		Parameters  json.RawMessage `json:"parameters,omitempty"`
+	} `json:"function"`
+}
+
+// InputsSchema 是 registry 工具与内置记忆工具的统一参数表：
+// 只有一个 inputs 数组（argv 的一个元素一个字符串），与 BuildArgv 一致。
+var InputsSchema = json.RawMessage(`{"type":"object","properties":{"inputs":{"type":"array","items":{"type":"string"}}},"required":["inputs"]}`)
+
+// ExpandSchema 是 expand 导航工具的参数表：category 必填，subcategory 可空。
+var ExpandSchema = json.RawMessage(`{"type":"object","properties":{"category":{"type":"string"},"subcategory":{"type":"string"}},"required":["category"]}`)
+
+// NewToolDefinition 按名字 + 说明 + 参数表造一个工具声明。
+func NewToolDefinition(name, description string, parameters json.RawMessage) ToolDefinition {
+	var t ToolDefinition
+	t.Type = "function"
+	t.Function.Name = name
+	t.Function.Description = description
+	t.Function.Parameters = parameters
+	return t
 }
 
 // Zones 是缓存分区输入：A 冻结前缀放最前且内容固定；A2 换页摘要；
@@ -139,6 +198,9 @@ type Usage struct {
 }
 
 // Client 是 DeepSeek 客户端。
+// Role 是本次调用的记账角色（规划 v2）：front_plan / front_judge /
+// executor；空串表示未分角色。Client 是值字段为主的结构（无互斥锁），
+// withRole 浅拷贝后改 Role 再调用是安全的（并发任务各用各的拷贝）。
 type Client struct {
 	Model       string
 	BaseURL     string
@@ -146,6 +208,7 @@ type Client struct {
 	Timeout     time.Duration
 	Peak        bool    // 高峰价 2 倍，默认 false（非高峰价）
 	Temperature float64 // 默认 0.2，分诊要确定性
+	Role        string  // 记账角色（规划 v2 分角色记账）
 	Ledger      *ledger.Ledger
 	SessionID   string
 	TaskID      string
@@ -219,16 +282,26 @@ func parseEnvFile(path string) (map[string]string, error) {
 }
 
 type chatRequest struct {
-	Model       string    `json:"model"`
-	Messages    []Message `json:"messages"`
-	Temperature float64   `json:"temperature"`
+	Model       string           `json:"model"`
+	Messages    []Message        `json:"messages"`
+	Temperature float64          `json:"temperature"`
+	Tools       []ToolDefinition `json:"tools,omitempty"`
 }
 
 type chatResponse struct {
 	Choices []struct {
 		Message struct {
-			Content string `json:"content"`
+			Content   string     `json:"content"`
+			ToolCalls []ToolCall `json:"tool_calls"`
 		} `json:"message"`
+		// FinishReason 是模型停下的原因（stop / length / tool_calls /
+		// content_filter）。length 表示输出被截断：本轮内容不可信，
+		// 必须整轮作废、不得执行其中的工具调用、不得当答案收下。
+		// 注意：DeepSeek 有时不带 finish_reason（实测 7 回合里有 1 回合
+		// 缺失，Python 流式脚本测的；Go 生产代码走非流式 POST），缺失按
+		// “未知”处理，不当成 stop；但截断时 length 会返回
+		// （max_tokens=1 实测），截断拦截不受影响。
+		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 	Usage struct {
 		PromptTokens     int64 `json:"prompt_tokens"`
@@ -253,21 +326,41 @@ func (c *Client) ChatTask(ctx context.Context, msgs []Message, taskID string) (s
 	return c.chatWithTask(ctx, msgs, taskID)
 }
 
-// chatWithTask 是 Chat 的真实实现。
+// chatWithTask 是 Chat 的真实实现（不返回 finish_reason 的兼容入口）。
 func (c *Client) chatWithTask(ctx context.Context, msgs []Message, taskID string) (string, Usage, error) {
+	reply, _, u, err := c.chatWithTaskMeta(ctx, msgs, taskID)
+	return reply, u, err
+}
+
+// chatWithTaskMeta 与 chatWithTask 相同，但额外返回 finish_reason：
+// length 表示输出被截断，调用方必须整轮作废，不得执行、不得当答案收下。
+// finish_reason 缺失时按“未知”处理（不触发截断拦截；调用方按有无
+// tool_calls 决定是执行还是交活，不当成 stop 的保证）。
+func (c *Client) chatWithTaskMeta(ctx context.Context, msgs []Message, taskID string) (string, string, Usage, error) {
+	m, fr, u, err := c.chatWithTaskMetaTools(ctx, msgs, taskID, nil)
+	if err != nil {
+		return "", "", Usage{}, err
+	}
+	return m.Content, fr, u, nil
+}
+
+// chatWithTaskMetaTools 是带原生工具声明的调用：tools 非空时发给 API
+// 的 tools 参数，模型回 tool_calls；返回整条 assistant 消息（正文 +
+// tool_calls）与 finish_reason。tools 为空时与 chatWithTaskMeta 等价。
+func (c *Client) chatWithTaskMetaTools(ctx context.Context, msgs []Message, taskID string, tools []ToolDefinition) (Message, string, Usage, error) {
 	if strings.TrimSpace(c.APIKey) == "" {
-		return "", Usage{}, errors.New("llm: 未配置 DEEPSEEK_API_KEY")
+		return Message{}, "", Usage{}, errors.New("llm: 未配置 DEEPSEEK_API_KEY")
 	}
 	if len(msgs) == 0 {
-		return "", Usage{}, errors.New("llm: 消息为空")
+		return Message{}, "", Usage{}, errors.New("llm: 消息为空")
 	}
 	base := strings.TrimRight(c.BaseURL, "/")
 	if base == "" {
 		base = DefaultBaseURL
 	}
-	body, err := json.Marshal(chatRequest{Model: c.Model, Messages: msgs, Temperature: c.Temperature})
+	body, err := json.Marshal(chatRequest{Model: c.Model, Messages: msgs, Temperature: c.Temperature, Tools: tools})
 	if err != nil {
-		return "", Usage{}, fmt.Errorf("llm: 组请求失败: %w", err)
+		return Message{}, "", Usage{}, fmt.Errorf("llm: 组请求失败: %w", err)
 	}
 	timeout := c.Timeout
 	if timeout <= 0 {
@@ -277,7 +370,7 @@ func (c *Client) chatWithTask(ctx context.Context, msgs []Message, taskID string
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/v1/chat/completions", bytes.NewReader(body))
 	if err != nil {
-		return "", Usage{}, fmt.Errorf("llm: 建请求失败: %w", err)
+		return Message{}, "", Usage{}, fmt.Errorf("llm: 建请求失败: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+c.APIKey)
@@ -287,22 +380,22 @@ func (c *Client) chatWithTask(ctx context.Context, msgs []Message, taskID string
 	}
 	resp, err := hc.Do(req)
 	if err != nil {
-		return "", Usage{}, fmt.Errorf("llm: 调用失败: %w", err)
+		return Message{}, "", Usage{}, fmt.Errorf("llm: 调用失败: %w", err)
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
-		return "", Usage{}, fmt.Errorf("llm: 读响应失败: %w", err)
+		return Message{}, "", Usage{}, fmt.Errorf("llm: 读响应失败: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", Usage{}, fmt.Errorf("llm: API 返回 %d: %s", resp.StatusCode, truncateRunes(string(raw), 600))
+		return Message{}, "", Usage{}, fmt.Errorf("llm: API 返回 %d: %s", resp.StatusCode, truncateRunes(string(raw), 600))
 	}
 	var cr chatResponse
 	if err := json.Unmarshal(raw, &cr); err != nil {
-		return "", Usage{}, fmt.Errorf("llm: 响应解析失败: %w", err)
+		return Message{}, "", Usage{}, fmt.Errorf("llm: 响应解析失败: %w", err)
 	}
 	if len(cr.Choices) == 0 {
-		return "", Usage{}, errors.New("llm: 响应无 choices")
+		return Message{}, "", Usage{}, errors.New("llm: 响应无 choices")
 	}
 	u := Usage{
 		PromptTokens:     cr.Usage.PromptTokens,
@@ -311,18 +404,31 @@ func (c *Client) chatWithTask(ctx context.Context, msgs []Message, taskID string
 		CompletionTokens: cr.Usage.CompletionTokens,
 	}
 	c.recordExpense(u, taskID)
-	return cr.Choices[0].Message.Content, u, nil
+	m := Message{
+		Role:      "assistant",
+		Content:   cr.Choices[0].Message.Content,
+		ToolCalls: cr.Choices[0].Message.ToolCalls,
+	}
+	// M-4：模型回的 tool_call 若 Arguments 为空串 ""（不是 "{}"），
+	// DeepSeek 也会报 422；这里统一保底填 "{}"，调用方解析不再报错。
+	for i := range m.ToolCalls {
+		if strings.TrimSpace(m.ToolCalls[i].Function.Arguments) == "" {
+			m.ToolCalls[i].Function.Arguments = "{}"
+		}
+	}
+	return m, cr.Choices[0].FinishReason, u, nil
 }
 
 // recordExpense 把一次调用的费用记进 expense_ledger（按 taskID 归属）。
 // 失败只记日志，不阻塞、不吞回复（账本坏了不该让一次好回答作废）。
+// Role 随行记账（规划 v2 分角色记账；空串表示未分角色）。
 func (c *Client) recordExpense(u Usage, taskID string) {
 	if c.Ledger == nil {
 		return
 	}
 	cost := CostMilliForModel(c.Model, u.CacheHitTokens, u.CacheMissTokens, u.CompletionTokens, c.Peak)
 	_, err := c.Ledger.RecordExpense(ledger.ExpenseRecord{
-		SessionID: c.SessionID, TaskID: taskID, Model: c.Model,
+		SessionID: c.SessionID, TaskID: taskID, Model: c.Model, Role: c.Role,
 		PromptTokens: u.PromptTokens, CacheHitTokens: u.CacheHitTokens,
 		CacheMissTokens: u.CacheMissTokens, CompletionTokens: u.CompletionTokens,
 		CostCNYMilli: cost,
@@ -330,6 +436,47 @@ func (c *Client) recordExpense(u Usage, taskID string) {
 	if err != nil {
 		log.Printf("llm: record expense failed: %v", err)
 	}
+}
+
+// withRole 返回一个 Role 被改成指定值的浅拷贝客户端（规划 v2）：
+// Client 无互斥锁，浅拷贝安全；原客户端的 Role 不变，并发任务各用
+// 各的拷贝，不会互相串角色。费用行按拷贝的 Role 记账。
+func (c *Client) withRole(role string) *Client {
+	cp := *c
+	cp.Role = role
+	return &cp
+}
+
+// CallTaskRole 与 CallTask 相同，但本次调用按指定角色记账（规划 v2）。
+func (c *Client) CallTaskRole(taskID, frozen, tail, role string) (string, int64, int64, error) {
+	return c.withRole(role).CallTask(taskID, frozen, tail)
+}
+
+// CallTaskWithMetaRole 与 CallTaskWithMeta 相同，但按指定角色记账。
+func (c *Client) CallTaskWithMetaRole(taskID, frozen, tail, role string) (string, string, int64, int64, error) {
+	return c.withRole(role).CallTaskWithMeta(taskID, frozen, tail)
+}
+
+// CallTaskFullRole 与 CallTaskFull 相同，但按指定角色记账（规划 v2）。
+func (c *Client) CallTaskFullRole(taskID, frozen, tail string, tools []ToolDefinition, history []Message, role string) (Message, string, int64, int64, error) {
+	return c.withRole(role).CallTaskFull(taskID, frozen, tail, tools, history)
+}
+
+// CallTaskContext 与 CallTask 相同，但调用方透传 ctx（超时由调用方定）。
+// Gemini 审阅 M-5：翻新摘要的 420s 超时要真正生效，不能走
+// context.Background() + 客户端默认超时。
+func (c *Client) CallTaskContext(ctx context.Context, taskID, frozen, tail string) (string, int64, int64, error) {
+	msgs := BuildMessages(Zones{Frozen: frozen, Tail: tail})
+	reply, u, err := c.chatWithTask(ctx, msgs, taskID)
+	if err != nil {
+		return "", 0, 0, err
+	}
+	return reply, u.PromptTokens, u.CompletionTokens, nil
+}
+
+// CallTaskContextRole 与 CallTaskContext 相同，但本次调用按指定角色记账。
+func (c *Client) CallTaskContextRole(ctx context.Context, taskID, frozen, tail, role string) (string, int64, int64, error) {
+	return c.withRole(role).CallTaskContext(ctx, taskID, frozen, tail)
 }
 
 // CallTask 是通用的带任务归属的模型调用：frozen（冻结提示词 + 清单）
@@ -343,6 +490,31 @@ func (c *Client) CallTask(taskID, frozen, tail string) (string, int64, int64, er
 		return "", 0, 0, err
 	}
 	return reply, u.PromptTokens, u.CompletionTokens, nil
+}
+
+// CallTaskWithMeta 与 CallTask 相同，但额外返回 finish_reason（P0-1：
+// 执行会话用它拦截截断。length 时调用方必须整轮作废）。
+func (c *Client) CallTaskWithMeta(taskID, frozen, tail string) (string, string, int64, int64, error) {
+	msgs := BuildMessages(Zones{Frozen: frozen, Tail: tail})
+	reply, fr, u, err := c.chatWithTaskMeta(context.Background(), msgs, taskID)
+	if err != nil {
+		return "", "", 0, 0, err
+	}
+	return reply, fr, u.PromptTokens, u.CompletionTokens, nil
+}
+
+// CallTaskFull 是 P1 的原生工具调用：frozen 放 system（A 区），history
+// 是结构化对话历史（assistant 的 tool_calls + tool 的结果，原样追加，
+// 不得改写），tail 放最后一条 user 消息（C 区）；tools 声明给模型。
+// 返回整条 assistant 消息（正文 + tool_calls）、finish_reason 与用量。
+// 模型不调工具只回正文时，ToolCalls 为空，正文就是它要停下交的答案。
+func (c *Client) CallTaskFull(taskID, frozen, tail string, tools []ToolDefinition, history []Message) (Message, string, int64, int64, error) {
+	msgs := BuildMessages(Zones{Frozen: frozen, History: history, Tail: tail})
+	m, fr, u, err := c.chatWithTaskMetaTools(context.Background(), msgs, taskID, tools)
+	if err != nil {
+		return Message{}, "", 0, 0, err
+	}
+	return m, fr, u.PromptTokens, u.CompletionTokens, nil
 }
 
 // TriageCall 是给 triage.Triage 注入的 ModelCallFunc：

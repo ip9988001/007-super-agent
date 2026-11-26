@@ -25,9 +25,9 @@ import (
 const (
 	SemanticDefaultURL   = "http://127.0.0.1:11434"
 	SemanticDefaultModel = "qwen3-embedding:0.6b"
-	SemanticTopK         = 5     // 语义一路最多回 5 条，再与词法合并取前 3
-	SemanticMinSim       = 0.30  // 余弦相似度低于此值不回
-	SemanticScoreScale   = 100   // 相似度转整数分：Score = int(sim*100)，0–100。语义是更准的
+	SemanticTopK         = 5    // 语义一路最多回 5 条，再与词法合并取前 3
+	SemanticMinSim       = 0.30 // 余弦相似度低于此值不回
+	SemanticScoreScale   = 100  // 相似度转整数分：Score = int(sim*100)，0–100。语义是更准的
 	// 相关性信号，故意让它能压过词法命中次数（常见 10–40）：换说法
 	// 的查询（如“绕过机器人验证”）词法会错配高频词（机器人→企业微信
 	// 机器人），语义才能把真正相关的 camoufox 那条顶上来。两路同源
@@ -75,6 +75,21 @@ func OpenSemantic(dbPath, ollamaURL, model string) (*Service, error) {
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("semantic open db: %w", err)
+	}
+	// 单连接串行写 + WAL + synchronous=NORMAL + busy_timeout=5000：
+	// 与简介主库、账本同一口径，防与巡检/前台写库撞上 SQLITE_BUSY。
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec(`PRAGMA journal_mode=WAL`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("semantic pragma WAL: %w", err)
+	}
+	if _, err := db.Exec(`PRAGMA synchronous=NORMAL`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("semantic pragma synchronous: %w", err)
+	}
+	if _, err := db.Exec(`PRAGMA busy_timeout=5000`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("semantic pragma busy_timeout: %w", err)
 	}
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS semantic_docs (
 		source TEXT PRIMARY KEY, text TEXT NOT NULL, mtime INTEGER NOT NULL, vec BLOB NOT NULL
@@ -153,6 +168,22 @@ func (s *Service) load() error {
 	s.dim = dim
 	s.mu.Unlock()
 	return nil
+}
+
+// OllamaEmbedFunc 返回一个直调 Ollama /api/embed 的 EmbedFunc
+// （线 B 第二阶段第 3 棒：两阶段召回的问句向量化用，不经过
+// Service 的向量库；Ollama 不通时调用方降级，不报错）。
+// url/model 为空时取默认值（本地 127.0.0.1:11434，
+// qwen3-embedding:0.6b）。
+func OllamaEmbedFunc(url, model string) EmbedFunc {
+	if url == "" {
+		url = SemanticDefaultURL
+	}
+	if model == "" {
+		model = SemanticDefaultModel
+	}
+	s := &Service{url: strings.TrimSuffix(url, "/"), model: model}
+	return s.ollamaEmbed
 }
 
 // ollamaEmbed 调 Ollama /api/embed（支持批量），返回与输入等长的向量。

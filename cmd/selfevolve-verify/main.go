@@ -87,6 +87,10 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	// 校验工具直连账本写种子：busy_timeout=5000，与账本写入口同一口径。
+	if _, err := db.Exec(`PRAGMA busy_timeout=5000`); err != nil {
+		log.Fatal(err)
+	}
 	loc := beijingNow().Location()
 	nowBJ := beijingNow()
 	prior := []int64{300, 300, 50, 50, 50, 50, 50}

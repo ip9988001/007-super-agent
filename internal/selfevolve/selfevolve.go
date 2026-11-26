@@ -3,6 +3,7 @@ package selfevolve
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -15,6 +16,7 @@ import (
 
 	"007-super-agent/internal/forge"
 	"007-super-agent/internal/ledger"
+	"007-super-agent/internal/memlock"
 	"007-super-agent/internal/memory"
 	"007-super-agent/internal/registry"
 )
@@ -35,6 +37,9 @@ const (
 	RebuildWeekday = time.Sunday
 	// CheckInterval：常驻循环的轮询间隔（照抄 RefineLoop/BackupLoop）。
 	CheckInterval = 60 * time.Second
+	// SelfEvolveLongDuration 是自查/锻造/重建耗时告警线（20 分钟）：
+	// 与 04:00 精炼只隔 30 分钟，超 20 分钟记一条告警。
+	SelfEvolveLongDuration = 20 * time.Minute
 	// SummaryModel：当日汇总费用行的 model 字段标记——汇总行的
 	// token 与费用与调用行重复，汇总时必须排除该标记（见
 	// ledger.SummarizeExpenseByTask），否则当日费用会 double count。
@@ -139,35 +144,64 @@ func (l *Loop) Run(ctx context.Context) {
 
 // maybeRun 是 Run 的一次窗口检查（抽出来供测试直接调，
 // 用构造的时间测窗口逻辑，不用等真实时钟）。
+// 自查/锻造/重建任一窗口到了，先抢记忆写锁（与 04:00 精炼共用，
+// 见 internal/memlock）：抢不到说明精炼正在写，本次跳过、标记不写，
+// 下个 60 秒 tick 再试；影子模式不写记忆，不抢锁。耗时超 20 分钟
+// 记一条告警（与精炼只隔 30 分钟）。
 func (l *Loop) maybeRun(now time.Time) {
 	date := now.Format("2006-01-02")
-	if marker := readMarker(reviewMarkerFile(l.dataDir)); shouldReview(now, marker) {
-		if l.shadow {
+	reviewDue := shouldReview(now, readMarker(reviewMarkerFile(l.dataDir)))
+	forgeDue := shouldReview(now, readMarker(forgeMarkerFile(l.dataDir)))
+	rebuildDue := shouldRebuild(now, readMarker(rebuildMarkerFile(l.dataDir)))
+	if !reviewDue && !forgeDue && !rebuildDue {
+		return
+	}
+	if l.shadow {
+		if reviewDue {
 			l.logShadowOnce("review", date)
-		} else if _, err := l.ReviewDaily(context.Background(), date); err != nil {
+		}
+		if forgeDue {
+			l.logShadowOnce("forge", date)
+		}
+		if rebuildDue {
+			l.logShadowOnce("rebuild", date)
+		}
+		return
+	}
+	start := time.Now()
+	lk, err := memlock.TryLock(l.dataDir)
+	if err != nil {
+		if errors.Is(err, memlock.ErrLocked) {
+			log.Printf("self-evolve loop: 记忆写锁被占用（精炼正在写），本次自查/锻造/重建跳过，下个 60 秒再试")
+		} else {
+			log.Printf("self-evolve loop: 取记忆写锁失败: %v（本次跳过）", err)
+		}
+		return
+	}
+	defer lk.Unlock()
+	if reviewDue {
+		if _, err := l.ReviewDaily(context.Background(), date); err != nil {
 			log.Printf("self-evolve loop: 自查失败: %v", err)
 		} else if err := writeMarker(reviewMarkerFile(l.dataDir), date); err != nil {
 			log.Printf("self-evolve loop: 写自查标记失败: %v（下个 60 秒会重跑一次）", err)
 		}
 	}
-	if marker := readMarker(forgeMarkerFile(l.dataDir)); shouldReview(now, marker) {
-		if l.shadow {
-			l.logShadowOnce("forge", date)
-		} else if err := l.runForge(now, date); err != nil {
+	if forgeDue {
+		if err := l.runForge(now, date); err != nil {
 			log.Printf("self-evolve loop: 锻造处理失败: %v", err)
 		} else if err := writeMarker(forgeMarkerFile(l.dataDir), date); err != nil {
 			log.Printf("self-evolve loop: 写锻造标记失败: %v（下个 60 秒会重跑一次）", err)
 		}
 	}
-
-	if marker := readMarker(rebuildMarkerFile(l.dataDir)); shouldRebuild(now, marker) {
-		if l.shadow {
-			l.logShadowOnce("rebuild", date)
-		} else if _, err := l.RebuildWeekly(context.Background(), date); err != nil {
+	if rebuildDue {
+		if _, err := l.RebuildWeekly(context.Background(), date); err != nil {
 			log.Printf("self-evolve loop: 重建失败: %v", err)
 		} else if err := writeMarker(rebuildMarkerFile(l.dataDir), date); err != nil {
 			log.Printf("self-evolve loop: 写重建标记失败: %v（下个 60 秒会重跑一次）", err)
 		}
+	}
+	if dur := time.Since(start); dur > SelfEvolveLongDuration {
+		log.Printf("self-evolve loop: 本次自查/锻造/重建耗时 %s，超 %s 告警", dur, SelfEvolveLongDuration)
 	}
 }
 

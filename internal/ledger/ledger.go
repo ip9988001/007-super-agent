@@ -20,6 +20,8 @@ import (
 	"sync"
 	"time"
 
+	"007-super-agent/internal/sanitize"
+
 	_ "modernc.org/sqlite"
 )
 
@@ -43,9 +45,37 @@ func Open(path string) (*Ledger, error) {
 		db.Close()
 		return nil, fmt.Errorf("ledger pragma WAL: %w", err)
 	}
+	if _, err := db.Exec(`PRAGMA synchronous=NORMAL`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("ledger pragma synchronous: %w", err)
+	}
 	if _, err := db.Exec(`PRAGMA busy_timeout=5000`); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("ledger pragma busy_timeout: %w", err)
+	}
+	// 迁移（线 A）：旧库的 inbox_queue 没有 deadline 列，而 schema.sql 里
+	// 的 idx_inbox_deadline 索引引用该列——必须在建表之前先补列，
+	// 否则旧库执行建表语句会在建索引时报 no such column: deadline。
+	// 表不存在（新库）时跳过，建表语句自带该列。
+	{
+		var hasTable int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'inbox_queue'`).Scan(&hasTable); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("ledger migrate check inbox table: %w", err)
+		}
+		if hasTable > 0 {
+			var n int
+			if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('inbox_queue') WHERE name = 'deadline'`).Scan(&n); err != nil {
+				db.Close()
+				return nil, fmt.Errorf("ledger migrate check inbox deadline: %w", err)
+			}
+			if n == 0 {
+				if _, err := db.Exec(`ALTER TABLE inbox_queue ADD COLUMN deadline TEXT NOT NULL DEFAULT ''`); err != nil {
+					db.Close()
+					return nil, fmt.Errorf("ledger migrate add inbox deadline: %w", err)
+				}
+			}
+		}
 	}
 	if _, err := db.Exec(schemaSQL); err != nil {
 		db.Close()
@@ -67,6 +97,49 @@ func Open(path string) (*Ledger, error) {
 			if _, err := db.Exec(`ALTER TABLE execution_ledger ADD COLUMN ` + col.name + ` ` + col.typ); err != nil {
 				db.Close()
 				return nil, fmt.Errorf("ledger migrate add %s: %w", col.name, err)
+			}
+		}
+	}
+	// 迁移（线 A P0 修复）：dispatch_events.tokens 改名 dispatch_est_tokens。
+	// 旧库已有 tokens 列时改名（数据保留）；新库建表已用新列名，跳过。
+	// 先查表在不在（新库空表启动时表还不存在，跳过不报错）。
+	{
+		var hasTable int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'dispatch_events'`).Scan(&hasTable); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("ledger migrate check dispatch_events table: %w", err)
+		}
+		if hasTable > 0 {
+			var hasOld, hasNew int
+			if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('dispatch_events') WHERE name = 'tokens'`).Scan(&hasOld); err != nil {
+				db.Close()
+				return nil, fmt.Errorf("ledger migrate check dispatch_events tokens: %w", err)
+			}
+			if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('dispatch_events') WHERE name = 'dispatch_est_tokens'`).Scan(&hasNew); err != nil {
+				db.Close()
+				return nil, fmt.Errorf("ledger migrate check dispatch_events dispatch_est_tokens: %w", err)
+			}
+			if hasOld > 0 && hasNew == 0 {
+				if _, err := db.Exec(`ALTER TABLE dispatch_events RENAME COLUMN tokens TO dispatch_est_tokens`); err != nil {
+					db.Close()
+					return nil, fmt.Errorf("ledger migrate rename dispatch_events tokens: %w", err)
+				}
+			}
+		}
+	}
+	// 迁移（规划 v2）：expense_ledger 加 role 列（分角色记账：front_plan /
+	// front_judge / executor；空串表示旧行或未分角色的调用，如分诊/监工）。
+	// 放在 schemaSQL 之后，表一定存在。
+	{
+		var n int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('expense_ledger') WHERE name = 'role'`).Scan(&n); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("ledger migrate check expense role: %w", err)
+		}
+		if n == 0 {
+			if _, err := db.Exec(`ALTER TABLE expense_ledger ADD COLUMN role TEXT NOT NULL DEFAULT ''`); err != nil {
+				db.Close()
+				return nil, fmt.Errorf("ledger migrate add expense role: %w", err)
 			}
 		}
 	}
@@ -192,6 +265,21 @@ type Execution struct {
 	AdvisorNote       string
 	StageNo           int
 	ArtifactPath      string
+}
+
+// MaxExecutionID 取 execution_ledger 当前最大 id（无行时为 0）。
+// H-2：computeFactList 按“本次 runAgent 执行窗口”统计调用数——
+// 调用方在 runAgent 开始前记下 MaxExecutionID，只统计 id 大于它的行，
+// 不把之前步骤的账本行算进当前步（多步共用同一 taskID 时，第 2 步
+// 0 调用也不能继承第 1 步的账本）。
+func (l *Ledger) MaxExecutionID() (int64, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	var n int64
+	if err := l.db.QueryRow(`SELECT COALESCE(MAX(id), 0) FROM execution_ledger`).Scan(&n); err != nil {
+		return 0, fmt.Errorf("ledger max execution id: %w", err)
+	}
+	return n, nil
 }
 
 // ListExecutions 按任务查执行回执（最新在前，最多 limit 行）。
@@ -344,10 +432,13 @@ func (l *Ledger) RecordWatermark(r WatermarkRecord) (int64, error) {
 }
 
 // ExpenseRecord 是一次模型调用的费用行。CostCNYMilli 单位是 0.001 元。
+// Role 是调用角色（规划 v2）：front_plan（前置规划）/ front_judge
+// （前置判回执）/ executor（执行层）；空串表示旧行或未分角色的调用。
 type ExpenseRecord struct {
 	SessionID        string
 	TaskID           string
 	Model            string
+	Role             string
 	PromptTokens     int64
 	CacheHitTokens   int64
 	CacheMissTokens  int64
@@ -355,16 +446,32 @@ type ExpenseRecord struct {
 	CostCNYMilli     int64
 }
 
+// Role 常量（规划 v2 分角色记账）：前置规划 / 前置判回执 / 执行层。
+// ExpenseRoleRollover 是翻新摘要的独立角色（Gemini 审阅 M-5）：
+// 摘要费用不计入规划 ¥0.05 熔断（planCost 只算 front_plan +
+// front_judge），但仍记入总账本。
+// ExpenseRoleAdvisor / ExpenseRoleFrontSummary（H-3）：监工审交付与
+// 最终汇报各有专属标签，不再留空 role——空 role 的调用绕过费用监控，
+// 全任务总费用算不全。
+const (
+	ExpenseRoleFrontPlan    = "front_plan"
+	ExpenseRoleFrontJudge   = "front_judge"
+	ExpenseRoleExecutor     = "executor"
+	ExpenseRoleRollover     = "rollover"
+	ExpenseRoleAdvisor      = "advisor"
+	ExpenseRoleFrontSummary = "front_summary"
+)
+
 // RecordExpense 写一行费用账。失败返回错误。
 func (l *Ledger) RecordExpense(r ExpenseRecord) (int64, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	res, err := l.db.Exec(`INSERT INTO expense_ledger
-		(ts, session_id, task_id, model, prompt_tokens, cache_hit_tokens,
+		(ts, session_id, task_id, model, role, prompt_tokens, cache_hit_tokens,
 		 cache_miss_tokens, completion_tokens, cost_cny_milli)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		time.Now().UTC().Format(time.RFC3339), r.SessionID, r.TaskID, r.Model,
-		r.PromptTokens, r.CacheHitTokens, r.CacheMissTokens,
+		r.Role, r.PromptTokens, r.CacheHitTokens, r.CacheMissTokens,
 		r.CompletionTokens, r.CostCNYMilli)
 	if err != nil {
 		return 0, fmt.Errorf("ledger insert expense_ledger: %w", err)
@@ -413,15 +520,47 @@ func (l *Ledger) TaskExpense(taskID string) (calls, costCNYMilli int64, err erro
 	return calls, costCNYMilli, nil
 }
 
+// TaskCostByRoles 按角色汇总某任务的费用（规划 v2 硬熔断用）：
+// 只加指定角色的 cost_cny_milli 之和（单位 0.001 元）。
+// 无记录时返回 0，不报错。只读，不写库。
+func (l *Ledger) TaskCostByRoles(taskID string, roles ...string) (int64, error) {
+	if len(roles) == 0 {
+		return 0, nil
+	}
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	placeholders := make([]string, len(roles))
+	args := make([]any, 0, len(roles)+1)
+	args = append(args, taskID)
+	for i, r := range roles {
+		placeholders[i] = "?"
+		args = append(args, r)
+	}
+	q := `SELECT COALESCE(SUM(cost_cny_milli),0) FROM expense_ledger
+		WHERE task_id = ? AND role IN (` + strings.Join(placeholders, ",") + `)`
+	var cost int64
+	if err := l.db.QueryRow(q, args...).Scan(&cost); err != nil {
+		return 0, fmt.Errorf("ledger task cost by roles: %w", err)
+	}
+	return cost, nil
+}
+
 // ---- inbox_queue：网关持久化入队队列（第 14 步 B-02）----
 
 // InboxStatus 是 inbox_queue 一行的状态。
 const (
-	InboxPending = "PENDING" // 待处理
-	InboxRunning = "RUNNING" // 已取走未确认
-	InboxDone    = "DONE"    // 已确认
-	InboxFailed  = "FAILED"  // 已失败
+	InboxPending  = "PENDING"  // 待处理
+	InboxRunning  = "RUNNING"  // 已取走未确认
+	InboxDone     = "DONE"     // 已确认
+	InboxFailed   = "FAILED"   // 已失败
+	InboxRejected = "REJECTED" // 前置校验拒绝（线 A：派单核心指令超限等）
+	InboxTimeout  = "TIMEOUT"  // 看门狗超时置位（线 A）
 )
+
+// MaxInboxRequeues 是水位扫荡对同一行的最大重排次数（P0 修复）：
+// 超期 RUNNING 行最多重排 2 次；第 3 次超期直接置 FAILED 并写失败回信，
+// 绝不让“重排 → 重写 deadline”无限死循环。
+const MaxInboxRequeues = 2
 
 // InboxRecord 是一次入队的信。
 type InboxRecord struct {
@@ -443,6 +582,7 @@ type InboxRow struct {
 	Text       string
 	Status     string
 	RetryCount int
+	Deadline   string // RFC3339 UTC，RUNNING 行的终结期限；为空表示旧行未设
 	CreatedTS  string
 	UpdatedTS  string
 }
@@ -493,7 +633,7 @@ func (l *Ledger) ListInboxByStatus(status string) ([]InboxRow, error) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	rows, err := l.db.Query(`SELECT id, ts, session_id, task_id, inbound_seq,
-		source, text, status, retry_count, created_ts, updated_ts
+		source, text, status, retry_count, deadline, created_ts, updated_ts
 		FROM inbox_queue WHERE status = ? ORDER BY id ASC`, status)
 	if err != nil {
 		return nil, fmt.Errorf("ledger query inbox_queue: %w", err)
@@ -509,11 +649,29 @@ func (l *Ledger) ListStaleInbox(olderThan time.Duration) ([]InboxRow, error) {
 	defer l.mu.RUnlock()
 	cutoff := time.Now().UTC().Add(-olderThan).Format(time.RFC3339)
 	rows, err := l.db.Query(`SELECT id, ts, session_id, task_id, inbound_seq,
-		source, text, status, retry_count, created_ts, updated_ts
-		FROM inbox_queue WHERE status = 'RUNNING' AND retry_count = 0
-		AND updated_ts < ? ORDER BY id ASC`, cutoff)
+		source, text, status, retry_count, deadline, created_ts, updated_ts
+		FROM inbox_queue WHERE status = 'RUNNING' AND retry_count < ?
+		AND updated_ts < ? ORDER BY id ASC`, MaxInboxRequeues, cutoff)
 	if err != nil {
 		return nil, fmt.Errorf("ledger query stale inbox: %w", err)
+	}
+	defer rows.Close()
+	return scanInboxRows(rows)
+}
+
+// ListExhaustedStaleInbox 读出已超期且重排次数已用完的 RUNNING 行
+// （retry_count >= MaxInboxRequeues）：调用方不再重排，直接置 FAILED
+// 并写失败回信。
+func (l *Ledger) ListExhaustedStaleInbox(olderThan time.Duration) ([]InboxRow, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	cutoff := time.Now().UTC().Add(-olderThan).Format(time.RFC3339)
+	rows, err := l.db.Query(`SELECT id, ts, session_id, task_id, inbound_seq,
+		source, text, status, retry_count, deadline, created_ts, updated_ts
+		FROM inbox_queue WHERE status = 'RUNNING' AND retry_count >= ?
+		AND updated_ts < ? ORDER BY id ASC`, MaxInboxRequeues, cutoff)
+	if err != nil {
+		return nil, fmt.Errorf("ledger query exhausted stale inbox: %w", err)
 	}
 	defer rows.Close()
 	return scanInboxRows(rows)
@@ -524,7 +682,7 @@ func scanInboxRows(rows *sql.Rows) ([]InboxRow, error) {
 	for rows.Next() {
 		var r InboxRow
 		if err := rows.Scan(&r.ID, &r.TS, &r.SessionID, &r.TaskID, &r.Seq,
-			&r.Source, &r.Text, &r.Status, &r.RetryCount, &r.CreatedTS, &r.UpdatedTS); err != nil {
+			&r.Source, &r.Text, &r.Status, &r.RetryCount, &r.Deadline, &r.CreatedTS, &r.UpdatedTS); err != nil {
 			return nil, fmt.Errorf("ledger scan inbox_queue: %w", err)
 		}
 		out = append(out, r)
@@ -584,15 +742,16 @@ func (l *Ledger) MarkInboxFailed(id int64) error {
 	return nil
 }
 
-// RequeueInbox 按行 id 把一行 RUNNING 行重排回 PENDING（水位超时自动重排 1 次）：
-// retry_count+1，调用方只对 retry_count==0 的行调本方法。
+// RequeueInbox 按行 id 把一行 RUNNING 行重排回 PENDING（水位超时自动重排）：
+// retry_count+1，最多重排 MaxInboxRequeues 次；调用方只对
+// retry_count < MaxInboxRequeues 的行调本方法（超限的行走 FAILED）。
 func (l *Ledger) RequeueInbox(id int64) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	res, err := l.db.Exec(`UPDATE inbox_queue
 		SET status = 'PENDING', retry_count = retry_count + 1, updated_ts = ?
-		WHERE id = ? AND status = 'RUNNING' AND retry_count = 0`,
-		time.Now().UTC().Format(time.RFC3339), id)
+		WHERE id = ? AND status = 'RUNNING' AND retry_count < ?`,
+		time.Now().UTC().Format(time.RFC3339), id, MaxInboxRequeues)
 	if err != nil {
 		return fmt.Errorf("ledger inbox requeue: %w", err)
 	}
@@ -600,6 +759,178 @@ func (l *Ledger) RequeueInbox(id int64) error {
 		return fmt.Errorf("ledger inbox requeue: id %d 不是可重排的 RUNNING 行", id)
 	}
 	return nil
+}
+
+// MarkInboxRejected 按行 id 把一行 RUNNING 行改成 REJECTED（前置校验拒绝，
+// 如派单核心指令超限）。只在当前状态为 RUNNING 时才改。
+func (l *Ledger) MarkInboxRejected(id int64) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	res, err := l.db.Exec(`UPDATE inbox_queue SET status = 'REJECTED', updated_ts = ?
+		WHERE id = ? AND status = 'RUNNING'`,
+		time.Now().UTC().Format(time.RFC3339), id)
+	if err != nil {
+		return fmt.Errorf("ledger inbox mark REJECTED: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("ledger inbox mark REJECTED: id %d 不是 RUNNING 行", id)
+	}
+	return nil
+}
+
+// MarkInboxTimeout 按行 id 把一行 RUNNING 行改成 TIMEOUT（看门狗超时置位）。
+// 只在当前状态为 RUNNING 时才改。
+func (l *Ledger) MarkInboxTimeout(id int64) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	res, err := l.db.Exec(`UPDATE inbox_queue SET status = 'TIMEOUT', updated_ts = ?
+		WHERE id = ? AND status = 'RUNNING'`,
+		time.Now().UTC().Format(time.RFC3339), id)
+	if err != nil {
+		return fmt.Errorf("ledger inbox mark TIMEOUT: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("ledger inbox mark TIMEOUT: id %d 不是 RUNNING 行", id)
+	}
+	return nil
+}
+
+// SetInboxDeadline 按行 id 写 deadline（RUNNING 行的终结期限）。
+// 只在当前状态为 RUNNING 时才改——取走时由网关在 MarkInboxRunning
+// 之后立即调；重排回 PENDING 的行 deadline 不清零，下次取走时重写。
+func (l *Ledger) SetInboxDeadline(id int64, deadline time.Time) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	res, err := l.db.Exec(`UPDATE inbox_queue SET deadline = ?, updated_ts = ?
+		WHERE id = ? AND status = 'RUNNING'`,
+		deadline.UTC().Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339), id)
+	if err != nil {
+		return fmt.Errorf("ledger inbox set deadline: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("ledger inbox set deadline: id %d 不是 RUNNING 行", id)
+	}
+	return nil
+}
+
+// TouchInboxRunning 按 task_id 续期 RUNNING 行的 deadline 与 updated_ts
+// （规划 v2 看门狗续期）：长计划（多步判回执）跑过 1800 秒时，前置在每步
+// 派发前调一次，把 deadline 推后 1800 秒并刷新 updated_ts，免得
+// sweepStale / 外部看门狗把还在干活的计划当死任务重排或置 TIMEOUT。
+// 同一 task_id 有多行 RUNNING 时（seq==0 的多条投递）全部续期；
+// 没有 RUNNING 行时返回错误（调用方只记日志，不阻塞任务）。
+func (l *Ledger) TouchInboxRunning(taskID string, deadline time.Time) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	res, err := l.db.Exec(`UPDATE inbox_queue SET deadline = ?, updated_ts = ?
+		WHERE task_id = ? AND status = 'RUNNING'`,
+		deadline.UTC().Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339), taskID)
+	if err != nil {
+		return fmt.Errorf("ledger inbox touch running: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("ledger inbox touch running: task %s 没有 RUNNING 行", taskID)
+	}
+	return nil
+}
+
+// ListOverdueInbox 读出已超期未终结的 RUNNING 行（看门狗扫荡用）：
+// deadline 已设且早于 now 的；或 deadline 为空（线 A 之前的旧行）
+// 且 updated_ts 早于 now-legacyAge 的。按 id 升序。
+func (l *Ledger) ListOverdueInbox(now time.Time, legacyAge time.Duration) ([]InboxRow, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	nowStr := now.UTC().Format(time.RFC3339)
+	legacyCutoff := now.Add(-legacyAge).UTC().Format(time.RFC3339)
+	rows, err := l.db.Query(`SELECT id, ts, session_id, task_id, inbound_seq,
+		source, text, status, retry_count, deadline, created_ts, updated_ts
+		FROM inbox_queue WHERE status = 'RUNNING' AND
+		((deadline != '' AND deadline < ?) OR (deadline = '' AND updated_ts < ?))
+		ORDER BY id ASC`, nowStr, legacyCutoff)
+	if err != nil {
+		return nil, fmt.Errorf("ledger query overdue inbox: %w", err)
+	}
+	defer rows.Close()
+	return scanInboxRows(rows)
+}
+
+// ---- dispatch_events：派单预算事件（线 A）----
+
+// DispatchEvent 是一次派单预算事件：软告警 / 分级裁减 / 超限拒绝 / 看门狗超时。
+// 只记事件摘要，不记派单全文、不记密钥。
+// session_repair / session_resume 复用这张表记会话修复与续跑事件
+// （P2-a 规格 §4.3：修复后记一笔 dispatch_event）。
+// DispatchEstTokens 是派单估算 token 数（EstimateDispatchTokens 保守口径），
+// 字段名刻意与账本费用 token 数区分开，避免线上排障时混淆（P0 修复）。
+type DispatchEvent struct {
+	SessionID         string
+	TaskID            string
+	DispatchID        string
+	Kind              string // soft_alert / trimmed / overflow_rejected / watchdog_timeout
+	DispatchEstTokens int
+	Detail            string // 人话摘要（截断 ≤600 字）
+}
+
+// 派单预算事件种类（与 schema.sql dispatch_events.kind 对应）。
+const (
+	DispatchEventSoftAlert        = "soft_alert"
+	DispatchEventTrimmed          = "trimmed"
+	DispatchEventOverflowRejected = "overflow_rejected"
+	DispatchEventWatchdogTimeout  = "watchdog_timeout"
+	// 会话事件（P2-a）：步历史修复（截残行/补闭合/丢弃）与断点续跑。
+	DispatchEventSessionRepair = "session_repair"
+	DispatchEventSessionResume = "session_resume"
+	// DispatchEventSessionRollover 是会话翻新事件（P2-b）：水位超阈值，
+	// 摘要续接到新会话，旧会话原地保留。
+	DispatchEventSessionRollover = "session_rollover"
+	// DispatchEventSessionArchive 是会话归档事件（P2-b）：已终结且
+	// 7 天未活动的会话挪归档文件夹（不删）。
+	DispatchEventSessionArchive = "session_archive"
+	// 规划事件（规划 v2）：某步完成时网关发的异步回调事件（session_id、
+	// step_no、回执摘要、事实清单摘要）；串行调度器凭它叫醒前置。
+	DispatchEventPlanStepCallback = "plan_step_callback"
+)
+
+// RecordDispatchEvent 写一行派单预算事件。失败返回错误，不许静默吞掉。
+func (l *Ledger) RecordDispatchEvent(e DispatchEvent) (int64, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	res, err := l.db.Exec(`INSERT INTO dispatch_events
+		(ts, session_id, task_id, dispatch_id, kind, dispatch_est_tokens, detail)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		time.Now().UTC().Format(time.RFC3339),
+		e.SessionID, e.TaskID, e.DispatchID, e.Kind, e.DispatchEstTokens,
+		truncateRunes(e.Detail, 600),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("ledger record dispatch event: %w", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("ledger dispatch event last id: %w", err)
+	}
+	return id, nil
+}
+
+// ListDispatchEvents 按任务号读派单预算事件（审计与测试用，按 id 升序）。
+func (l *Ledger) ListDispatchEvents(taskID string) ([]DispatchEvent, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	rows, err := l.db.Query(`SELECT session_id, task_id, dispatch_id, kind, dispatch_est_tokens, detail
+		FROM dispatch_events WHERE task_id = ? ORDER BY id ASC`, taskID)
+	if err != nil {
+		return nil, fmt.Errorf("ledger list dispatch events: %w", err)
+	}
+	defer rows.Close()
+	var out []DispatchEvent
+	for rows.Next() {
+		var e DispatchEvent
+		if err := rows.Scan(&e.SessionID, &e.TaskID, &e.DispatchID, &e.Kind, &e.DispatchEstTokens, &e.Detail); err != nil {
+			return nil, fmt.Errorf("ledger scan dispatch event: %w", err)
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
 }
 
 // ---- Stage 边界落盘（第 14 步 B-06）----
@@ -803,7 +1134,7 @@ func (l *Ledger) RecordPlanRun(p PlanRun) (int64, error) {
 		(plan_id, task_id, task_text, steps, plan_json, verdict,
 		 revise_rounds, estimated_cost_milli, created_ts)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		p.PlanID, p.TaskID, truncateRunes(p.TaskText, 2000), p.Steps,
+		p.PlanID, p.TaskID, truncateRunes(p.TaskText, 5000), p.Steps,
 		p.PlanJSON, p.Verdict, p.ReviseRounds, p.EstimatedCostMilli,
 		time.Now().UTC().Format(time.RFC3339))
 	if err != nil {
@@ -1093,12 +1424,175 @@ func (l *Ledger) SummarizeExpenseByTask(taskID string) (ExpenseSummary, error) {
 	return s, nil
 }
 
+// RecallRecord 是一次召回的记账行（v2.1 第七节召回账本，线 B 第一阶段）。
+// Candidates 是按分排序的候选（每项 "source=score"，前 40）；
+// LexicalRank / SemanticRank 是词法 / 语义两路的原始名次（source 列表），
+// 调用方没有分路信息时留空；Delivered 是最终交付卡片的 source 列表。
+type RecallRecord struct {
+	SessionID    string
+	TaskID       string
+	Query        string
+	Candidates   []string
+	LexicalRank  []string
+	SemanticRank []string
+	Delivered    []string
+	TokensEst    int64 // 交付卡片合计 token 估算（EstimateTokens 口径）
+	LatencyMs    int64
+}
+
+// RecordRecall 写一行召回账。写入前查询、候选、名次、交付卡片全部过
+// 脱敏中间件（节点 3），账本里绝不出现凭证原文；长字段按字符截断，
+// 不劈开汉字。失败返回错误（调用方自行决定是否阻塞；生产热路径只记日志）。
+func (l *Ledger) RecordRecall(r RecallRecord) (int64, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	join := func(items []string, n int) string {
+		return sanitize.Sanitize(truncateRunes(strings.Join(items, ","), n))
+	}
+	res, err := l.db.Exec(`INSERT INTO recall_log
+		(ts, session_id, task_id, query, candidates, lexical_rank, semantic_rank,
+		 delivered, tokens_est, latency_ms, hits)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		time.Now().UTC().Format(time.RFC3339), r.SessionID, r.TaskID,
+		sanitize.Sanitize(truncateRunes(r.Query, 2000)),
+		join(r.Candidates, 8000), join(r.LexicalRank, 4000), join(r.SemanticRank, 4000),
+		join(r.Delivered, 4000), r.TokensEst, r.LatencyMs, len(r.Candidates))
+	if err != nil {
+		return 0, fmt.Errorf("ledger insert recall_log: %w", err)
+	}
+	return res.LastInsertId()
+}
+
+// RecallLogRow 是 recall_log 的一行回读（测试与自查用）。
+type RecallLogRow struct {
+	ID         int64
+	TaskID     string
+	Query      string
+	Candidates string
+	Delivered  string
+	TokensEst  int64
+	LatencyMs  int64
+	Hits       int
+}
+
+// ListRecallByTask 按 task_id 读召回账行（最新在前，最多 limit 行）。
+func (l *Ledger) ListRecallByTask(taskID string, limit int) ([]RecallLogRow, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	rows, err := l.db.Query(`SELECT id, task_id, query, candidates, delivered,
+		tokens_est, latency_ms, hits FROM recall_log WHERE task_id = ?
+		ORDER BY id DESC LIMIT ?`, taskID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("ledger list recall by task: %w", err)
+	}
+	defer rows.Close()
+	var out []RecallLogRow
+	for rows.Next() {
+		var r RecallLogRow
+		if err := rows.Scan(&r.ID, &r.TaskID, &r.Query, &r.Candidates, &r.Delivered,
+			&r.TokensEst, &r.LatencyMs, &r.Hits); err != nil {
+			return nil, fmt.Errorf("ledger scan recall: %w", err)
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// PatrolRecord 是一次巡检的记账行（v2.1 §6 巡检账本，线 B 第二阶段）。
+// Detail 是巡检的细节行（\n 拼接，只含路径与计数，不含文件内容）。
+type PatrolRecord struct {
+	SessionID         string
+	TaskID            string
+	Full              bool
+	Scanned           int
+	New               int
+	Modified          int
+	Renamed           int
+	Deleted           int
+	StaleMarked       int
+	PendingMarked     int
+	SkippedGenerating int
+	SecretFiles       int
+	SecretHits        int
+	Detail            string
+}
+
+// RecordPatrol 写一行巡检账。写入前细节过脱敏中间件（节点 3），
+// 账本里绝不出现凭证原文；长字段按字符截断，不劈开汉字。
+// 失败返回错误（调用方自行决定是否阻塞；生产巡检只记日志）。
+func (l *Ledger) RecordPatrol(r PatrolRecord) (int64, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	full := 0
+	if r.Full {
+		full = 1
+	}
+	res, err := l.db.Exec(`INSERT INTO patrol_log
+		(ts, session_id, task_id, full, scanned, new_count, modified, renamed,
+		 deleted, stale_marked, pending_marked, skipped_generating,
+		 secret_files, secret_hits, detail)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		time.Now().UTC().Format(time.RFC3339), r.SessionID, r.TaskID, full,
+		r.Scanned, r.New, r.Modified, r.Renamed, r.Deleted,
+		r.StaleMarked, r.PendingMarked, r.SkippedGenerating,
+		r.SecretFiles, r.SecretHits,
+		sanitize.Sanitize(truncateRunes(r.Detail, 8000)))
+	if err != nil {
+		return 0, fmt.Errorf("ledger insert patrol_log: %w", err)
+	}
+	return res.LastInsertId()
+}
+
+// PatrolLogRow 是 patrol_log 的一行回读（测试与自查用）。
+type PatrolLogRow struct {
+	ID                int64
+	TaskID            string
+	Full              bool
+	Scanned           int
+	New               int
+	Modified          int
+	Renamed           int
+	Deleted           int
+	StaleMarked       int
+	PendingMarked     int
+	SkippedGenerating int
+	SecretFiles       int
+	SecretHits        int
+}
+
+// ListPatrolByTask 按 task_id 读巡检账行（最新在前，最多 limit 行）。
+func (l *Ledger) ListPatrolByTask(taskID string, limit int) ([]PatrolLogRow, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	rows, err := l.db.Query(`SELECT id, task_id, full, scanned, new_count,
+		modified, renamed, deleted, stale_marked, pending_marked,
+		skipped_generating, secret_files, secret_hits FROM patrol_log
+		WHERE task_id = ? ORDER BY id DESC LIMIT ?`, taskID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("ledger list patrol by task: %w", err)
+	}
+	defer rows.Close()
+	var out []PatrolLogRow
+	for rows.Next() {
+		var r PatrolLogRow
+		var full int
+		if err := rows.Scan(&r.ID, &r.TaskID, &full, &r.Scanned, &r.New,
+			&r.Modified, &r.Renamed, &r.Deleted, &r.StaleMarked, &r.PendingMarked,
+			&r.SkippedGenerating, &r.SecretFiles, &r.SecretHits); err != nil {
+			return nil, fmt.Errorf("ledger scan patrol: %w", err)
+		}
+		r.Full = full != 0
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // ListExpenseByTask 按 task_id 读费用行（最新在前，最多 limit 行；
 // 自查费用 task_id 格式测试用）。
 func (l *Ledger) ListExpenseByTask(taskID string, limit int) ([]ExpenseRecord, error) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
-	rows, err := l.db.Query(`SELECT session_id, task_id, model, prompt_tokens,
+	rows, err := l.db.Query(`SELECT session_id, task_id, model, role, prompt_tokens,
 		cache_hit_tokens, cache_miss_tokens, completion_tokens, cost_cny_milli
 		FROM expense_ledger WHERE task_id = ? ORDER BY id DESC LIMIT ?`, taskID, limit)
 	if err != nil {
@@ -1108,7 +1602,7 @@ func (l *Ledger) ListExpenseByTask(taskID string, limit int) ([]ExpenseRecord, e
 	var out []ExpenseRecord
 	for rows.Next() {
 		var r ExpenseRecord
-		if err := rows.Scan(&r.SessionID, &r.TaskID, &r.Model, &r.PromptTokens,
+		if err := rows.Scan(&r.SessionID, &r.TaskID, &r.Model, &r.Role, &r.PromptTokens,
 			&r.CacheHitTokens, &r.CacheMissTokens, &r.CompletionTokens,
 			&r.CostCNYMilli); err != nil {
 			return nil, fmt.Errorf("ledger scan expense by task: %w", err)
